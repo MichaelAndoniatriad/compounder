@@ -1,7 +1,11 @@
 """User-defined portfolio mandate injected into agent prompts.
 
-Edit INVESTOR_POLICY_FULL to change exit rules, growth framework, and checklist
-for all agents that import it.
+The portfolio runs two strategy sleeves:
+  - core: long-term hold + growth (3-5yr). Governed by INVESTOR_POLICY_FULL.
+  - catalyst: short-term, event-driven tactical trades. Governed by CATALYST_POLICY_FULL.
+
+Edit the relevant block to change exit rules, framework, and checklist for the
+agents that import it. Use ``policy_for_strategy()`` to select the right block.
 """
 
 # Shorter block for early-stage analysts (market/news/sentiment) so prompts stay focused.
@@ -11,6 +15,21 @@ INVESTOR_POLICY_ANALYST_SUPPLEMENT = """
 Downstream agents apply: **5+ year** growth horizon; staged entry (**half** intended size, add over **2–4 weeks**); **≤5%** of portfolio per new position; **average up, not down**; pre-earnings trim if **≥+15%** before print (sell half, hold half through); at **2×** entry sell half; **thesis break** (2–3 predefined metrics) → full exit within **48 hours** when any metric breaks on earnings or material news; **−30%** from entry with thesis intact → one review at **next scheduled earnings**; **−40%** from entry → **full exit**, no exceptions.
 
 Call out catalysts (earnings, guidance), drawdown vs a plausible entry, red-flag patterns (deteriorating growth, cash flow vs revenue, heavy dilution), and anything that would fail the desk's pre-buy checklist.
+""".strip()
+
+# Short block for analysts when researching a catalyst-sleeve (short-term, event-driven) name.
+CATALYST_ANALYST_SUPPLEMENT = """
+## Desk mandate (context for your report — CATALYST trade)
+
+This is a short-term, event-driven trade, not a long-term hold. The thesis is one specific dated catalyst
+(earnings, FDA/PDUFA, launch, index inclusion, contract or legal decision, analyst day). Downstream agents
+apply: single entry before the event; **-8%** hard stop; trailing stop once **+10%** (then **-8%** off peak);
+**time stop** if the catalyst passes without the move; **30-day** max hold absent a catalyst date. No averaging,
+no holding through the noise.
+
+Focus your report on: what the catalyst is and its date, the setup into the event (positioning, expectations,
+implied move), what would make the event a beat vs a miss, liquidity/tradability, and any near-term risk that
+could break the trade before the catalyst. Long-term moat/valuation detail is secondary here.
 """.strip()
 
 INVESTOR_POLICY_FULL = """
@@ -108,3 +127,56 @@ Before buying any growth stock, confirm all of the following:
 
 If all boxes cannot be checked, either do more research or move to the next idea.
 """.strip()
+
+
+CATALYST_POLICY_FULL = """
+## Catalyst Sleeve Policy (short-term, event-driven — NOT a long-term hold)
+
+This sleeve trades a specific, dated catalyst. The catalyst IS the thesis. There is no
+5-year horizon, no averaging up, no "hold through the noise". Risk is managed tightly
+because the only edge is correctly reading one event.
+
+**Entry**
+- Every catalyst trade must name the catalyst and its expected date (earnings, FDA/PDUFA,
+  product launch, index inclusion, contract decision, legal ruling, analyst day).
+- Enter as a single position before the event. Do NOT stage in over weeks.
+- Size is smaller than a core position; multiple concurrent catalyst trades are expected.
+- If you cannot state the catalyst, the date, and what move you expect, do not enter.
+
+**Exit (any one fires, act immediately)**
+
+Trigger 1: Hard stop loss
+Exit if the position falls 8% from entry. This is tight on purpose — a catalyst trade
+that is down before the event is usually wrong on timing or thesis.
+
+Trigger 2: Trailing stop
+Once the position is up 10% from entry, a trailing stop arms. Exit if it then falls 8%
+from its peak. This lets a winning catalyst move run while locking in the gain. There is
+no fixed profit target — the trailing stop captures the upside.
+
+Trigger 3: Time stop
+If the catalyst date passes and the expected move did not happen (position not up ~5%+),
+exit within 3 days regardless of P/L. A catalyst that fired without moving the stock is a
+dead thesis. If no catalyst date was set, close the trade after 30 days maximum.
+
+**Hard rules**
+- Never let a catalyst trade quietly become a long-term hold. If you want to keep it as a
+  core position after the catalyst, that is a NEW decision with core entry rules and a new
+  entry price — not a way to dodge the time stop.
+- Never widen the stop to avoid being stopped out.
+- The sleeve is locked at entry. A losing catalyst trade is not reclassified as core.
+""".strip()
+
+
+def policy_for_strategy(strategy: str) -> str:
+    """Return the mandated policy text for a strategy sleeve ('core' or 'catalyst')."""
+    return CATALYST_POLICY_FULL if str(strategy).strip().lower() == "catalyst" else INVESTOR_POLICY_FULL
+
+
+def analyst_supplement_for_strategy(strategy: str) -> str:
+    """Return the analyst-facing mandate supplement for a strategy sleeve."""
+    return (
+        CATALYST_ANALYST_SUPPLEMENT
+        if str(strategy).strip().lower() == "catalyst"
+        else INVESTOR_POLICY_ANALYST_SUPPLEMENT
+    )

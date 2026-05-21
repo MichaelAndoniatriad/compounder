@@ -23,6 +23,8 @@ from tradingagents.dataflows.config import set_config
 from tradingagents.integrations.etoro.clerk_bridge import _normalize_ticker
 from tradingagents.llm_clients import create_llm_client
 from tradingagents.portfolio_advisor import etoro_scan, evidence, state
+from tradingagents.portfolio_advisor import position_plans as pos_plans
+from tradingagents.portfolio_advisor import watchlist as watchlist_mod
 from tradingagents.portfolio_advisor.models import AdvisorPMAppendJob, AdvisorPMCycleResult
 from tradingagents.portfolio_advisor.prompt_limits import cfg_int as _pm_int
 
@@ -1137,6 +1139,120 @@ def _notify_action_stances(cfg: Dict[str, Any], result: AdvisorPMCycleResult, po
         return False
 
 
+def _parse_available_balance(portfolio_text: str) -> Optional[float]:
+    """Extract available_balance from the first line of fetch_portfolio_rows text."""
+    import re
+    first = (portfolio_text or "").split("\n")[0]
+    m = re.search(r"available_balance=(['\"]?)([0-9]+(?:\.[0-9]+)?)\1", first)
+    if m:
+        try:
+            return float(m.group(2))
+        except ValueError:
+            pass
+    return None
+
+
+def _deployable_capital_block(
+    portfolio_text: str,
+    portfolio_rows: List[Dict[str, Any]],
+) -> str:
+    """Build a short cash + position-sizing block for the PM prompt."""
+    cash = _parse_available_balance(portfolio_text)
+    ubv_vals = [
+        float(r["unitsBaseValueDollars"])
+        for r in portfolio_rows
+        if r.get("unitsBaseValueDollars") is not None
+    ]
+    total_ubv = sum(ubv_vals) if ubv_vals else None
+
+    lines = ["Deployable capital:"]
+    if cash is not None:
+        lines.append(f"  available_balance (eToro): ${cash:,.2f}")
+    else:
+        lines.append("  available_balance: not parsed from snapshot")
+
+    if total_ubv:
+        max_new = total_ubv * 0.05
+        first_tranche = max_new * 0.5
+        lines.append(f"  total_invested (positions only): ${total_ubv:,.2f}")
+        lines.append(
+            f"  position sizing rule: max 5% of invested = ${max_new:,.0f} per new name; "
+            f"first tranche (half now) = ${first_tranche:,.0f}"
+        )
+        if cash is not None:
+            can_afford = "yes" if cash >= first_tranche else f"NO — only ${cash:,.0f} available, first tranche requires ${first_tranche:,.0f}"
+            lines.append(f"  can fund first tranche from cash: {can_afford}")
+    return "\n".join(lines) + "\n"
+
+
+def _sleeve_allocation_block(
+    cfg: Dict[str, Any],
+    portfolio_text: str,
+    portfolio_rows: List[Dict[str, Any]],
+) -> str:
+    """Build a sleeve mix vs target block (core / catalyst / cash) for the PM prompt.
+
+    Each live position's sleeve comes from its position plan (default 'core' when
+    no plan exists). Compares actual weights against the configured targets and
+    flags any sleeve that has drifted beyond tolerance.
+    """
+    targets = cfg.get("portfolio_advisor_sleeve_targets") or {"core": 0.50, "catalyst": 0.40, "cash": 0.10}
+    try:
+        tolerance = float(cfg.get("portfolio_advisor_sleeve_drift_tolerance", 0.07))
+    except (TypeError, ValueError):
+        tolerance = 0.07
+
+    plans = pos_plans.load_position_plans(cfg)
+    cash = _parse_available_balance(portfolio_text) or 0.0
+
+    core_val = 0.0
+    catalyst_val = 0.0
+    for r in portfolio_rows:
+        ubv = _float_or_none(r.get("unitsBaseValueDollars"))
+        if ubv is None:
+            continue
+        tk = _normalize_ticker(str(r.get("symbolFull") or ""))
+        plan = plans.get(tk)
+        strategy = plan.strategy if plan else "core"
+        if strategy == "catalyst":
+            catalyst_val += ubv
+        else:
+            core_val += ubv
+
+    total = core_val + catalyst_val + cash
+    if total <= 0:
+        return ""
+
+    actual = {
+        "core": core_val / total,
+        "catalyst": catalyst_val / total,
+        "cash": cash / total,
+    }
+    dollars = {"core": core_val, "catalyst": catalyst_val, "cash": cash}
+
+    lines = ["Sleeve allocation (actual vs target):"]
+    flags: List[str] = []
+    for sleeve in ("core", "catalyst", "cash"):
+        tgt = float(targets.get(sleeve, 0.0))
+        act = actual[sleeve]
+        drift = act - tgt
+        marker = ""
+        if abs(drift) > tolerance:
+            marker = "  << DRIFT"
+            direction = "over" if drift > 0 else "under"
+            flags.append(f"{sleeve} is {abs(drift)*100:.0f}pts {direction} target")
+        lines.append(
+            f"  {sleeve}: {act*100:.0f}% (${dollars[sleeve]:,.0f}) vs target {tgt*100:.0f}%{marker}"
+        )
+    if flags:
+        lines.append(
+            "  Rebalance guidance: steer new capital toward under-target sleeves. "
+            "Do NOT sell an intact core position to fund catalyst trades; fund from cash or from "
+            "positions with a TRIGGERED exit rule. " + "; ".join(flags) + "."
+        )
+    return "\n".join(lines) + "\n"
+
+
 def run_pm_cycle(
     cfg: Dict[str, Any],
     *,
@@ -1205,6 +1321,34 @@ def run_pm_cycle(
     claude_block = f"{pm_claude}\n\n" if pm_claude else ""
     memory_block = f"Your working memory (PM_MEMORY.md — recent notes to self):\n{pm_memory}\n\n" if pm_memory else ""
 
+    # Deterministic rule-trigger check — computed from position_plans.json + current prices.
+    try:
+        trigger_block = pos_plans.build_trigger_block(cfg, live_tickers)
+    except Exception as e:
+        logger.debug("position rule trigger block failed: %s", e)
+        trigger_block = ""
+
+    # Cash and position-sizing block.
+    try:
+        capital_block = _deployable_capital_block(portfolio_text, portfolio_rows)
+    except Exception as e:
+        logger.debug("deployable capital block failed: %s", e)
+        capital_block = ""
+
+    # Sleeve allocation (core / catalyst / cash) vs target mix.
+    try:
+        sleeve_block = _sleeve_allocation_block(cfg, portfolio_text, portfolio_rows)
+    except Exception as e:
+        logger.debug("sleeve allocation block failed: %s", e)
+        sleeve_block = ""
+
+    # Candidate watchlist summary (short — just shows what's on deck, not gated yet).
+    try:
+        watchlist_block = watchlist_mod.watchlist_summary_for_pm(cfg)
+    except Exception as e:
+        logger.debug("watchlist summary block failed: %s", e)
+        watchlist_block = ""
+
     today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     prompt = f"""{claude_block}You are the portfolio manager for a research stack. Advisory only: no trade orders, no claims that trades executed.
 
@@ -1223,8 +1367,12 @@ Trigger for this cycle: {trigger_s}
 {memory_block}Portfolio snapshot:
 {portfolio_snapshot}
 
+{sleeve_block}
+{capital_block}
+{trigger_block}
 Live tickers (normalized): {", ".join(sorted(live_tickers))}
 
+{watchlist_block}
 Pending advisor jobs preview (JSON):
 {pend_preview}
 
@@ -1261,6 +1409,11 @@ Structured output fields (use defaults when unsure):
   to the human's phone, so only fill it when you genuinely have something they need to know unprompted.
   Do not repeat the same action already present in prior PM context unless the exact required close list changed.
 
+IMPORTANT — position rule triggers: the POSITION RULE STATUS block above is computed deterministically from
+position_plans.json and current prices. If a ticker shows TRIGGERED, name the exact advisory action in your
+response and set push_note if this is a new trigger. TRIGGERED always takes priority over everything else.
+Positions without a plan on file cannot have rule triggers checked; recommend the human set entry prices for them.
+
 IMPORTANT — position sizing: the portfolio snapshot above includes capital$ (cash/base committed), current$
 (capital plus unrealized P/L when available), units (shares held), open$ (cost basis per share), and
 total_portfolio_value_usd. When you recommend trimming or selling, always express
@@ -1269,6 +1422,19 @@ Example: "Sell 3 units of TEAM (~$240) — reduces exposure from $720 to $480." 
 portfolio is in dollars; give them the exact number so they can act immediately. If you mean "close", list exactly
 which lots/positions using the open$ values shown in the snapshot. If the exact lot list is not supported by the
 snapshot, do not create an action stance; queue follow-up research or ask for clarification.
+
+IMPORTANT — strategy sleeves: the portfolio runs two sleeves. core = long-term hold + growth (3-5yr: staged
+entry, +15% pre-earnings trim, -30%/-40% stops, thesis-break exit). catalyst = short-term event-driven (single
+entry before a dated catalyst, -8% hard stop, trailing stop after +10%, time-stop if the catalyst passes without
+the move). The POSITION RULE STATUS block already applies the correct rules per position based on its sleeve.
+Treat a position's sleeve as fixed: never suggest reclassifying a losing catalyst trade as core to dodge its stop,
+or vice versa. If the human wants to keep a catalyst name long-term after the event, say that explicitly as a NEW
+core entry decision.
+
+IMPORTANT — new positions and reallocation: before recommending any new entry, check the Deployable capital and
+Sleeve allocation blocks. First tranche must fit within available_balance, and new capital should move the sleeve
+mix toward target. Do NOT recommend selling an intact existing position to fund a new one unless the existing
+position has a TRIGGERED exit rule. Cash-funded entry first; reallocation only on thesis break or a fired exit rule.
 
 Deliver structured output only. Stances must use tickers you see above. forward_tasks should be concrete
 (research X, schedule replan, verify Y thesis, respond to risk flag, etc.). memory_note is what you want your next self to read first.

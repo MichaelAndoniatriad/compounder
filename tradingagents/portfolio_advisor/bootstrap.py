@@ -135,7 +135,12 @@ def run_full_portfolio_bootstrap(
         if i > 0 and delay_seconds > 0:
             time.sleep(float(delay_seconds))
         try:
-            final_state, _sig = run_deep_research(tid, td, analysts, cfg)
+            try:
+                from tradingagents.portfolio_advisor.position_plans import strategy_for_ticker
+                strategy = strategy_for_ticker(cfg, tid)
+            except Exception:
+                strategy = "core"
+            final_state, _sig = run_deep_research(tid, td, analysts, cfg, strategy=strategy)
             rd = Path(str(cfg.get("results_dir", ".")))
             save_deep_report(results_dir=rd, ticker=tid, trade_date=td, final_state=final_state)
             decision_text = str(final_state.get("final_trade_decision") or "")

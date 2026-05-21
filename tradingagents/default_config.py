@@ -129,7 +129,7 @@ DEFAULT_CONFIG = _apply_env_overrides({
     "portfolio_advisor_inject_prior_clerk_report": True,
     "portfolio_advisor_prior_clerk_report_max_chars": 16000,
     # Advisor-level PM council (separate from LangGraph's Portfolio Manager node).
-    "portfolio_advisor_pm_model": "openai/gpt-5.5",
+    "portfolio_advisor_pm_model": "deepseek/deepseek-v4-pro",
     "portfolio_advisor_pm_log_path": None,
     # Master switch for advisor PM (set False only to pause all PM automation, e.g. tests or cost cap).
     "portfolio_advisor_pm_enabled": True,
@@ -166,6 +166,30 @@ DEFAULT_CONFIG = _apply_env_overrides({
     "portfolio_advisor_pm_candidate_comparison": True,
     # Best-effort yfinance enrichment for candidate liquidity gates when avg_daily_volume is not supplied.
     "portfolio_advisor_candidate_market_data_enabled": True,
+    # --- Strategy sleeves (core long-term/growth vs catalyst tactical) ---
+    # Target portfolio mix by sleeve; PM flags drift and steers new capital to rebalance.
+    "portfolio_advisor_sleeve_targets": {"core": 0.50, "catalyst": 0.40, "cash": 0.10},
+    # How far actual sleeve weight may drift from target before the PM flags it (fraction of total).
+    "portfolio_advisor_sleeve_drift_tolerance": 0.07,
+    # Catalyst-sleeve exit rules (fractions of entry/peak; days for time-based exits).
+    "portfolio_advisor_catalyst_hard_stop_pct": 0.08,        # exit if down 8% from entry
+    "portfolio_advisor_catalyst_trailing_activate_pct": 0.10,  # trailing arms once up 10% from entry
+    "portfolio_advisor_catalyst_trailing_stop_pct": 0.08,    # then exit if down 8% from peak
+    "portfolio_advisor_catalyst_time_stop_days": 3,          # days after catalyst date to exit if move didn't happen
+    "portfolio_advisor_catalyst_max_hold_days": 30,          # hard hold cap when no catalyst date is set
+    # Core sleeve: a +15% position only fires PRE_EARNINGS_TRIM (red) when its next earnings
+    # date is within this many days; otherwise it stays amber ("trim armed").
+    "portfolio_advisor_pre_earnings_trim_window_days": 14,
+    # After each full_graph deep run, auto-refresh that name's sleeve + thesis-break metrics
+    # via the position classifier (one extra cheap LLM pass). Set False to disable.
+    "portfolio_advisor_auto_classify_after_full_graph": True,
+    # Weekly research funnel: max candidate full_graph deep runs per rolling 7 days (cost control).
+    # Names that clear the screen beyond this are held for the next week, ranked by priority.
+    "portfolio_advisor_weekly_full_graph_cap": 4,
+    # News researcher (weekly discovery): how many candidates to target, and prompt sizing.
+    "news_researcher_target_candidates": 8,
+    "news_researcher_article_limit": 40,
+    "news_researcher_news_chars": 12000,
     # Planner / replan LLM: portfolio export + catalyst digest size (characters).
     "portfolio_advisor_planner_portfolio_chars": 10000,
     "portfolio_advisor_planner_catalyst_chars": 7000,

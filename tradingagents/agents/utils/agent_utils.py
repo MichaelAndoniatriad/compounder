@@ -29,13 +29,23 @@ def _learned_rules_excerpt_for_prompt(max_chars: int = 6000) -> str:
     return read_learned_rules_excerpt(get_config(), max_chars=max_chars).strip()
 
 
+def _active_strategy() -> str:
+    """Strategy sleeve for the current run, set on config by the deep runner ('core' default)."""
+    from tradingagents.dataflows.config import get_config
+
+    try:
+        return str((get_config() or {}).get("active_strategy") or "core").strip().lower()
+    except Exception:
+        return "core"
+
+
 def get_investor_policy_full_instruction() -> str:
-    """Full exit policy, 10-step framework, and pre-buy checklist for decision agents."""
-    from tradingagents.agents.utils.investor_policy import INVESTOR_POLICY_FULL
+    """Full exit policy + framework for decision agents, selected by the active strategy sleeve."""
+    from tradingagents.agents.utils.investor_policy import policy_for_strategy
 
     base = (
         "\n\n---\n\n## Mandated portfolio policy (follow strictly)\n\n"
-        + INVESTOR_POLICY_FULL
+        + policy_for_strategy(_active_strategy())
     )
     learned = _learned_rules_excerpt_for_prompt(max_chars=6000)
     if learned:
@@ -48,10 +58,8 @@ def get_investor_policy_full_instruction() -> str:
 
 
 def get_investor_policy_analyst_supplement() -> str:
-    """Short mandate context for market/news/sentiment analysts."""
-    from tradingagents.agents.utils.investor_policy import (
-        INVESTOR_POLICY_ANALYST_SUPPLEMENT,
-    )
+    """Short mandate context for market/news/sentiment analysts, selected by active strategy sleeve."""
+    from tradingagents.agents.utils.investor_policy import analyst_supplement_for_strategy
 
     tail = _learned_rules_excerpt_for_prompt(max_chars=900)
     extra = ""
@@ -61,7 +69,7 @@ def get_investor_policy_analyst_supplement() -> str:
             + tail[:900]
             + ("…" if len(tail) > 900 else "")
         )
-    return "\n\n---\n" + INVESTOR_POLICY_ANALYST_SUPPLEMENT + extra
+    return "\n\n---\n" + analyst_supplement_for_strategy(_active_strategy()) + extra
 
 
 def get_language_instruction() -> str:

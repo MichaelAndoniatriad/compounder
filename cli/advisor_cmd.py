@@ -487,6 +487,421 @@ def portfolio_cost_report(
     console.print(f"\n[dim]Calls with unknown pricing: {null_count}[/dim]")
 
 
+# ---------------------------------------------------------------------------
+# Position plan commands
+# ---------------------------------------------------------------------------
+
+position_plan_app = typer.Typer(
+    help="Per-position exit plans: entry price, thesis-break metrics, rule trigger tracking.",
+    no_args_is_help=True,
+)
+portfolio_app.add_typer(position_plan_app, name="position-plan")
+
+
+@position_plan_app.command("set")
+def position_plan_set(
+    ticker: str = typer.Argument(..., help="Ticker symbol, e.g. NVDA"),
+    entry: float = typer.Option(..., "--entry", "-e", help="Entry price (your average cost basis)."),
+    strategy: str = typer.Option(
+        "core",
+        "--strategy",
+        "-s",
+        help="Sleeve: 'core' (long-term/growth) or 'catalyst' (short-term event trade).",
+    ),
+    entry_date: str = typer.Option("", "--date", "-d", help="Entry date YYYY-MM-DD."),
+    thesis: str = typer.Option(
+        "",
+        "--thesis",
+        "-t",
+        help="(core) Thesis-break metrics, semicolon-separated, e.g. 'rev growth <20%;NRR drops below 110%'",
+    ),
+    catalyst_date: str = typer.Option("", "--catalyst-date", help="(catalyst) Expected event date YYYY-MM-DD."),
+    catalyst_desc: str = typer.Option("", "--catalyst-desc", help="(catalyst) What event is this trade betting on?"),
+    horizon: str = typer.Option("3-5 years", "--horizon", "-h", help="(core) Target hold horizon."),
+    notes: str = typer.Option("", "--notes", "-n", help="Free-form notes."),
+):
+    """Write or update the exit plan for a position (core or catalyst sleeve)."""
+    from tradingagents.portfolio_advisor.position_plans import (
+        PositionPlan,
+        upsert_position_plan,
+        catalyst_rules_from_cfg,
+    )
+
+    cfg = DEFAULT_CONFIG.copy()
+    strategy = strategy.strip().lower()
+    if strategy not in ("core", "catalyst"):
+        console.print(f"[red]Invalid strategy '{strategy}'. Use 'core' or 'catalyst'.[/red]")
+        raise typer.Exit(1)
+    metrics = [m.strip() for m in thesis.split(";") if m.strip()] if thesis else []
+    plan = PositionPlan(
+        ticker=ticker.strip().upper(),
+        entry_price=entry,
+        strategy=strategy,
+        entry_date=entry_date,
+        thesis_break_metrics=metrics,
+        target_horizon=horizon,
+        notes=notes,
+        catalyst_date=catalyst_date,
+        catalyst_description=catalyst_desc,
+    )
+    upsert_position_plan(cfg, plan)
+    console.print(f"[green]Plan saved for {plan.ticker} ({strategy}):[/green]")
+    if strategy == "core":
+        console.print(f"  entry=${plan.entry_price:.4f}, trim_at=${plan.trim_at:.2f}, "
+                      f"double_at=${plan.double_at:.2f}, soft_stop=${plan.soft_stop:.2f}, "
+                      f"hard_stop=${plan.hard_stop_core:.2f}")
+        if metrics:
+            console.print(f"  thesis_break_metrics: {'; '.join(metrics)}")
+        else:
+            console.print("[yellow]  Warning: no thesis-break metrics set — add them before the next earnings print[/yellow]")
+    else:
+        r = catalyst_rules_from_cfg(cfg)
+        hard = plan.entry_price * (1 - r.hard_stop_pct)
+        arm = plan.entry_price * (1 + r.trailing_activate_pct)
+        console.print(f"  entry=${plan.entry_price:.4f}, hard_stop=${hard:.2f} (-{r.hard_stop_pct*100:.0f}%), "
+                      f"trailing arms at ${arm:.2f} (+{r.trailing_activate_pct*100:.0f}%, then -{r.trailing_stop_pct*100:.0f}% from peak)")
+        if catalyst_date:
+            console.print(f"  catalyst: {catalyst_desc or '(undescribed)'} on {catalyst_date} "
+                          f"(time-stop {r.time_stop_days}d after if no move)")
+        else:
+            console.print(f"[yellow]  No catalyst date — max hold {r.max_hold_days}d. Set --catalyst-date for a tighter time-stop.[/yellow]")
+        if not catalyst_desc:
+            console.print("[yellow]  Warning: catalyst not described — what event is this trade betting on?[/yellow]")
+
+
+@position_plan_app.command("list")
+def position_plan_list():
+    """Show all position plans and their current trigger status (fetches live prices)."""
+    from tradingagents.portfolio_advisor.position_plans import (
+        load_position_plans,
+        compute_trigger_status,
+        catalyst_rules_from_cfg,
+        _fetch_prices,
+        _fetch_earnings_dates_for_trim,
+        _earnings_window_days,
+    )
+
+    cfg = DEFAULT_CONFIG.copy()
+    plans = load_position_plans(cfg)
+    if not plans:
+        console.print("[yellow]No position plans on file. Use `position-plan set` to add one.[/yellow]")
+        return
+
+    live = set(plans.keys())  # treat all plans as live for a manual listing
+    current_prices = _fetch_prices(plans, live)
+    earnings_dates = _fetch_earnings_dates_for_trim(plans, current_prices)
+    statuses = compute_trigger_status(
+        plans, current_prices,
+        catalyst_rules=catalyst_rules_from_cfg(cfg),
+        earnings_dates=earnings_dates,
+        earnings_window_days=_earnings_window_days(cfg),
+    )
+
+    from rich.text import Text
+
+    for ticker in sorted(statuses):
+        s = statuses[ticker]
+        if s.triggered:
+            style = "bold red"
+        elif s.watch:
+            style = "yellow"
+        else:
+            style = "green"
+        console.print(Text("\n" + s.summary_line(), style=style))
+
+
+@position_plan_app.command("backfill")
+def position_plan_backfill(
+    overwrite: bool = typer.Option(False, "--overwrite", help="Replace existing plans too (default: skip them)."),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+):
+    """Create core plans for live holdings using their eToro weighted-avg cost basis.
+
+    Defaults every plan to the 'core' sleeve. After this, reclassify catalyst names with
+    `position-plan set TICKER --strategy catalyst ...` and add thesis-break metrics to core names.
+    """
+    _configure_logging(verbose)
+    from tradingagents.portfolio_advisor.position_plans import backfill_plans_from_portfolio
+    from tradingagents.portfolio_advisor import etoro_scan
+
+    cfg = DEFAULT_CONFIG.copy()
+    try:
+        _, _, _, rows = etoro_scan.fetch_portfolio_rows()
+    except Exception as e:
+        console.print(f"[red]Could not fetch eToro portfolio: {e}[/red]")
+        raise typer.Exit(1) from e
+    result = backfill_plans_from_portfolio(cfg, rows, overwrite=overwrite)
+    if result["created"]:
+        console.print(f"[green]Created plans (core):[/green] {', '.join(result['created'])}")
+    if result["skipped_existing"]:
+        console.print(f"[dim]Kept existing plans: {', '.join(result['skipped_existing'])}[/dim]")
+    if result["skipped_no_data"]:
+        console.print(f"[yellow]Skipped (no usable cost basis): {', '.join(result['skipped_no_data'])}[/yellow]")
+    if not any(result.values()):
+        console.print("[yellow]No holdings found to backfill.[/yellow]")
+    console.print("\nNext: reclassify any catalyst trades and add thesis-break metrics, e.g.")
+    console.print("  advisor portfolio position-plan set DKNG --entry <p> --strategy catalyst --catalyst-date YYYY-MM-DD --catalyst-desc '...'")
+
+
+@position_plan_app.command("classify")
+def position_plan_classify(
+    only_missing: bool = typer.Option(
+        False, "--only-missing", help="Only classify plans that have no thesis-break metrics yet."
+    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+):
+    """Let the system decide each holding's sleeve + thesis-break metrics + keep/sell.
+
+    Reads each position's research (memory, events, latest decision) and price action, applies the
+    investor policy, and writes the classification back into the plan. Sell recommendations are
+    surfaced, never auto-executed.
+    """
+    _configure_logging(verbose)
+    from tradingagents.portfolio_advisor.position_classifier import classify_all_holdings
+
+    cfg = DEFAULT_CONFIG.copy()
+    result = classify_all_holdings(cfg, only_missing=only_missing)
+    if not result.get("classified"):
+        console.print(f"[yellow]Nothing classified:[/yellow] {result.get('reason', 'no holdings')}")
+        return
+    for c in result["classified"]:
+        tag = "bold red" if c["recommendation"] == "sell" else ("yellow" if c["strategy"] == "catalyst" else "green")
+        from rich.text import Text
+        header = f"{c['ticker']} -> {c['strategy'].upper()}  (rec: {c['recommendation']})"
+        console.print(Text("\n" + header, style=tag))
+        for m in c["thesis_break_metrics"]:
+            console.print(Text(f"    break: {m}"), markup=False)
+        if c["rationale"]:
+            console.print(Text(f"    {c['rationale']}", style="dim"))
+    if result["sell_flags"]:
+        console.print(f"\n[bold red]SELL recommended:[/bold red] {', '.join(result['sell_flags'])}")
+    if result["skipped"]:
+        console.print(f"[dim]Skipped: {', '.join(result['skipped'])}[/dim]")
+
+
+@position_plan_app.command("remove")
+def position_plan_remove(
+    ticker: str = typer.Argument(..., help="Ticker symbol to remove."),
+):
+    """Delete a position plan."""
+    from tradingagents.portfolio_advisor.position_plans import remove_position_plan
+
+    cfg = DEFAULT_CONFIG.copy()
+    removed = remove_position_plan(cfg, ticker.strip().upper())
+    if removed:
+        console.print(f"[green]Plan removed for {ticker.upper()}.[/green]")
+    else:
+        console.print(f"[yellow]No plan found for {ticker.upper()}.[/yellow]")
+
+
+# ---------------------------------------------------------------------------
+# Watchlist commands
+# ---------------------------------------------------------------------------
+
+watchlist_app = typer.Typer(
+    help="Candidate watchlist: tickers you want scanned and gated before entering the portfolio.",
+    no_args_is_help=True,
+)
+portfolio_app.add_typer(watchlist_app, name="watchlist")
+
+
+@watchlist_app.command("add")
+def watchlist_add(
+    ticker: str = typer.Argument(..., help="Ticker to add to the watchlist."),
+    thesis: str = typer.Option("", "--thesis", "-t", help="Short investment thesis."),
+    strategy: str = typer.Option(
+        "core",
+        "--strategy",
+        "-s",
+        help="Sleeve: 'core' (long-term/growth) or 'catalyst' (short-term event trade).",
+    ),
+    catalyst_date: str = typer.Option("", "--catalyst-date", help="(catalyst) Expected event date YYYY-MM-DD."),
+):
+    """Add a ticker to the candidate watchlist."""
+    from tradingagents.portfolio_advisor.watchlist import add_to_watchlist
+
+    cfg = DEFAULT_CONFIG.copy()
+    strategy = strategy.strip().lower()
+    if strategy not in ("core", "catalyst"):
+        console.print(f"[red]Invalid strategy '{strategy}'. Use 'core' or 'catalyst'.[/red]")
+        raise typer.Exit(1)
+    added = add_to_watchlist(cfg, ticker, thesis=thesis, strategy=strategy, catalyst_date=catalyst_date)
+    if added:
+        console.print(f"[green]{ticker.upper()} added to watchlist ({strategy}).[/green]")
+    else:
+        console.print(f"[yellow]{ticker.upper()} is already on the watchlist.[/yellow]")
+
+
+@watchlist_app.command("remove")
+def watchlist_remove(
+    ticker: str = typer.Argument(..., help="Ticker to remove."),
+):
+    """Remove a ticker from the candidate watchlist."""
+    from tradingagents.portfolio_advisor.watchlist import remove_from_watchlist
+
+    cfg = DEFAULT_CONFIG.copy()
+    removed = remove_from_watchlist(cfg, ticker)
+    if removed:
+        console.print(f"[green]{ticker.upper()} removed.[/green]")
+    else:
+        console.print(f"[yellow]{ticker.upper()} not found on watchlist.[/yellow]")
+
+
+@watchlist_app.command("list")
+def watchlist_list():
+    """Show all tickers on the watchlist."""
+    from tradingagents.portfolio_advisor.watchlist import load_watchlist
+
+    cfg = DEFAULT_CONFIG.copy()
+    entries = load_watchlist(cfg)
+    if not entries:
+        console.print("[yellow]Watchlist is empty. Use `watchlist add TICKER` to add ideas.[/yellow]")
+        return
+    for e in entries:
+        if isinstance(e, str):
+            console.print(f"  {e.upper()} (core): (no thesis)")
+        else:
+            ticker = str(e.get("ticker", "")).upper()
+            thesis = str(e.get("thesis", ""))
+            strategy = str(e.get("strategy", "core")).lower()
+            cat = str(e.get("catalyst_date", ""))
+            cat_s = f" [catalyst {cat}]" if cat else ""
+            console.print(f"  {ticker} ({strategy}){cat_s}: {thesis or '(no thesis)'}", markup=False)
+
+
+@watchlist_app.command("scan")
+def watchlist_scan(
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+    no_jobs: bool = typer.Option(False, "--no-jobs", help="Gate entries but don't queue research jobs."),
+):
+    """Run all watchlist entries through the candidate gates. Queues research for those that pass."""
+    _configure_logging(verbose)
+    from tradingagents.portfolio_advisor.watchlist import scan_watchlist
+    from tradingagents.portfolio_advisor import etoro_scan
+
+    cfg = DEFAULT_CONFIG.copy()
+    try:
+        _, _, tickers, _ = etoro_scan.fetch_portfolio_rows()
+        live = etoro_scan.current_ticker_set(tickers)
+    except Exception:
+        live = set()
+    result = scan_watchlist(cfg, live_tickers=live, queue_jobs=not no_jobs)
+    console.print(f"[green]Scan complete:[/green] {result['scanned']} entries evaluated, "
+                  f"{result['queued']} research jobs queued")
+    if result["promoted"]:
+        console.print(f"  Passed gates / queued for research: {', '.join(result['promoted'])}")
+    if result["watch"]:
+        console.print(f"  Watch (weak thesis or missing data): {', '.join(result['watch'])}")
+    if result["rejected"]:
+        console.print(f"  Rejected (hard gate failure): {', '.join(result['rejected'])}")
+
+
+@watchlist_app.command("scan-deep")
+def watchlist_scan_deep(
+    no_generate: bool = typer.Option(
+        False, "--no-generate", help="Skip idea discovery; only gate/pick from the existing watchlist."
+    ),
+    generate_n: int = typer.Option(8, "--generate-n", help="How many new ideas to discover."),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+):
+    """Biweekly: discover new growth ideas, then send the single best to full_graph.
+
+    Generates fresh candidates that fit your mandate, adds them to the watchlist, gates everything,
+    picks one name, and queues a full_graph job. The next run-due tick runs the deep research; the
+    candidate pipeline then runs the PM comparison to decide. This is what the biweekly cron calls.
+    """
+    _configure_logging(verbose)
+    from tradingagents.portfolio_advisor.watchlist import scan_and_queue_one_deep
+    from tradingagents.portfolio_advisor import etoro_scan
+
+    cfg = DEFAULT_CONFIG.copy()
+    try:
+        _, _, tickers, _ = etoro_scan.fetch_portfolio_rows()
+        live = etoro_scan.current_ticker_set(tickers)
+    except Exception:
+        live = set()
+    result = scan_and_queue_one_deep(cfg, live_tickers=live, generate=not no_generate, generate_n=generate_n)
+    gen = result.get("generated") or {}
+    if gen.get("added"):
+        console.print(f"[cyan]Discovered & added to watchlist:[/cyan] {', '.join(gen['added'])}")
+    picked = result.get("picked")
+    if not picked:
+        console.print(f"[yellow]Nothing queued:[/yellow] {result.get('reason', 'no eligible candidate')}")
+        if result.get("rejected"):
+            console.print(f"  Rejected by gates: {', '.join(result['rejected'])}")
+        return
+    console.print(
+        f"[green]Queued full_graph deep dive:[/green] {picked} ({result.get('strategy')}, "
+        f"priority {result.get('priority')}, status {result.get('status')})"
+    )
+    console.print("  It will run on the next run-due tick (every 15 min) and the PM will decide on it.")
+
+
+@watchlist_app.command("research")
+def watchlist_research(
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+):
+    """Weekly research funnel (Stage 1): discover candidates from market news, gate them, queue screens.
+
+    News-driven discovery (with memory-generator top-up if news is thin) -> hard gates ->
+    cheap single_model thesis screens. Names that clear the screen auto-promote to full_graph
+    (capped per week); the PM then decides. This is what the weekly cron calls.
+    """
+    _configure_logging(verbose)
+    from tradingagents.portfolio_advisor.news_researcher import run_weekly_discovery
+    from tradingagents.portfolio_advisor import etoro_scan
+
+    cfg = DEFAULT_CONFIG.copy()
+    try:
+        _, _, tickers, _ = etoro_scan.fetch_portfolio_rows()
+        live = etoro_scan.current_ticker_set(tickers)
+    except Exception:
+        live = set()
+    result = run_weekly_discovery(cfg, live_tickers=live)
+    if result.get("discovered"):
+        console.print(f"[cyan]Discovered from news:[/cyan] {', '.join(result['discovered'])}")
+    if result.get("topped_up"):
+        console.print(f"[dim]Topped up from generator: {', '.join(result['topped_up'])}[/dim]")
+    if not result.get("added") and not result.get("screened"):
+        console.print(f"[yellow]Nothing queued:[/yellow] {result.get('reason', 'no candidates passed the rules')}")
+        return
+    console.print(f"[green]Queued {result.get('screened', 0)} single_model screen(s).[/green]")
+    if result.get("rejected"):
+        console.print(f"  Rejected by gates: {', '.join(result['rejected'])}")
+    console.print(
+        f"  Screens run on the next run-due tick; winners promote to full_graph "
+        f"(budget left this week: {result.get('full_graph_budget_left', '?')}). The PM then decides."
+    )
+
+
+@watchlist_app.command("generate")
+def watchlist_generate(
+    n: int = typer.Option(8, "--n", help="How many ideas to discover."),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+):
+    """Discover new growth-stock ideas that fit your mandate and add them to the watchlist (no research)."""
+    _configure_logging(verbose)
+    from tradingagents.portfolio_advisor.idea_generator import discover_ideas_to_watchlist
+    from tradingagents.portfolio_advisor import etoro_scan
+
+    cfg = DEFAULT_CONFIG.copy()
+    try:
+        _, _, tickers, _ = etoro_scan.fetch_portfolio_rows()
+        live = etoro_scan.current_ticker_set(tickers)
+    except Exception:
+        live = set()
+    result = discover_ideas_to_watchlist(cfg, live_tickers=live, n=n)
+    if not result.get("ideas"):
+        console.print("[yellow]No ideas generated.[/yellow]")
+        return
+    from rich.text import Text
+    for idea in result["ideas"]:
+        added = "added" if idea["ticker"] in result["added"] else "dup/skip"
+        console.print(Text(f"\n{idea['ticker']} ({idea['strategy']}) [{idea['theme']}] — {added}"), markup=False)
+        console.print(Text(f"    {idea['thesis']}", style="dim"))
+    console.print(f"\n[green]Added {len(result['added'])} new name(s) to the watchlist.[/green]")
+
+
 @portfolio_app.command("telegram-listen")
 def portfolio_advisor_telegram_listen(
     once: bool = typer.Option(False, "--once", help="Poll once and exit."),

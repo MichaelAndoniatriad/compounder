@@ -348,7 +348,12 @@ def _run_job(j: Dict[str, Any], cfg: Dict[str, Any], live: set, trade_date: str)
 
     try:
         if tier == "full_graph":
-            final_state, _signal = run_deep_research(tid, trade_date, analysts, cfg)
+            try:
+                from tradingagents.portfolio_advisor.position_plans import strategy_for_ticker
+                strategy = strategy_for_ticker(cfg, tid, job=j)
+            except Exception:
+                strategy = "core"
+            final_state, _signal = run_deep_research(tid, trade_date, analysts, cfg, strategy=strategy)
             rd = Path(str(cfg.get("results_dir", ".")))
             save_deep_report(results_dir=rd, ticker=tid, trade_date=trade_date, final_state=final_state)
             dec = str(final_state.get("final_trade_decision") or "")
@@ -363,6 +368,20 @@ def _run_job(j: Dict[str, Any], cfg: Dict[str, Any], live: set, trade_date: str)
                 handle_candidate_full_graph_result(cfg, j, dec, live_tickers=live)
             except Exception as e:
                 logger.warning("candidate full_graph transition failed for %s: %s", tid, e)
+            # Refresh this name's sleeve + thesis-break metrics from the fresh research.
+            if bool(cfg.get("portfolio_advisor_auto_classify_after_full_graph", True)):
+                try:
+                    from tradingagents.portfolio_advisor.position_plans import load_position_plans
+                    from tradingagents.portfolio_advisor.position_classifier import (
+                        classify_position, _apply_classification,
+                    )
+                    plans = load_position_plans(cfg)
+                    if tid in plans:
+                        c = classify_position(cfg, tid, plans[tid])
+                        if c is not None:
+                            _apply_classification(cfg, plans[tid], c)
+                except Exception as e:
+                    logger.warning("auto-classify after full_graph failed for %s: %s", tid, e)
             _save_job_outcome(cfg, jid, "completed")
             verdict = messaging.ntfy_verdict(dec, tid)
             return {"ticker": tid, "status": "completed", "verdict": verdict}

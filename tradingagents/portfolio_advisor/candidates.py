@@ -26,6 +26,7 @@ class CandidateRecord:
     ticker: str
     source: str = "monthly_lookout"
     reason: str = ""
+    strategy: str = "core"
     evidence_refs: List[str] = field(default_factory=list)
     status: CandidateStatus = "candidate"
     priority: int = 3
@@ -75,6 +76,8 @@ def normalize_candidate(raw: Any, *, default_source: str = "monthly_lookout", th
     out["source"] = str(out.get("source") or default_source).strip()
     if not out.get("reason") and theme:
         out["reason"] = theme
+    strategy = str(out.get("strategy") or "core").strip().lower()
+    out["strategy"] = strategy if strategy in ("core", "catalyst") else "core"
     out["priority"] = _priority(out.get("priority"))
     refs = out.get("evidence_refs") or []
     out["evidence_refs"] = [str(r).strip() for r in refs if str(r).strip()] if isinstance(refs, list) else []
@@ -131,16 +134,26 @@ def evaluate_candidate(
     if not thesis_ok:
         failures.append("missing_thesis")
 
+    strategy = str(data.get("strategy") or "core").strip().lower()
+    if strategy not in ("core", "catalyst"):
+        strategy = "core"
+
     catalyst_ok = _bool_gate(data.get("catalyst_ok"))
     catalyst_text = str(data.get("catalyst") or data.get("catalyst_date") or "").strip()
     if catalyst_ok is None:
         catalyst_ok = bool(catalyst_text)
-    gates["catalyst"] = "pass" if catalyst_ok else "unknown"
+    # A catalyst-sleeve candidate with no catalyst makes no sense — it is a hard failure.
+    if strategy == "catalyst":
+        gates["catalyst"] = "pass" if catalyst_ok else "fail"
+        if not catalyst_ok:
+            failures.append("missing_catalyst")
+    else:
+        gates["catalyst"] = "pass" if catalyst_ok else "unknown"
 
     full_graph_rating = str(data.get("full_graph_rating") or "").strip()
     priority = _priority(data.get("priority"))
     status: CandidateStatus
-    if any(f in failures for f in ("already_in_portfolio", "policy", "liquidity")):
+    if any(f in failures for f in ("already_in_portfolio", "policy", "liquidity", "missing_catalyst")):
         status = "rejected"
         next_action = "Do not research until failed gates are resolved."
     elif full_graph_rating in {"Buy", "Overweight"} and priority <= 2:
@@ -157,6 +170,7 @@ def evaluate_candidate(
         ticker=ticker,
         source=str(data.get("source") or default_source),
         reason=thesis_text,
+        strategy=strategy,
         evidence_refs=list(data.get("evidence_refs") or []),
         status=status,
         priority=priority,
@@ -375,6 +389,46 @@ def queue_candidate_research_jobs(cfg: Dict[str, Any], records: Iterable[Candida
     return len(new_rows)
 
 
+def queue_deep_candidate_job(
+    cfg: Dict[str, Any],
+    ticker: str,
+    reason: str = "",
+    *,
+    strategy: str = "core",
+) -> bool:
+    """Queue ONE full_graph candidate_promotion job (deduped against pending). Returns True if queued.
+
+    On completion, run-due calls handle_candidate_full_graph_result, which runs the PM
+    comparison when the deep decision is Buy/Overweight — i.e. the system 'decides' on the name.
+    """
+    now = datetime.now(timezone.utc)
+    tid = str(ticker or "").strip().upper()
+    if not tid:
+        return False
+    if weekly_full_graph_budget_left(cfg) <= 0:
+        return False
+    strategy = str(strategy or "core").strip().lower()
+    if strategy not in ("core", "catalyst"):
+        strategy = "core"
+    job = {
+        "id": f"canddeep_{tid}_{now.strftime('%Y%m%d%H%M%S')}",
+        "ticker": tid,
+        "scheduled_at": now.isoformat(),
+        "kind": "deep_research",
+        "reason": (reason or f"Watchlist deep dive on {tid}.")[:500],
+        "status": "pending",
+        "created_at": now.isoformat(),
+        "execution_tier": "full_graph",
+        "job_type": "thesis_check",
+        "source": "candidate_promotion",
+        "evidence_question": f"Does full_graph research support adding {tid} to the portfolio?",
+        "supersedes_job_id": "",
+        "strategy": strategy,
+        "flags": ["CANDIDATE_PROMOTION"],
+    }
+    return _append_candidate_job(cfg, job)
+
+
 def is_candidate_job(job: Dict[str, Any]) -> bool:
     source = str(job.get("source") or "").strip()
     flags = {str(f) for f in (job.get("flags") or [])}
@@ -420,6 +474,37 @@ def _append_candidate_job(cfg: Dict[str, Any], job: Dict[str, Any]) -> bool:
     return True
 
 
+def _weekly_full_graph_cap(cfg: Dict[str, Any]) -> int:
+    try:
+        return int(cfg.get("portfolio_advisor_weekly_full_graph_cap", 4))
+    except (TypeError, ValueError):
+        return 4
+
+
+def weekly_full_graph_budget_left(cfg: Dict[str, Any]) -> int:
+    """How many candidate full_graph deep runs remain in this rolling 7-day window.
+
+    Counts candidate-driven full_graph jobs (source candidate_promotion) created in the last
+    7 days regardless of status — pending, completed, or failed all consume the budget.
+    """
+    from datetime import timedelta
+
+    cap = _weekly_full_graph_cap(cfg)
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+    st = state.load_state(cfg)
+    used = 0
+    for j in st.get("jobs") or []:
+        if not isinstance(j, dict):
+            continue
+        if str(j.get("execution_tier") or "") != "full_graph":
+            continue
+        if str(j.get("source") or "") != "candidate_promotion":
+            continue
+        if str(j.get("created_at") or "") >= cutoff:
+            used += 1
+    return max(0, cap - used)
+
+
 def handle_candidate_light_research_result(
     cfg: Dict[str, Any],
     job: Dict[str, Any],
@@ -435,6 +520,21 @@ def handle_candidate_light_research_result(
     now = datetime.now(timezone.utc)
 
     if verdict == "INTACT":
+        # Screen passed. Promote to full_graph only if the weekly deep-run budget allows;
+        # otherwise hold the name as research_queued for a later week.
+        budget_left = weekly_full_graph_budget_left(cfg)
+        if budget_left <= 0:
+            rec = CandidateRecord(
+                ticker=tid,
+                source="candidate_light_research",
+                reason=str(job.get("reason") or ""),
+                status="research_queued",
+                priority=2,
+                gates={"light_thesis": "pass"},
+                next_action="Screen passed but weekly full_graph budget exhausted; holding for next week.",
+            )
+            append_candidate_records(cfg, [rec])
+            return {"handled": True, "verdict": verdict, "status": rec.status, "full_graph_queued": False, "deferred_cap": True}
         rec = CandidateRecord(
             ticker=tid,
             source="candidate_light_research",

@@ -66,10 +66,15 @@ def run_deep_research(
     trade_date: str,
     analysts: List[str],
     config: Dict[str, Any],
+    strategy: str = "core",
 ) -> Tuple[dict, Any]:
-    """Run the full LangGraph pipeline for one ticker (expensive)."""
+    """Run the full LangGraph pipeline for one ticker (expensive).
+
+    ``strategy`` ('core' or 'catalyst') selects which investor policy the agents apply.
+    """
     cfg = config.copy()
     cfg["output_language"] = cfg.get("output_language", "English")
+    cfg["active_strategy"] = (strategy or "core").strip().lower()
     set_config(cfg)
 
     selected = normalize_analysts(analysts)

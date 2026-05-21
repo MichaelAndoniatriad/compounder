@@ -24,6 +24,42 @@ def last_close_yfinance(ticker: str) -> Optional[float]:
         return None
 
 
+def next_earnings_date_yfinance(ticker: str) -> Optional[str]:
+    """Best-effort next (or most recent upcoming) earnings date as ISO YYYY-MM-DD, else None."""
+    sym = (ticker or "").strip().upper()
+    if not sym:
+        return None
+    try:
+        import yfinance as yf
+        from datetime import date, datetime
+
+        tk = yf.Ticker(sym)
+        # Preferred: explicit earnings-dates table (has future rows).
+        try:
+            df = tk.get_earnings_dates(limit=12)
+            if df is not None and len(df.index) > 0:
+                today = datetime.now().date()
+                future = [d for d in df.index if hasattr(d, "date") and d.date() >= today]
+                if future:
+                    return min(future).date().isoformat()
+        except Exception:
+            pass
+        # Fallback: calendar dict.
+        cal = getattr(tk, "calendar", None)
+        if isinstance(cal, dict):
+            ed = cal.get("Earnings Date")
+            if isinstance(ed, (list, tuple)) and ed:
+                ed = ed[0]
+            if isinstance(ed, date):
+                return ed.isoformat()
+            if isinstance(ed, str) and ed.strip():
+                return ed.strip()[:10]
+        return None
+    except Exception as e:
+        logger.debug("yfinance earnings date failed for %s: %s", sym, e)
+        return None
+
+
 def weekly_return_pct_yfinance(ticker: str, *, lookback_days: int = 7) -> Optional[float]:
     """Approximate calendar window return using last two closes in range."""
     sym = (ticker or "").strip().upper()
