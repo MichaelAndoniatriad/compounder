@@ -278,3 +278,76 @@ Please reference our work if you find *TradingAgents* provides you with some hel
       url={https://arxiv.org/abs/2412.20138}, 
 }
 ```
+
+---
+
+## Portfolio Advisor System
+
+An autonomous portfolio management layer built on top of TradingAgents. It runs on a cron schedule, discovers investment candidates from live market news, screens them through a 3-stage research funnel, tracks per-position exit rules across two strategy sleeves, and runs a daily PM cycle against a live eToro portfolio.
+
+```mermaid
+flowchart TD
+    subgraph DATA["Data Sources"]
+        ET["eToro\nlive portfolio + cash balance"]
+        GN["get_global_news\nlive market news feed"]
+        YF["yfinance\nprices + earnings dates"]
+    end
+
+    subgraph CRONS["Cron Schedule"]
+        C1["Every 15 min\nrun-due — pending jobs + PM cycle"]
+        C2["Daily 2 am\nweekly check forced"]
+        C3["Monday 4 am\nwatchlist research — Stage 1"]
+    end
+
+    subgraph FUNNEL["Research Funnel"]
+        S1["Stage 1 — news_researcher\nDiscover candidates from live news\nhybrid top-up from idea_generator if thin"]
+        S2["Stage 2 — candidates.py\nHard gates + single_model thesis screen"]
+        S3["Stage 3 — full_graph\n12-agent LangGraph deep run\ncapped at 4 per rolling 7 days"]
+        S1 -->|"adds to watchlist"| S2
+        S2 -->|"screen INTACT → promote"| S3
+    end
+
+    subgraph GRAPH["full_graph — LangGraph Pipeline"]
+        G1["Analysts\nMarket · Sentiment · Fundamentals · News"]
+        G2["Bull / Bear Researchers"]
+        G3["Risk Debaters"]
+        G4["Research Manager → Trader → PM"]
+        G1 --> G2 --> G3 --> G4
+    end
+
+    subgraph ADVISOR["Portfolio Advisor"]
+        PM["PM cycle\nadvisor_pm.py"]
+        PP["Position Plans\ndeterministic exit triggers per holding"]
+        CL["Position Classifier\nLLM assigns sleeve + thesis-break metrics"]
+        SA["Sleeve Allocation\n50% core / 40% catalyst / 10% cash\ndrift tolerance 7 pts"]
+    end
+
+    subgraph SLEEVES["Two Strategy Sleeves"]
+        CORE["Core — long-term compounder\n+15% pre-earnings trim\n+100% double · -30% soft stop · -40% hard stop"]
+        CAT["Catalyst — event-driven trade\n-8% hard stop · trailing stop arms at +10%\ntime-stop 3d post-catalyst · 30d max hold"]
+    end
+
+    C3 --> S1
+    C1 -->|"run pending jobs"| S2
+    C1 -->|"batch_complete"| PM
+    C2 --> PM
+
+    GN --> S1
+    ET --> PM
+    YF --> PP
+
+    S3 --> GRAPH
+    GRAPH -->|"auto-classify after deep run"| CL
+    CL --> PP
+    PP -->|"POSITION RULE STATUS block"| PM
+    SA -->|"drift flags + rebalance guidance"| PM
+    PM --> SLEEVES
+```
+
+### Design principles
+
+- **Reallocation only on thesis-break** — never based on relative scoring or drawdown alone
+- **Sleeve locked at entry** — a losing catalyst trade cannot be reclassified as core to dodge its stop
+- **Candidates pass hard gates, not scores** — valuation/pre-buy for core; a dated catalyst is required for catalyst names
+- **Cash-funded entries first** — check available balance before any new position; new capital steers toward the under-target sleeve
+- **Deterministic exit triggers** — rule checks are Python, not LLM judgment; LLM only classifies and advises
