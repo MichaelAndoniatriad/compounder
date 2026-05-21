@@ -8,7 +8,7 @@ from typing import Any, Dict, List
 
 from tradingagents.advisor.earnings import next_earnings_from_yfinance
 from tradingagents.agents.utils.event_log import append_event
-from tradingagents.portfolio_advisor import etoro_scan, messaging, price_util
+from tradingagents.portfolio_advisor import etoro_scan, messaging, outcome_sync, price_util, state as pa_state
 from tradingagents.portfolio_advisor.plan_validation import (
     _gain_dd_pct,
     group_position_rows_by_ticker,
@@ -96,6 +96,54 @@ def _split_watchdog_triggers(
     return mandatory, trim, review
 
 
+def _watchdog_check_position_changes(
+    cfg: Dict[str, Any],
+    live_list: Any,
+    rows: List[Dict[str, Any]],
+) -> None:
+    """Detect ticker additions/removals and ping the PM when the book changes."""
+    live: set[str] = etoro_scan.current_ticker_set(live_list)
+
+    try:
+        outcome_sync.auto_close_outcomes(cfg, live, rows=rows)
+    except Exception:
+        logger.debug("watchdog: outcome_sync skipped", exc_info=True)
+
+    st = pa_state.load_state(cfg)
+    prev: set[str] = {str(t).upper().strip() for t in (st.get("last_portfolio_tickers") or []) if t}
+    added = sorted(live - prev)
+    removed = sorted(prev - live)
+
+    if not added and not removed:
+        return
+
+    for j in list(st.get("jobs") or []):
+        if j.get("status") != "pending":
+            continue
+        tid = str(j.get("ticker") or "").strip().upper()
+        if tid and tid not in live:
+            jid = str(j.get("id") or "")
+            if jid:
+                pa_state.cancel_job(st, jid, reason="watchdog: not in portfolio")
+
+    st["last_portfolio_tickers"] = sorted(live)
+    pa_state.save_state(cfg, st)
+
+    logger.info("watchdog: position change detected — added %s removed %s", added, removed)
+    try:
+        from tradingagents.portfolio_advisor.advisor_pm import optional_pm_cycle_on_portfolio_change
+        optional_pm_cycle_on_portfolio_change(
+            cfg,
+            trigger="watchdog_position_change",
+            old_portfolio_text_hash=None,
+            new_portfolio_text_hash="",
+            tickers_added=added,
+            tickers_removed=removed,
+        )
+    except Exception:
+        logger.exception("watchdog: PM cycle on position change failed")
+
+
 def run_watchdog(cfg: Dict[str, Any], *, ignore_market_hours: bool = False) -> int:
     """Return count of outbound watchdog notifications (0 to 3 if all buckets fire)."""
     if not ignore_market_hours and not in_us_equity_watch_window_utc():
@@ -108,6 +156,8 @@ def run_watchdog(cfg: Dict[str, Any], *, ignore_market_hours: bool = False) -> i
     except Exception as e:
         logger.error("watchdog: eToro fetch failed: %s", e)
         return 0
+
+    _watchdog_check_position_changes(cfg, _tickers, rows)
 
     mandatory, trim, review = _split_watchdog_triggers(rows)
     sent = 0

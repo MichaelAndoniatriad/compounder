@@ -1360,6 +1360,11 @@ For direct human questions, answer from the live portfolio snapshot, latest comp
 and the explicit question only. Do not echo prior PM prose or repeated old notifications. If old memory conflicts
 with the live snapshot or latest evidence, say what changed and prefer the live/latest evidence.
 
+The portfolio snapshot below is fetched live from eToro on every PM cycle — it is always current as of this run.
+If the human asks you to "refresh" or "check eToro", you already have done so: the snapshot above is the result.
+If a position the human says they closed still appears in the snapshot, tell them it still shows open in eToro's
+live data (likely an eToro API lag) — do not say you cannot refresh or that you need a sync.
+
 Execution tiers (for append_jobs only): "full_graph" runs the full multi-agent pipeline on one ticker; "single_model" is a faster desk-style pass (thesis_check, weekly_summary, post_earnings, routine_monitoring).
 
 Trigger for this cycle: {trigger_s}
@@ -1446,6 +1451,7 @@ the trigger, say that plainly and use append_jobs to send a new research layer t
         provider=provider,
         model=model,
         base_url=base,
+        max_completion_tokens=4096,
         **_provider_kwargs(cfg),
     )
     llm = client.get_llm()
