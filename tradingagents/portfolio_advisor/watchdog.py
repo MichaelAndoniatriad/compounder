@@ -6,7 +6,6 @@ import logging
 from datetime import date, datetime, timezone
 from typing import Any, Dict, List
 
-from tradingagents.advisor.earnings import next_earnings_from_yfinance
 from tradingagents.agents.utils.event_log import append_event
 from tradingagents.portfolio_advisor import etoro_scan, messaging, outcome_sync, price_util, state as pa_state
 from tradingagents.portfolio_advisor.plan_validation import (
@@ -17,6 +16,27 @@ from tradingagents.portfolio_advisor.plan_validation import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _current_price_from_lots(lots: list) -> float | None:
+    """Derive live price from eToro row fields (unitsBaseValueDollars / units)."""
+    for r in lots:
+        try:
+            ubv = r.get("unitsBaseValueDollars")
+            units = r.get("units")
+            if ubv is not None and units:
+                return float(ubv) / float(units)
+        except (TypeError, ValueError, ZeroDivisionError):
+            pass
+        try:
+            open_rate = r.get("openRate")
+            pnl = r.get("unrealizedPnL")
+            units = r.get("units")
+            if open_rate is not None and pnl is not None and units:
+                return float(open_rate) + float(pnl) / float(units)
+        except (TypeError, ValueError, ZeroDivisionError):
+            pass
+    return None
 
 
 ACTION_LINES = {
@@ -63,11 +83,16 @@ def _split_watchdog_triggers(
     for sym, lots in by_sym.items():
         entry = weighted_avg_open_for_lots(lots)
         is_long = representative_is_long_for_lots(lots)
-        px = price_util.last_close_yfinance(sym)
+        px = _current_price_from_lots(lots) or price_util.last_close_yfinance(sym)
         if px is None or entry <= 0:
             continue
         gain, dd = _gain_dd_pct(entry, px, is_long)
-        ed = next_earnings_from_yfinance(sym)
+        ed_str = price_util.next_earnings_date_yfinance(sym)
+        try:
+            from datetime import datetime as _dt
+            ed = _dt.strptime(ed_str, "%Y-%m-%d").date() if ed_str else None
+        except (ValueError, TypeError):
+            ed = None
         pre = (
             ed is not None
             and gain >= 15.0
@@ -155,6 +180,24 @@ def run_watchdog(cfg: Dict[str, Any], *, ignore_market_hours: bool = False) -> i
         _payload, _text, _tickers, rows = etoro_scan.fetch_portfolio_rows()
     except Exception as e:
         logger.error("watchdog: eToro fetch failed: %s", e)
+        try:
+            st_err = pa_state.load_state(cfg)
+            last_iso = st_err.get("last_watchdog_fetch_alert_iso") or ""
+            from datetime import datetime as _dt2, timezone as _tz
+            last_dt = _dt2.fromisoformat(last_iso) if last_iso else None
+            now_utc = _dt2.now(_tz.utc)
+            throttle_h = int(cfg.get("portfolio_advisor_silent_alert_throttle_hours") or 6)
+            if last_dt is None or (now_utc - last_dt).total_seconds() >= throttle_h * 3600:
+                st_err["last_watchdog_fetch_alert_iso"] = now_utc.isoformat()
+                pa_state.save_state(cfg, st_err)
+                messaging.send_advisor_message(
+                    cfg,
+                    "Advisor: watchdog portfolio fetch failed",
+                    f"Watchdog could not fetch eToro portfolio: {e}. Price triggers are paused until this clears.",
+                    urgent=True,
+                )
+        except Exception:
+            logger.debug("watchdog: failed to send fetch-failure alert", exc_info=True)
         return 0
 
     _watchdog_check_position_changes(cfg, _tickers, rows)
