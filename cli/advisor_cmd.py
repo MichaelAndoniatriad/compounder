@@ -487,6 +487,59 @@ def portfolio_cost_report(
     console.print(f"\n[dim]Calls with unknown pricing: {null_count}[/dim]")
 
 
+@portfolio_app.command("heartbeat")
+def portfolio_advisor_heartbeat():
+    """Send a system-alive Telegram ping: positions tracked, cron/watchdog status, last alert age."""
+    from datetime import datetime, timezone
+    cfg = DEFAULT_CONFIG.copy()
+    try:
+        from tradingagents.portfolio_advisor import etoro_scan, messaging, state as pa_state
+        from tradingagents.portfolio_advisor.position_plans import load_position_plans
+        from tradingagents.portfolio_advisor.messaging import load_recent_messages
+
+        _payload, _text, _tickers, rows = etoro_scan.fetch_portfolio_rows()
+        n_positions = len({str(r.get("symbolFull") or "").strip().upper() for r in rows if r.get("symbolFull")})
+
+        plans = load_position_plans(cfg)
+        n_plans = len(plans)
+
+        recent = load_recent_messages(cfg, limit=50)
+        last_alert = None
+        for m in recent:
+            if not m.get("suppressed_duplicate") and m.get("delivered"):
+                last_alert = m.get("timestamp")
+                break
+        if last_alert:
+            try:
+                ts = datetime.fromisoformat(last_alert.replace("Z", "+00:00"))
+                age_h = (datetime.now(timezone.utc) - ts).total_seconds() / 3600
+                last_alert_str = f"{age_h:.0f}h ago"
+            except Exception:
+                last_alert_str = last_alert[:16]
+        else:
+            last_alert_str = "none on record"
+
+        st = pa_state.load_state(cfg)
+        pending = len([j for j in (st.get("jobs") or []) if j.get("status") == "pending"])
+
+        body = (
+            f"Positions tracked: {n_positions}\n"
+            f"Position plans: {n_plans}\n"
+            f"Pending jobs: {pending}\n"
+            f"Last delivered alert: {last_alert_str}\n"
+            f"eToro fetch: OK"
+        )
+        ok = messaging.send_advisor_message(cfg, "Advisor: system alive", body, urgent=True)
+        if ok:
+            console.print("[green]Heartbeat sent.[/green]")
+        else:
+            console.print("[yellow]Heartbeat logged (no Telegram configured or quiet hours).[/yellow]")
+        console.print(body)
+    except Exception as e:
+        console.print(f"[red]Heartbeat failed: {e}[/red]")
+        raise typer.Exit(1)
+
+
 # ---------------------------------------------------------------------------
 # Position plan commands
 # ---------------------------------------------------------------------------

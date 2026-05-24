@@ -234,13 +234,33 @@ def classify_all_holdings(
     classified: List[Dict[str, Any]] = []
     sell_flags: List[str] = []
     skipped: List[str] = []
+    failed: List[str] = []
     for ticker, plan in sorted(plans.items()):
         if only_missing and plan.thesis_break_metrics:
             skipped.append(ticker)
             continue
         c = classify_position(cfg, ticker, plan)
         if c is None:
-            skipped.append(ticker)
+            failed.append(ticker)
+            if (plan.strategy or "core") == "catalyst":
+                logger.warning(
+                    "classify_position failed for catalyst position %s — "
+                    "exit rules may be wrong (core stops applied instead of -8%% hard stop). "
+                    "Re-run: position-plan classify --ticker %s",
+                    ticker, ticker,
+                )
+                try:
+                    from tradingagents.portfolio_advisor import messaging
+                    messaging.send_advisor_message(
+                        cfg,
+                        f"Advisor: classifier failed for catalyst {ticker}",
+                        f"{ticker} is tagged catalyst but classification failed — "
+                        f"the -8% hard stop rule will NOT fire until it is reclassified. "
+                        f"Run: advisor portfolio position-plan classify",
+                        urgent=True,
+                    )
+                except Exception:
+                    pass
             continue
         _apply_classification(cfg, plan, c)
         rec = (c.recommendation or "hold").strip().lower()
@@ -273,4 +293,4 @@ def classify_all_holdings(
     except Exception:
         pass
 
-    return {"classified": classified, "sell_flags": sell_flags, "skipped": skipped}
+    return {"classified": classified, "sell_flags": sell_flags, "skipped": skipped, "failed": failed}
