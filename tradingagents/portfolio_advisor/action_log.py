@@ -140,6 +140,14 @@ def ingest_from_analysis(cfg: Dict[str, Any], ticker: str, text: str, source: st
     upsert_action(cfg, ticker, action, required_action, source=source)
 
 
+def _clean_trim(text: str, limit: int = 280) -> str:
+    """Trim to a word boundary with an ellipsis — never cut mid-word/sentence."""
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit].rsplit(" ", 1)[0].rstrip(",.;:") + "…"
+
+
 def format_digest(cfg: Dict[str, Any]) -> str:
     """Format open action items for a short ntfy message."""
     items = load_open_actions(cfg)
@@ -156,7 +164,7 @@ def format_digest(cfg: Dict[str, Any]) -> str:
         except Exception:
             pass
         lines.append(
-            f"- {item['ticker']} {item['action'].upper()}{age}: {item['rationale'][:120]}"
+            f"- {item['ticker']} {item['action'].upper()}{age}: {_clean_trim(item['rationale'])}"
         )
     return "\n".join(lines)
 

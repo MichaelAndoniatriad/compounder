@@ -46,7 +46,7 @@ fi
 {
   echo "===== $(_ts) portfolio advisor evening-digest start ====="
   set +e
-  "$PY" -m cli.main advisor portfolio morning-digest
+  "$PY" -m cli.main advisor portfolio evening-digest
   ec=$?
   set -e
   echo "===== $(_ts) portfolio advisor evening-digest end (exit $ec) ====="
