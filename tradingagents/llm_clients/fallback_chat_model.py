@@ -12,7 +12,7 @@ import logging
 from functools import partial
 from typing import Any, Optional
 
-from langchain_core.runnables import RunnableLambda
+from langchain_core.runnables import RunnableLambda, Runnable
 
 logger = logging.getLogger(__name__)
 
@@ -67,8 +67,13 @@ def rate_limit_fallback_runnable(primary: Any, fallback: Optional[Any]) -> Any:
     return RunnableLambda(partial(_dual_invoke, primary, fallback))
 
 
-class RateLimitFallbackChatModel:
-    """Thin façade matching ``bind_tools`` / ``with_structured_output`` / ``invoke``."""
+class RateLimitFallbackChatModel(Runnable):
+    """Thin façade matching ``bind_tools`` / ``with_structured_output`` / ``invoke``.
+
+    Subclasses ``Runnable`` so it can be piped directly (``prompt | llm``) by
+    analysts that don't bind tools (e.g. the social/sentiment analyst); without
+    this, LCEL's ``coerce_to_runnable`` rejects the bare façade.
+    """
 
     def __init__(self, primary: Any, fallback: Optional[Any]):
         self._primary = primary
