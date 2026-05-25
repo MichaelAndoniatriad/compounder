@@ -84,6 +84,14 @@ def _within_send_window(cfg: Dict[str, Any], now: Optional[datetime] = None) -> 
     return False
 
 
+def _clean_trim(text: str, limit: int) -> str:
+    """Trim to a word boundary with an ellipsis — never cut mid-word/sentence."""
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit].rsplit(" ", 1)[0].rstrip(",.;:") + "…"
+
+
 def ntfy_verdict(text: str, ticker: str) -> str:
     """Reduce analysis text to a short actionable line for phone notifications."""
     import re
@@ -109,9 +117,9 @@ def ntfy_verdict(text: str, ticker: str) -> str:
             action = s
 
     if verdict:
-        out = verdict[:120]
+        out = _clean_trim(verdict, 160)
         if action and action.lower() not in verdict.lower():
-            out = f"{out} — {action[:80]}"
+            out = f"{out} — {_clean_trim(action, 100)}"
         return out
 
     # Fall back: find BUY/SELL/HOLD/TRIM/EXIT keyword and surrounding sentence
@@ -119,12 +127,12 @@ def ntfy_verdict(text: str, ticker: str) -> str:
         kw_upper = kw.upper()
         for sent in re.split(r'[.!\n]', text[:1000]):
             if kw_upper in sent.upper():
-                clean = sent.strip()[:120]
+                clean = _clean_trim(sent, 160)
                 if clean:
                     return clean
         return kw_upper
 
-    return text[:120]
+    return _clean_trim(text, 160)
 
 _MAX_BODY_PERSISTED = 50000
 _TELEGRAM_MAX_TEXT = 4096
