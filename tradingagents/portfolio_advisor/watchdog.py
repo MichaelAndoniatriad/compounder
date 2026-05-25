@@ -14,8 +14,19 @@ from tradingagents.portfolio_advisor.plan_validation import (
     representative_is_long_for_lots,
     weighted_avg_open_for_lots,
 )
+from tradingagents.integrations.etoro.portfolio import (
+    position_invested_usd,
+    position_unrealized_pnl,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _to_float(v: Any) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _current_price_from_lots(lots: list) -> float | None:
@@ -83,10 +94,23 @@ def _split_watchdog_triggers(
     for sym, lots in by_sym.items():
         entry = weighted_avg_open_for_lots(lots)
         is_long = representative_is_long_for_lots(lots)
-        px = _current_price_from_lots(lots) or price_util.last_close_yfinance(sym)
-        if px is None or entry <= 0:
+        # Gain/drawdown from eToro's own reported P&L — split-immune and reliable.
+        # unitsBaseValueDollars/units is unreliable (often equals cost basis),
+        # which produced false 0% gains and bogus mandatory-exit drawdowns.
+        pnl = sum(_to_float(position_unrealized_pnl(l)) for l in lots)
+        inv = sum(_to_float(position_invested_usd(l)) for l in lots)
+        if inv > 0:
+            gain = pnl / inv * 100.0
+            dd = max(0.0, -gain)
+            px = entry * (1.0 + gain / 100.0) if is_long else entry * (1.0 - gain / 100.0)
+        elif entry > 0:
+            # eToro P&L unavailable — fall back to the price-based estimate.
+            px = _current_price_from_lots(lots) or price_util.last_close_yfinance(sym)
+            if px is None:
+                continue
+            gain, dd = _gain_dd_pct(entry, px, is_long)
+        else:
             continue
-        gain, dd = _gain_dd_pct(entry, px, is_long)
         ed_str = price_util.next_earnings_date_yfinance(sym)
         try:
             from datetime import datetime as _dt
