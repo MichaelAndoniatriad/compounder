@@ -888,19 +888,35 @@ def _content_from_llm_message(msg: Any) -> str:
 
 
 def _coerce_pm_result_from_text(text: str) -> AdvisorPMCycleResult:
-    raw = text.strip()
-    try:
-        return AdvisorPMCycleResult.model_validate_json(raw)
-    except Exception:
-        return AdvisorPMCycleResult(
-            executive_summary=raw[:8000] if raw else "(empty LLM response)",
-            stances=[],
-            forward_tasks=[],
-            memory_note="",
-            request_replan=False,
-            replan_rationale="",
-            append_jobs=[],
-        )
+    raw = (text or "").strip()
+    # Models (esp. DeepSeek) wrap the JSON in ```json fences or surround it with
+    # prose. Try the raw text, then a fenced block, then the widest brace span —
+    # so a fenced reply is parsed into real fields instead of being dumped whole.
+    candidates = [raw]
+    fence = re.search(r"```(?:json)?\s*(\{.*\})\s*```", raw, re.DOTALL)
+    if fence:
+        candidates.append(fence.group(1))
+    start, end = raw.find("{"), raw.rfind("}")
+    if start != -1 and end > start:
+        candidates.append(raw[start : end + 1])
+    for cand in candidates:
+        try:
+            return AdvisorPMCycleResult.model_validate_json(cand)
+        except Exception:
+            continue
+    # Parsing failed completely. NEVER send raw JSON to the user: if it still
+    # looks like JSON, leave the summary blank (the reply builder shows a clean
+    # fallback); otherwise treat it as a plain-prose answer.
+    looks_json = raw.startswith("```") or raw.lstrip().startswith("{")
+    return AdvisorPMCycleResult(
+        executive_summary="" if looks_json else raw[:8000],
+        stances=[],
+        forward_tasks=[],
+        memory_note="",
+        request_replan=False,
+        replan_rationale="",
+        append_jobs=[],
+    )
 
 
 # ---------------------------------------------------------------------------
