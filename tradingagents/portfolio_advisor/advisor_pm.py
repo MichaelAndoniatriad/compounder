@@ -889,34 +889,58 @@ def _content_from_llm_message(msg: Any) -> str:
 
 def _coerce_pm_result_from_text(text: str) -> AdvisorPMCycleResult:
     raw = (text or "").strip()
-    # Models (esp. DeepSeek) wrap the JSON in ```json fences or surround it with
-    # prose. Try the raw text, then a fenced block, then the widest brace span —
-    # so a fenced reply is parsed into real fields instead of being dumped whole.
-    candidates = [raw]
+    # Pull a JSON object out of the response. Models (esp. DeepSeek) wrap it in
+    # ```json fences or surround it with prose, so try a fenced block and the
+    # widest brace span before giving up.
+    candidates: List[str] = []
     fence = re.search(r"```(?:json)?\s*(\{.*\})\s*```", raw, re.DOTALL)
     if fence:
         candidates.append(fence.group(1))
     start, end = raw.find("{"), raw.rfind("}")
     if start != -1 and end > start:
         candidates.append(raw[start : end + 1])
+    candidates.append(raw)
+
+    obj = None
     for cand in candidates:
         try:
-            return AdvisorPMCycleResult.model_validate_json(cand)
+            parsed = json.loads(cand)
+            if isinstance(parsed, dict):
+                obj = parsed
+                break
         except Exception:
             continue
-    # Parsing failed completely. NEVER send raw JSON to the user: if it still
-    # looks like JSON, leave the summary blank (the reply builder shows a clean
-    # fallback); otherwise treat it as a plain-prose answer.
-    looks_json = raw.startswith("```") or raw.lstrip().startswith("{")
-    return AdvisorPMCycleResult(
-        executive_summary="" if looks_json else raw[:8000],
-        stances=[],
-        forward_tasks=[],
-        memory_note="",
-        request_replan=False,
-        replan_rationale="",
-        append_jobs=[],
-    )
+
+    if obj is None:
+        # Not JSON at all — treat the whole thing as a prose answer.
+        return AdvisorPMCycleResult(
+            executive_summary=raw[:8000],
+            stances=[], forward_tasks=[], memory_note="",
+            request_replan=False, replan_rationale="", append_jobs=[],
+        )
+
+    # Repair commonly-omitted required fields so one missing field doesn't make
+    # us discard an otherwise useful response (DeepSeek drops these sometimes).
+    obj.setdefault("executive_summary", "")
+    repaired_stances = []
+    for st in obj.get("stances") or []:
+        if isinstance(st, dict) and st.get("ticker"):
+            st.setdefault("stance", "unknown")
+            repaired_stances.append(st)
+    obj["stances"] = repaired_stances
+
+    try:
+        return AdvisorPMCycleResult.model_validate(obj)
+    except Exception:
+        # A nested sub-object is still malformed — preserve the human-facing
+        # prose (summary / push_note / memory) instead of losing everything.
+        return AdvisorPMCycleResult(
+            executive_summary=str(obj.get("executive_summary") or "")[:8000],
+            push_note=str(obj.get("push_note") or ""),
+            memory_note=str(obj.get("memory_note") or ""),
+            stances=[], forward_tasks=[], append_jobs=[],
+            request_replan=False, replan_rationale="",
+        )
 
 
 # ---------------------------------------------------------------------------
