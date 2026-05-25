@@ -108,6 +108,12 @@ def _make_llm_for_spec(
     if "/o1" in model or "/o3" in model:
         client_kwargs.setdefault("max_completion_tokens", _vault_max_tokens(config))
 
+    # Low, fixed temperature for more repeatable verdicts across runs. Applies to
+    # all roles; reasoning models accept it (and largely sample-invariantly).
+    temp = config.get("graph_temperature")
+    if temp is not None:
+        client_kwargs.setdefault("temperature", float(temp))
+
     client = create_llm_client(
         "openrouter",
         model,
