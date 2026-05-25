@@ -495,6 +495,30 @@ def _ensure_conflict_research_job(result: AdvisorPMCycleResult, ticker: str, gra
     return True
 
 
+def _recent_full_graph_count(cfg: Dict[str, Any], ticker: str, days: int = 14) -> int:
+    """How many full_graph decisions ran for this ticker in the recent window.
+
+    Used to stop re-running deep research on a name whose verdict keeps
+    conflicting with the thesis read — escalate to the human instead of looping.
+    """
+    try:
+        from tradingagents.agents.utils.event_log import _iter_events
+        from datetime import timedelta
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        tk = ticker.strip().upper()
+        n = 0
+        for row in _iter_events(cfg, max_lines=5000):
+            if str(row.get("timestamp") or "") < cutoff:
+                continue
+            if str(row.get("event_type") or "") != "full_graph_decision":
+                continue
+            if str(row.get("ticker") or "").strip().upper() == tk:
+                n += 1
+        return n
+    except Exception:
+        return 0
+
+
 def _validate_pm_cycle_result(
     cfg: Dict[str, Any],
     result: AdvisorPMCycleResult,
@@ -590,23 +614,52 @@ def _validate_pm_cycle_result(
             )
         ):
             old = stance.stance
-            queued = _ensure_conflict_research_job(result, tk, graph_rating)
-            stance.stance = "unknown"
-            stance.rationale = (
-                (stance.rationale or "").strip()
-                + f" This conflicts with the latest full-graph decision ({graph_rating}); "
-                "newer cited evidence is required before changing stance."
-            ).strip()
-            overrides.append(
-                {
-                    "field": f"stances.{tk}.stance",
-                    "action": "downgraded_full_graph_conflict",
-                    "from": old,
-                    "latest_full_graph_ref": graph_decision.get("id"),
-                    "latest_full_graph_rating": graph_rating,
-                    "queued_conflict_research": queued,
-                }
-            )
+            cap = _pm_int(cfg, "portfolio_advisor_conflict_rerun_cap", 2, 0, 20)
+            prior_runs = _recent_full_graph_count(cfg, tk)
+            if prior_runs >= cap:
+                # Deep research has run repeatedly and still conflicts with the
+                # thesis read. Stop looping; escalate to the human once.
+                queued = False
+                stance.stance = "unknown"
+                stance.rationale = (
+                    (stance.rationale or "").strip()
+                    + f" Deep research ({graph_rating}) and the thesis read have disagreed across "
+                    f"{prior_runs} full-graph runs in {14} days — this needs your call, not another run."
+                ).strip()
+                escalation = (
+                    f"{tk}: deep research keeps saying {graph_rating} but the thesis read keeps "
+                    f"breaking ({prior_runs} runs, unresolved). I can't settle this automatically — "
+                    f"your call: hold or cut."
+                )
+                existing_push = (result.push_note or "").strip()
+                result.push_note = f"{existing_push} | {escalation}" if existing_push else escalation
+                overrides.append(
+                    {
+                        "field": f"stances.{tk}.stance",
+                        "action": "escalated_unresolved_conflict",
+                        "from": old,
+                        "latest_full_graph_rating": graph_rating,
+                        "full_graph_runs_14d": prior_runs,
+                    }
+                )
+            else:
+                queued = _ensure_conflict_research_job(result, tk, graph_rating)
+                stance.stance = "unknown"
+                stance.rationale = (
+                    (stance.rationale or "").strip()
+                    + f" This conflicts with the latest full-graph decision ({graph_rating}); "
+                    "newer cited evidence is required before changing stance."
+                ).strip()
+                overrides.append(
+                    {
+                        "field": f"stances.{tk}.stance",
+                        "action": "downgraded_full_graph_conflict",
+                        "from": old,
+                        "latest_full_graph_ref": graph_decision.get("id"),
+                        "latest_full_graph_rating": graph_rating,
+                        "queued_conflict_research": queued,
+                    }
+                )
         if stance.stance in {"buy", "sell", "trim", "add"}:
             has_research_ref = any(str(r).startswith("event:") for r in stance.evidence_refs)
             if stale_info or not has_research_ref:
