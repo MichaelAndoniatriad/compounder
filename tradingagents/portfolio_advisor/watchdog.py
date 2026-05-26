@@ -59,10 +59,16 @@ ACTION_LINES = {
 
 
 def _format_ticker_block(t: Dict[str, Any]) -> List[str]:
-    """One per-ticker block: data line, primary action line, trailing blank line."""
+    """One per-ticker block: human-readable data line, action line, blank line."""
+    gain = float(t.get("gain_pct") or 0.0)
+    dd = float(t.get("drawdown_pct") or 0.0)
+    entry = float(t.get("entry") or 0.0)
+    price = float(t.get("price") or 0.0)
+    direction = "up" if gain >= 0 else "down"
+    magnitude = abs(gain) if gain >= 0 else dd
     data = (
-        f"{t['ticker']}: codes {t['codes']} | weighted_avg_entry {t['entry']:.4f} "
-        f"| last ~{t['price']:.4f} | gain {t['gain_pct']:.1f}% | drawdown {t['drawdown_pct']:.1f}%"
+        f"{t['ticker']}: {direction} {magnitude:.1f}% "
+        f"(entry ~${entry:.2f}, now ~${price:.2f})."
     )
     codes = t.get("codes") or []
     primary_code = codes[0] if codes else ""
@@ -238,7 +244,7 @@ def run_watchdog(cfg: Dict[str, Any], *, ignore_market_hours: bool = False) -> i
             lines.extend(_format_ticker_block(t))
         messaging.send_advisor_message(
             cfg,
-            "[TradingAgents] Watchdog CRITICAL dd40_mandatory_exit",
+            "Watchdog: mandatory exit (40% drawdown hit)",
             "\n".join(lines),
             urgent=True,
         )
@@ -262,7 +268,7 @@ def run_watchdog(cfg: Dict[str, Any], *, ignore_market_hours: bool = False) -> i
             lines.extend(_format_ticker_block(t))
         messaging.send_advisor_message(
             cfg,
-            "[TradingAgents] Watchdog HIGH sell_half double_or_pre_earnings",
+            "Watchdog: sell half (double or pre-earnings trim)",
             "\n".join(lines),
             urgent=True,
         )
@@ -286,7 +292,7 @@ def run_watchdog(cfg: Dict[str, Any], *, ignore_market_hours: bool = False) -> i
             lines.extend(_format_ticker_block(t))
         messaging.send_advisor_message(
             cfg,
-            "[TradingAgents] Watchdog HIGH dd30_review",
+            "Watchdog: drawdown review (30% threshold)",
             "\n".join(lines),
             urgent=True,
         )
