@@ -97,6 +97,10 @@ def _format_pm_reply(result: AdvisorPMCycleResult) -> str:
     the dashboard, not on a phone.
     """
     summary = (result.executive_summary or "").strip()
+    # Defang literal "None"/"null" — some model outputs land that way and a
+    # bare "None" must never be sent to the user as an answer.
+    if summary.lower() in ("none", "null", "undefined"):
+        summary = ""
     lines: List[str] = [summary] if summary else []
 
     if result.append_jobs:

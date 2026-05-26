@@ -1186,11 +1186,20 @@ def _trigger_run_due_async() -> None:
         logger.warning("Failed to trigger async run-due: %s", e)
 
 
-def _notify_action_stances(cfg: Dict[str, Any], result: AdvisorPMCycleResult, portfolio_rows: List[Dict[str, Any]]) -> bool:
+def _notify_action_stances(
+    cfg: Dict[str, Any],
+    result: AdvisorPMCycleResult,
+    portfolio_rows: List[Dict[str, Any]],
+    notify_alert: bool = True,
+) -> bool:
     """Update action log from PM stances; push one conversational alert when something is new.
 
     Prefers the PM's own push_note (written conversationally per PM_CLAUDE.md). Falls back
     to a one-line-per-ticker compact form. No "Action required:" header, no "Reason:" sublines.
+
+    When ``notify_alert`` is False (chat-mode), still syncs the action log so a "hold"
+    clears the matching SELL action — but skips the separate alert send because the
+    chat reply is already the user-facing message.
     """
     try:
         from tradingagents.portfolio_advisor import messaging
@@ -1211,6 +1220,9 @@ def _notify_action_stances(cfg: Dict[str, Any], result: AdvisorPMCycleResult, po
                 continue
             new_or_changed.append(s)
         if not new_or_changed:
+            return False
+        if not notify_alert:
+            # Action log synced; chat reply itself carries the message — don't double-alert.
             return False
 
         push = (result.push_note or "").strip()
@@ -1574,10 +1586,14 @@ the trigger, say that plainly and use append_jobs to send a new research layer t
     )
     actions_taken = apply_pm_cycle_followups(cfg, result)
 
-    # Proactive alert for action stances on automated cycles (ntfy questions already surface stances in the reply)
-    action_alert_sent = False
-    if trigger_s not in ("ntfy_question",):
-        action_alert_sent = _notify_action_stances(cfg, result, portfolio_rows)
+    # Always sync the action log from stances so a chat-mode "hold" actually
+    # clears the matching SELL action (the digest stops contradicting the PM).
+    # Only AUTO-ALERT on scheduled cycles — for ntfy_question the chat reply is
+    # itself the user-facing message.
+    action_alert_sent = _notify_action_stances(
+        cfg, result, portfolio_rows,
+        notify_alert=(trigger_s != "ntfy_question"),
+    )
 
     # Push note — only when it is not already included in the consolidated action alert.
     # push_note is the PM's own urgency signal and bypasses quiet hours.
