@@ -1454,6 +1454,39 @@ def run_pm_cycle(
         logger.debug("watchlist summary block failed: %s", e)
         watchlist_block = ""
 
+    # Candidate RESEARCH block — what the system has actually researched on
+    # watchlist names. Without this the PM only sees a static summary and
+    # never knows PLTR/COST/FOUR (etc.) have completed deep research, so it
+    # never produces candidate_comparisons or buy stances on new names.
+    try:
+        cand_entries = watchlist_mod.load_watchlist(cfg)
+        cand_tickers: List[str] = []
+        for e in cand_entries:
+            if isinstance(e, str):
+                cand_tickers.append(e.strip().upper())
+            elif isinstance(e, dict):
+                tk = str(e.get("ticker") or "").strip().upper()
+                if tk:
+                    cand_tickers.append(tk)
+        cand_tickers = sorted({t for t in cand_tickers if t and t not in live_tickers})
+        raw_cand_block = _recent_analysis_block(cfg, cand_tickers) if cand_tickers else ""
+        if raw_cand_block:
+            # Strip the inner default header so the candidate-specific one reads cleanly.
+            if raw_cand_block.startswith("Latest research results"):
+                raw_cand_block = raw_cand_block.split("\n", 1)[1] if "\n" in raw_cand_block else ""
+            candidate_research_block = (
+                "Candidate research (watchlist names with completed research — evaluate "
+                "these and, when one is clearly stronger than a current holding or fills "
+                "the catalyst sleeve, emit a candidate_comparison AND a starter-sized "
+                "'buy' stance with explicit sizing. Cite the full_graph or thesis_check "
+                "event id in evidence_refs):\n" + raw_cand_block + "\n"
+            )
+        else:
+            candidate_research_block = ""
+    except Exception as e:
+        logger.debug("candidate research block failed: %s", e)
+        candidate_research_block = ""
+
     today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     prompt = f"""{claude_block}You are the portfolio manager for a research stack. Advisory only: no trade orders, no claims that trades executed.
 
@@ -1488,6 +1521,7 @@ Pending advisor jobs preview (JSON):
 
 Latest completed research decisions/results:
 {recent_analysis_block or "(none found in the recent event log)\n\n"}
+{candidate_research_block}
 Retrieved evidence refs and known dates (JSON):
 {evidence_block}
 
