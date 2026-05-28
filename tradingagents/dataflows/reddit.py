@@ -67,7 +67,10 @@ def _fetch_subreddit(
         with urlopen(req, timeout=timeout) as resp:
             payload = json.loads(resp.read())
     except (HTTPError, URLError, json.JSONDecodeError, TimeoutError) as exc:
-        logger.warning("Reddit fetch failed for r/%s · %s: %s", sub, ticker, exc)
+        # Reddit aggressively rate-limits/403s unauthenticated scrapers — log at
+        # debug so this isn't surfaced as a warning in every full_graph. The
+        # sentiment analyst handles an empty Reddit block downstream.
+        logger.debug("Reddit fetch failed for r/%s · %s: %s", sub, ticker, exc)
         return []
     children = (payload.get("data") or {}).get("children") or []
     return [c.get("data", {}) for c in children if isinstance(c, dict)]

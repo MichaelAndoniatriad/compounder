@@ -346,6 +346,34 @@ def _run_job(j: Dict[str, Any], cfg: Dict[str, Any], live: set, trade_date: str)
     tier = str(j.get("execution_tier") or "single_model").strip().lower()
     job_type = str(j.get("job_type") or "routine_monitoring").strip()
 
+    # Per-ticker rolling cap on full_graph: prevents retry storms (NVDA had 11
+    # runs in 14d under the old behavior). If exceeded, downgrade to single_model
+    # so the work still happens cheaply rather than re-running an expensive pipe.
+    if tier == "full_graph":
+        try:
+            from datetime import timedelta
+            from tradingagents.agents.utils.event_log import _iter_events
+            cap = int(cfg.get("portfolio_advisor_full_graph_per_ticker_14d_cap") or 2)
+            cutoff = (_utc_now() - timedelta(days=14)).isoformat()
+            recent = 0
+            for row in _iter_events(cfg, max_lines=5000):
+                if str(row.get("timestamp") or "") < cutoff:
+                    continue
+                if str(row.get("event_type") or "") != "full_graph_decision":
+                    continue
+                if str(row.get("ticker") or "").strip().upper() == tid:
+                    recent += 1
+            if recent >= cap:
+                logger.info(
+                    "downgrading %s full_graph -> single_model (already %d full_graph runs in 14d, cap=%d)",
+                    tid, recent, cap,
+                )
+                tier = "single_model"
+                j["execution_tier"] = "single_model"
+                j["downgraded_reason"] = f"full_graph 14d cap hit ({recent}/{cap})"
+        except Exception as e:
+            logger.debug("full_graph cap check failed for %s: %s", tid, e)
+
     try:
         if tier == "full_graph":
             try:

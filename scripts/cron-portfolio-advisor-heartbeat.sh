@@ -51,6 +51,20 @@ fi
   set +e
   "$PY" -m cli.main advisor portfolio heartbeat
   ec=$?
+  # Off-box dead-man's-switch: ping an external healthcheck URL so an
+  # INDEPENDENT service alerts the human if the whole box goes dark.
+  # Set TRADINGAGENTS_HEALTHCHECK_URL in .env (e.g. a healthchecks.io URL).
+  if [[ -n "${TRADINGAGENTS_HEALTHCHECK_URL:-}" ]]; then
+    if [[ "$ec" -eq 0 ]]; then
+      curl -fsS -m 10 --retry 2 "$TRADINGAGENTS_HEALTHCHECK_URL" -o /dev/null \
+        && echo "$(_ts) healthcheck ping OK" \
+        || echo "$(_ts) healthcheck ping FAILED"
+    else
+      curl -fsS -m 10 --retry 2 "${TRADINGAGENTS_HEALTHCHECK_URL%/}/fail" -o /dev/null \
+        && echo "$(_ts) healthcheck fail-ping OK" \
+        || echo "$(_ts) healthcheck fail-ping FAILED"
+    fi
+  fi
   set -e
   echo "===== $(_ts) portfolio advisor heartbeat end (exit $ec) ====="
   exit "$ec"

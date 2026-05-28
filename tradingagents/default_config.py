@@ -277,6 +277,10 @@ DEFAULT_CONFIG = _apply_env_overrides({
     # determinism (cuts the model's intermittent empty-reply behavior in chat
     # mode). Set None to use provider defaults.
     "graph_temperature": 0.0,
+    # Per-ticker rolling cap on full_graph runs (14d window). Stops retry
+    # storms (e.g. NVDA had 11 runs/14d before this). On exceeding, jobs are
+    # downgraded to single_model so the work still happens cheaply.
+    "portfolio_advisor_full_graph_per_ticker_14d_cap": 2,
     # Optional partial overrides: logical agent key -> {model, extra_body?}
     # (``provider`` is always openrouter; any ``provider`` key in overrides is ignored.)
     "agent_llm_routing": {},
