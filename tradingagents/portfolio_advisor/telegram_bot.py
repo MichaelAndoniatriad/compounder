@@ -121,18 +121,26 @@ def answer_text(cfg: Dict[str, Any], text: str) -> str:
         return "Send me a portfolio question, for example: what should I do?"
     if s.upper() == "CANCEL":
         return cancel_last_action(cfg)
-    result = run_pm_cycle(
-        cfg,
-        trigger="ntfy_question",
-        extra_context=(
-            f"Telegram human question (live chat):\n{s}\n\n"
-            "Put your conversational answer in executive_summary — text them like a "
-            "friend per your standing instructions, end with a question if there's a "
-            "real decision. Keep doing the rest of the cycle normally: stances, "
-            "candidate_comparisons, append_jobs, push_note when warranted."
-        ),
+
+    extra = (
+        f"Telegram human question (live chat):\n{s}\n\n"
+        "Put your conversational answer in executive_summary — text them like a "
+        "friend per your standing instructions, end with a question if there's a "
+        "real decision. Keep doing the rest of the cycle normally: stances, "
+        "candidate_comparisons, append_jobs, push_note when warranted."
     )
-    return _format_pm_reply(result)
+
+    # The model occasionally returns an empty/None response in chat mode despite
+    # a sound prompt. Retry once on a clearly-empty result before falling back.
+    FALLBACK = "I don't have a clear read on that right now."
+    result = run_pm_cycle(cfg, trigger="ntfy_question", extra_context=extra)
+    reply = _format_pm_reply(result)
+    if reply == FALLBACK or len(reply) < 30:
+        retry = run_pm_cycle(cfg, trigger="ntfy_question", extra_context=extra)
+        retry_reply = _format_pm_reply(retry)
+        if len(retry_reply) > len(reply):
+            reply = retry_reply
+    return reply
 
 
 def process_update(cfg: Dict[str, Any], update: Dict[str, Any]) -> Optional[str]:
