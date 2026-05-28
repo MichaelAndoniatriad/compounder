@@ -1501,6 +1501,10 @@ def run_pm_cycle(
         candidate_research_block = ""
 
     today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    # The literal label "ntfy_question" was making v4-pro defer with empty
+    # replies — show the model a neutral label while keeping trigger_s for
+    # post-processing gates (alert send, action-log sync mode).
+    trigger_label = "live_chat" if trigger_s == "ntfy_question" else trigger_s
     prompt = f"""{claude_block}You are the portfolio manager for a research stack. Advisory only: no trade orders, no claims that trades executed.
 
 Today's date (UTC): {today_utc}
@@ -1518,7 +1522,7 @@ live data (likely an eToro API lag) — do not say you cannot refresh or that yo
 
 Execution tiers (for append_jobs only): "full_graph" runs the full multi-agent pipeline on one ticker; "single_model" is a faster desk-style pass (thesis_check, weekly_summary, post_earnings, routine_monitoring).
 
-Trigger for this cycle: {trigger_s}
+Trigger for this cycle: {trigger_label}
 
 {memory_block}Portfolio snapshot:
 {portfolio_snapshot}
