@@ -1381,7 +1381,9 @@ def run_pm_cycle(
 
     _ensure_pm_claude_md(cfg)
     pm_claude = _read_pm_claude_md(cfg)
-    pm_memory = "" if trigger_s == "ntfy_question" else _read_pm_memory_structured(cfg)
+    # Always feed PM memory/context — chat-mode was getting too thin a prompt
+    # under the agentic persona, causing the model to defer with empty replies.
+    pm_memory = _read_pm_memory_structured(cfg)
 
     _payload, portfolio_text, tickers, portfolio_rows = etoro_scan.fetch_portfolio_rows()
     if not tickers:
@@ -1419,9 +1421,9 @@ def run_pm_cycle(
     extra_cap = _pm_int(cfg, "portfolio_advisor_pm_extra_context_chars", 3200, 0, 20000)
     extra_excerpt = (extra_context or "").strip()[:extra_cap] if extra_cap > 0 else ""
 
-    prior_txt = "" if trigger_s == "ntfy_question" else _prior_pm_context(cfg, current_tickers=live_tickers)
+    prior_txt = _prior_pm_context(cfg, current_tickers=live_tickers)
     prior_block = f"Prior PM context (most recent cycles):\n{prior_txt}\n\n" if prior_txt else ""
-    tm_block = "" if trigger_s == "ntfy_question" else _trading_memory_digest_block(cfg)
+    tm_block = _trading_memory_digest_block(cfg)
     recent_analysis_block = _recent_analysis_block(cfg, sorted(live_tickers))
     evidence_context = _pm_evidence_context(cfg, sorted(live_tickers), pend)
     evidence_block = _pm_json_for_prompt(
