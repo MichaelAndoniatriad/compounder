@@ -1039,6 +1039,68 @@ def proposals_clear():
     console.print(f"[cyan]Removed {n} archived proposal(s).[/cyan]")
 
 
+executor_app = typer.Typer(
+    help=(
+        "Real-execution scaffold (Phase 1: login + session). No trades are "
+        "placed automatically — execution still requires explicit approval + "
+        "REAL_EXECUTION_ENABLED=yes in env."
+    ),
+    no_args_is_help=True,
+)
+portfolio_app.add_typer(executor_app, name="executor")
+
+
+@executor_app.command("login")
+def executor_login():
+    """One-time interactive eToro login. Prompts for the SMS code on stdin,
+    saves the session cookies to ~/.tradingagents/portfolio_advisor/etoro_session.json.
+    Requires ETORO_LOGIN_USERNAME and ETORO_LOGIN_PASSWORD in the environment.
+    """
+    cfg = DEFAULT_CONFIG.copy()
+    try:
+        from tradingagents.portfolio_advisor.etoro_browser import login_interactive
+        msg = login_interactive(cfg)
+        console.print(msg)
+    except Exception as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1) from e
+
+
+@executor_app.command("verify")
+def executor_verify():
+    """Load the saved eToro session and confirm we land on the portfolio page
+    without being redirected to login. Run this after `executor login` and
+    occasionally to detect session expiry."""
+    cfg = DEFAULT_CONFIG.copy()
+    try:
+        from tradingagents.portfolio_advisor.etoro_browser import verify_session
+        console.print(verify_session(cfg))
+    except Exception as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1) from e
+
+
+@executor_app.command("status")
+def executor_status():
+    """Show today's execution audit log + current safety limits."""
+    cfg = DEFAULT_CONFIG.copy()
+    from tradingagents.portfolio_advisor.executor import limits_from_cfg, read_audit_today
+    lim = limits_from_cfg(cfg)
+    console.print(f"limits: max {lim.max_trades_per_day} trades/day, "
+                  f"max ${lim.max_position_usd:.0f}/position, "
+                  f"actions={sorted(lim.allowed_actions)}, "
+                  f"allowlist={'(any)' if lim.allowed_tickers is None else sorted(lim.allowed_tickers)}")
+    import os
+    real_on = os.environ.get("REAL_EXECUTION_ENABLED", "").strip().lower() == "yes"
+    console.print(f"REAL_EXECUTION_ENABLED: {'YES (live)' if real_on else 'no (dry-run only)'}")
+    rows = read_audit_today(cfg)
+    console.print(f"audit rows today: {len(rows)}")
+    for r in rows[-8:]:
+        console.print(f"  {r.get('ts','')[:19]}  {r.get('ticker'):6} "
+                      f"{r.get('action'):6} ~${float(r.get('approx_usd') or 0):.0f}  "
+                      f"-> {r.get('outcome')}" + (f"  err: {r.get('error')}" if r.get('error') else ""))
+
+
 @portfolio_app.command("telegram-listen")
 def portfolio_advisor_telegram_listen(
     once: bool = typer.Option(False, "--once", help="Poll once and exit."),
