@@ -124,7 +124,13 @@ def answer_text(cfg: Dict[str, Any], text: str) -> str:
     result = run_pm_cycle(
         cfg,
         trigger="ntfy_question",
-        extra_context=f"Telegram human question:\n{s}\n\nAnswer as a direct chat reply. Be concise, clear, and advisory only.",
+        extra_context=(
+            f"Telegram human question (live chat):\n{s}\n\n"
+            "Put your conversational answer in executive_summary — text them like a "
+            "friend per your standing instructions, end with a question if there's a "
+            "real decision. Keep doing the rest of the cycle normally: stances, "
+            "candidate_comparisons, append_jobs, push_note when warranted."
+        ),
     )
     return _format_pm_reply(result)
 
