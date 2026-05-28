@@ -273,9 +273,10 @@ DEFAULT_CONFIG = _apply_env_overrides({
     # ignores ``llm_provider`` / ``quick_think_llm`` / ``deep_think_llm``.
     # Tuned only via this dict or Streamlit settings — not TRADINGAGENTS_* env.
     "corporate_hierarchy_enabled": True,
-    # Fixed low temperature on graph LLMs for more repeatable verdicts (set None
-    # to use provider defaults, 0.0 for maximum determinism).
-    "graph_temperature": 0.2,
+    # Fixed temperature on graph LLMs for repeatable verdicts. 0.0 = maximum
+    # determinism (cuts the model's intermittent empty-reply behavior in chat
+    # mode). Set None to use provider defaults.
+    "graph_temperature": 0.0,
     # Optional partial overrides: logical agent key -> {model, extra_body?}
     # (``provider`` is always openrouter; any ``provider`` key in overrides is ignored.)
     "agent_llm_routing": {},
