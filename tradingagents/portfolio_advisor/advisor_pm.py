@@ -1612,19 +1612,44 @@ the trigger, say that plainly and use append_jobs to send a new research layer t
         **_provider_kwargs(cfg),
     )
     llm = client.get_llm()
-    structured = bind_structured(llm, AdvisorPMCycleResult, "AdvisorPMCycle")
-    if structured is not None:
-        try:
-            out = structured.invoke([HumanMessage(content=prompt)])
-            if isinstance(out, AdvisorPMCycleResult):
-                result = out
-            else:
-                result = _coerce_pm_result_from_text(_content_from_llm_message(out))
-        except Exception as e:
-            logger.warning("PM structured cycle failed: %s", e)
-            raw = llm.invoke([HumanMessage(content=prompt)])
-            result = _coerce_pm_result_from_text(_content_from_llm_message(raw))
-    else:
+    # Tool-using PM: bind queue_research / mark_action_done / get_recent_research
+    # so the PM can act mid-reasoning (queue a job, clear a stale SELL, look up
+    # any ticker's verdict) and see the result before producing its final answer.
+    # Falls back to plain invoke if the model rejects tools or anything else fails.
+    result = None
+    try:
+        from langchain_core.messages import ToolMessage
+        from tradingagents.portfolio_advisor.pm_tools import build_pm_tools
+        tools = build_pm_tools(cfg, set(live_tickers))
+        tools_by_name = {t.name: t for t in tools}
+        llm_with_tools = llm.bind_tools(tools)
+        messages: List[Any] = [HumanMessage(content=prompt)]
+        max_rounds = _pm_int(cfg, "portfolio_advisor_pm_max_tool_rounds", 4, 0, 12)
+        last_resp = None
+        for _ in range(max_rounds + 1):
+            resp = llm_with_tools.invoke(messages)
+            last_resp = resp
+            messages.append(resp)
+            tcs = list(getattr(resp, "tool_calls", []) or [])
+            if not tcs:
+                break
+            for tc in tcs:
+                tname = tc.get("name") if isinstance(tc, dict) else getattr(tc, "name", "")
+                targs = tc.get("args") if isinstance(tc, dict) else getattr(tc, "args", {}) or {}
+                tid = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", "")
+                t_obj = tools_by_name.get(tname)
+                try:
+                    tresult = t_obj.invoke(targs) if t_obj else f"error: unknown tool {tname!r}"
+                except Exception as te:
+                    tresult = f"error: {te}"
+                messages.append(ToolMessage(content=str(tresult)[:1000], tool_call_id=tid))
+        if last_resp is not None:
+            result = _coerce_pm_result_from_text(_content_from_llm_message(last_resp))
+    except Exception as e:
+        logger.warning("PM tool-using cycle failed (%s); falling back to plain invoke.", e)
+
+    if result is None:
+        # Fallback: plain text invoke (no tools, no structured output).
         raw = llm.invoke([HumanMessage(content=prompt)])
         result = _coerce_pm_result_from_text(_content_from_llm_message(raw))
 
