@@ -955,6 +955,90 @@ def watchlist_generate(
     console.print(f"\n[green]Added {len(result['added'])} new name(s) to the watchlist.[/green]")
 
 
+proposals_app = typer.Typer(
+    help="PM trade proposals (dry-run). Review, approve, reject — nothing is executed automatically.",
+    no_args_is_help=True,
+)
+portfolio_app.add_typer(proposals_app, name="proposals")
+
+
+@proposals_app.command("list")
+def proposals_list(
+    all_statuses: bool = typer.Option(
+        False, "--all", help="Show every status (default: only pending proposals)."
+    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+):
+    """List proposed trades from the PM. Default shows only pending (status=proposed)."""
+    _configure_logging(verbose)
+    cfg = DEFAULT_CONFIG.copy()
+    from tradingagents.portfolio_advisor import proposals as ptp
+    rows = ptp.load_all(cfg) if all_statuses else ptp.list_pending(cfg)
+    if not rows:
+        console.print("[yellow]No proposals." + (" (use --all to see archived statuses)" if not all_statuses else "") + "[/yellow]")
+        return
+    for r in rows:
+        console.print(ptp.format_one_line(r))
+
+
+@proposals_app.command("approve")
+def proposals_approve(
+    id_: str = typer.Argument(..., metavar="ID", help="Proposal short id (first 8+ hex chars)."),
+    note: str = typer.Option("", "--note", help="Optional note recorded with the approval."),
+):
+    """Mark a proposal as approved. Does NOT execute — sets state for a future executor."""
+    cfg = DEFAULT_CONFIG.copy()
+    from tradingagents.portfolio_advisor import proposals as ptp
+    # Allow partial id prefixes (first 8 chars).
+    target = id_.strip().lower()
+    rows = ptp.load_all(cfg)
+    matches = [r for r in rows if (r.get("id") or "").startswith(target)]
+    if not matches:
+        console.print(f"[red]No proposal matching id prefix {target!r}.[/red]")
+        raise typer.Exit(1)
+    if len(matches) > 1:
+        console.print(f"[red]Ambiguous id {target!r} ({len(matches)} matches). Use more chars.[/red]")
+        raise typer.Exit(1)
+    ok, row = ptp.approve(cfg, matches[0]["id"], note=note)
+    if ok and row is not None:
+        console.print(f"[green]Approved:[/green] {ptp.format_one_line(row)}")
+    else:
+        console.print("[red]Approval failed.[/red]"); raise typer.Exit(1)
+
+
+@proposals_app.command("reject")
+def proposals_reject(
+    id_: str = typer.Argument(..., metavar="ID"),
+    note: str = typer.Option("", "--note", help="Optional reason recorded with the rejection."),
+):
+    """Mark a proposal as rejected."""
+    cfg = DEFAULT_CONFIG.copy()
+    from tradingagents.portfolio_advisor import proposals as ptp
+    target = id_.strip().lower()
+    rows = ptp.load_all(cfg)
+    matches = [r for r in rows if (r.get("id") or "").startswith(target)]
+    if not matches:
+        console.print(f"[red]No proposal matching id prefix {target!r}.[/red]")
+        raise typer.Exit(1)
+    if len(matches) > 1:
+        console.print(f"[red]Ambiguous id {target!r}.[/red]")
+        raise typer.Exit(1)
+    ok, row = ptp.reject(cfg, matches[0]["id"], note=note)
+    if ok and row is not None:
+        console.print(f"[yellow]Rejected:[/yellow] {ptp.format_one_line(row)}")
+    else:
+        console.print("[red]Rejection failed.[/red]"); raise typer.Exit(1)
+
+
+@proposals_app.command("clear")
+def proposals_clear():
+    """Remove archived proposals (rejected / cancelled / executed). Keeps pending + approved."""
+    cfg = DEFAULT_CONFIG.copy()
+    from tradingagents.portfolio_advisor import proposals as ptp
+    n = ptp.clear(cfg)
+    console.print(f"[cyan]Removed {n} archived proposal(s).[/cyan]")
+
+
 @portfolio_app.command("telegram-listen")
 def portfolio_advisor_telegram_listen(
     once: bool = typer.Option(False, "--once", help="Poll once and exit."),

@@ -149,24 +149,47 @@ def _clean_trim(text: str, limit: int = 280) -> str:
 
 
 def format_digest(cfg: Dict[str, Any]) -> str:
-    """Format open action items for a short ntfy message."""
+    """Format open action items + pending PM trade proposals for a short message.
+
+    Returns "" only when there's nothing to surface in either bucket.
+    """
     items = load_open_actions(cfg)
-    if not items:
+    try:
+        from tradingagents.portfolio_advisor import proposals as ptp
+        pending = ptp.list_pending(cfg)
+    except Exception:
+        pending = []
+
+    if not items and not pending:
         return ""
-    lines = ["Open actions:"]
-    for item in sorted(items, key=lambda x: x.get("ticker", "")):
-        age = ""
-        try:
-            created = datetime.fromisoformat(item["created_at"].replace("Z", "+00:00"))
-            days = (datetime.now(timezone.utc) - created).days
-            if days > 0:
-                age = f" ({days}d)"
-        except Exception:
-            pass
-        lines.append(
-            f"- {item['ticker']} {item['action'].upper()}{age}: {_clean_trim(item['rationale'])}"
-        )
-    return "\n".join(lines)
+
+    sections: List[str] = []
+
+    if items:
+        lines = ["Open actions:"]
+        for item in sorted(items, key=lambda x: x.get("ticker", "")):
+            age = ""
+            try:
+                created = datetime.fromisoformat(item["created_at"].replace("Z", "+00:00"))
+                days = (datetime.now(timezone.utc) - created).days
+                if days > 0:
+                    age = f" ({days}d)"
+            except Exception:
+                pass
+            lines.append(
+                f"- {item['ticker']} {item['action'].upper()}{age}: {_clean_trim(item['rationale'])}"
+            )
+        sections.append("\n".join(lines))
+
+    if pending:
+        plines = ["Pending PM proposals (review: `advisor portfolio proposals list`):"]
+        for r in pending[:8]:
+            plines.append("- " + ptp.format_one_line(r))
+        if len(pending) > 8:
+            plines.append(f"  …and {len(pending) - 8} more")
+        sections.append("\n".join(plines))
+
+    return "\n\n".join(sections)
 
 
 def run_morning_digest(cfg: Dict[str, Any]) -> bool:
