@@ -1501,10 +1501,11 @@ def run_pm_cycle(
         candidate_research_block = ""
 
     today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    # The literal label "ntfy_question" was making v4-pro defer with empty
-    # replies — show the model a neutral label while keeping trigger_s for
-    # post-processing gates (alert send, action-log sync mode).
-    trigger_label = "live_chat" if trigger_s == "ntfy_question" else trigger_s
+    # Both "ntfy_question" and "live_chat" made v4-pro defer with empty replies;
+    # only "manual" (the same label scheduled cycles use) reliably produced output.
+    # Show the model "manual" for chat too; keep trigger_s as "ntfy_question" so
+    # post-processing gates (alert send, action-log sync mode) remain correct.
+    trigger_label = "manual" if trigger_s == "ntfy_question" else trigger_s
     prompt = f"""{claude_block}You are the portfolio manager for a research stack. Advisory only: no trade orders, no claims that trades executed.
 
 Today's date (UTC): {today_utc}
