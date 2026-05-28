@@ -114,4 +114,143 @@ def build_pm_tools(cfg: Dict[str, Any], live_tickers: set) -> List[Any]:
         except Exception as e:
             return f"error reading research log: {e}"
 
-    return [queue_research, mark_action_done, get_recent_research]
+    @tool
+    def compare_candidates(ticker_a: str, ticker_b: str, days: int = 21) -> str:
+        """Fetch the latest research verdict for two tickers side-by-side so you can
+        decide which is the stronger move. Useful when both are watchlist candidates
+        you might swap one of them in, or comparing a candidate against a holding.
+        Returns both verdict excerpts in one block.
+        """
+        a = get_recent_research.invoke({"ticker": ticker_a, "days": days})
+        b = get_recent_research.invoke({"ticker": ticker_b, "days": days})
+        return f"A. {a}\n\nB. {b}"
+
+    @tool
+    def cancel_pending_job(ticker_or_job_id: str) -> str:
+        """Cancel pending research jobs by ticker (cancels all pending for that name)
+        or by exact job id. Returns the count cancelled.
+        """
+        key = (ticker_or_job_id or "").strip()
+        if not key:
+            return "error: empty key"
+        st = pa_state.load_state(cfg)
+        cancelled = 0
+        for j in (st.get("jobs") or []):
+            if str(j.get("status") or "") != "pending":
+                continue
+            if (str(j.get("id") or "") == key
+                    or str(j.get("ticker") or "").strip().upper() == key.upper()):
+                j["status"] = "cancelled"
+                j["cancel_reason"] = "cancelled via PM tool"
+                cancelled += 1
+        if cancelled:
+            pa_state.save_state(cfg, st)
+        return f"cancelled {cancelled} pending job(s) for {key!r}"
+
+    @tool
+    def get_sleeve_mix() -> str:
+        """Return the current core/catalyst/cash sleeve allocation vs the policy
+        target (50/40/10). Use this whenever you're deciding whether to deploy
+        cash or reshape exposure."""
+        try:
+            from tradingagents.portfolio_advisor.advisor_pm import _sleeve_allocation_block
+            from tradingagents.portfolio_advisor import etoro_scan
+            _payload, portfolio_text, _t, rows = etoro_scan.fetch_portfolio_rows()
+            block = _sleeve_allocation_block(cfg, portfolio_text, rows)
+            return block.strip() or "(sleeve mix unavailable)"
+        except Exception as e:
+            return f"error computing sleeve mix: {e}"
+
+    @tool
+    def adjust_position_plan(
+        ticker: str,
+        strategy: str = "",
+        target_horizon: str = "",
+        notes: str = "",
+    ) -> str:
+        """Edit the on-disk position plan for a holding. Pass empty strings for
+        fields you don't want to change. ``strategy`` is 'core' or 'catalyst'
+        (the sleeve). Stop-loss percentages aren't per-plan editable — they
+        come from the sleeve defaults (core: -30%/-40%, catalyst: -8% etc.).
+        """
+        tk = (ticker or "").strip().upper()
+        if not tk:
+            return "error: empty ticker"
+        try:
+            from tradingagents.portfolio_advisor import position_plans as pp
+            plans = pp.load_position_plans(cfg)
+            plan = plans.get(tk)
+            if plan is None:
+                return f"no existing plan for {tk}; run classifier first"
+            changes: List[str] = []
+            strat_clean = (strategy or "").strip().lower()
+            if strat_clean in ("core", "catalyst") and plan.strategy != strat_clean:
+                plan.strategy = strat_clean
+                changes.append(f"strategy→{strat_clean}")
+            if target_horizon.strip() and plan.target_horizon != target_horizon.strip():
+                plan.target_horizon = target_horizon.strip()
+                changes.append(f"target_horizon→{target_horizon.strip()}")
+            if notes.strip():
+                plan.notes = notes.strip()
+                changes.append("notes updated")
+            if not changes:
+                return f"{tk}: no changes (all fields empty)"
+            pp.upsert_position_plan(cfg, plan)
+            return f"{tk} plan updated: {', '.join(changes)}"
+        except Exception as e:
+            return f"error updating plan: {e}"
+
+    @tool
+    def propose_trade(
+        ticker: str,
+        action: str,
+        shares: float = 0.0,
+        approx_usd: float = 0.0,
+        target_price: float = 0.0,
+        sleeve: str = "",
+        reason: str = "",
+    ) -> str:
+        """Log a PROPOSED trade for the human to review and execute manually on eToro.
+
+        This is the dry-run execution path — it does NOT place a trade. It records
+        the exact proposal (ticker, action buy/sell/trim, shares, dollar size,
+        sleeve, and your reason) to ~/.tradingagents/portfolio_advisor/proposed_trades.jsonl
+        so the human sees a precise actionable list. action ∈ {buy, sell, trim, add}.
+        """
+        tk = (ticker or "").strip().upper()
+        act = (action or "").strip().lower()
+        if not tk or act not in ("buy", "sell", "trim", "add"):
+            return "error: need ticker + action in {buy, sell, trim, add}"
+        try:
+            import json
+            from pathlib import Path
+            p = pa_state.advisor_dir(cfg) / "proposed_trades.jsonl"
+            p.parent.mkdir(parents=True, exist_ok=True)
+            entry = {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "ticker": tk,
+                "action": act,
+                "shares": float(shares or 0),
+                "approx_usd": float(approx_usd or 0),
+                "target_price": float(target_price or 0),
+                "sleeve": (sleeve or "").strip().lower() or None,
+                "reason": (reason or "").strip()[:500],
+                "status": "proposed",
+            }
+            with p.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(entry) + "\n")
+            qty = f"{shares:g} sh" if shares else (f"~${approx_usd:.0f}" if approx_usd else "size TBD")
+            return f"PROPOSAL recorded: {act} {tk} {qty} (advisory only; human executes)"
+        except Exception as e:
+            return f"error recording proposal: {e}"
+
+    return [
+        queue_research,
+        mark_action_done,
+        get_recent_research,
+        compare_candidates,
+        cancel_pending_job,
+        get_sleeve_mix,
+        adjust_position_plan,
+        propose_trade,
+    ]
