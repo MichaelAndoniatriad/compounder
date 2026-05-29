@@ -134,12 +134,21 @@ def cancel_job(state: Dict[str, Any], job_id: str, reason: str = "") -> bool:
 
 
 def cancel_all_pending(state: Dict[str, Any], reason: str) -> int:
+    """Cancel pending jobs, but preserve jobs queued by PM tool calls.
+
+    The planner only knows about holdings maintenance; wiping pm_tool_call
+    jobs (candidate research the PM actively queued) destroys work the PM
+    decided to do and prevents the catalyst sleeve from ever being researched.
+    """
     n = 0
     for j in state.get("jobs") or []:
-        if j.get("status") == "pending":
-            j["status"] = "cancelled"
-            j["cancel_reason"] = reason
-            n += 1
+        if j.get("status") != "pending":
+            continue
+        if str(j.get("source") or "") == "pm_tool_call":
+            continue  # preserve PM-initiated candidate research
+        j["status"] = "cancelled"
+        j["cancel_reason"] = reason
+        n += 1
     return n
 
 
