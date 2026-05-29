@@ -432,7 +432,9 @@ def queue_deep_candidate_job(
 def is_candidate_job(job: Dict[str, Any]) -> bool:
     source = str(job.get("source") or "").strip()
     flags = {str(f) for f in (job.get("flags") or [])}
-    return source in {"candidate_gate", "candidate_promotion"} or bool(
+    # pm_tool_call = PM actively queued research on a watchlist name via tool;
+    # treat as a candidate job so run_due doesn't cancel it for not being a holding.
+    return source in {"candidate_gate", "candidate_promotion", "pm_tool_call"} or bool(
         flags & {"CANDIDATE_GATE", "CANDIDATE_PROMOTION"}
     )
 
