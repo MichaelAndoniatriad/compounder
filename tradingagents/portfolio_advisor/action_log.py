@@ -193,8 +193,34 @@ def format_digest(cfg: Dict[str, Any]) -> str:
 
 
 def run_morning_digest(cfg: Dict[str, Any]) -> bool:
-    """Send morning digest of open action items. Returns True if anything was sent."""
-    from tradingagents.portfolio_advisor import messaging
+    """Send morning digest of open action items + trigger a PM cycle if stale.
+
+    The PM only fires after a research batch completes, so on quiet days
+    (no jobs executing) it can go 24h+ without a check-in. If the last
+    PM cycle was >12h ago, run one now so the PM can surface the sleeve
+    gap, propose candidate research, and send a proactive brief.
+    Returns True if a digest message was sent.
+    """
+    from tradingagents.portfolio_advisor import messaging, state as pa_state
+
+    # Trigger a proactive PM cycle if it's been too long since the last one.
+    try:
+        st = pa_state.load_state(cfg)
+        last_iso = st.get("last_pm_cycle_iso") or ""
+        stale_h = int(cfg.get("portfolio_advisor_pm_proactive_hours", 12) or 12)
+        if last_iso:
+            from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+            age = _dt.now(_tz.utc) - _dt.fromisoformat(last_iso)
+            if age.total_seconds() > stale_h * 3600:
+                from tradingagents.portfolio_advisor.advisor_pm import run_pm_cycle
+                run_pm_cycle(cfg, trigger="morning_proactive")
+        elif not last_iso:
+            from tradingagents.portfolio_advisor.advisor_pm import run_pm_cycle
+            run_pm_cycle(cfg, trigger="morning_proactive")
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).debug("morning proactive PM cycle failed: %s", e)
+
     body = format_digest(cfg)
     if not body:
         return False
