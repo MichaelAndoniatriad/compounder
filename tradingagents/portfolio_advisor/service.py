@@ -440,16 +440,31 @@ def _post_batch_pm_brief(cfg: Dict[str, Any], results: List[Dict[str, Any]]) -> 
     try:
         from tradingagents.portfolio_advisor.advisor_pm import run_pm_cycle
         verdicts = "\n".join(f"{r['ticker']}: {r['verdict']}" for r in results if r.get("verdict"))
-        context = f"Research batch just completed. Individual results:\n{verdicts}\n\nBrief each ticker: one line, verdict first."
+        context = (
+            f"Research batch just completed. Individual results:\n{verdicts}\n\n"
+            "Summarise what we learned and what you're doing next. If you queued more "
+            "research or have a candidate recommendation, set push_note to tell the "
+            "human — they want to hear this."
+        )
         result = run_pm_cycle(cfg, trigger="batch_complete", extra_context=context)
-        if result.push_note or any(s.stance in ("sell", "trim") for s in (result.stances or [])):
-            return
-        if result.stances:
+        # Send push_note as urgent (bypasses quiet hours) when the PM has something to say.
+        push = (result.push_note or "").strip()
+        has_action = (
+            push
+            or any(s.stance in ("sell", "trim", "buy", "add") for s in (result.stances or []))
+            or bool(result.candidate_comparisons)
+            or bool(result.append_jobs)
+        )
+        if has_action:
+            body = push or (result.executive_summary or "").strip()
+            if body:
+                messaging.send_advisor_message(cfg, "PM", body, urgent=True)
+        elif result.stances:
+            # Quiet update — goes through normal send-window gate
             lines = []
             for s in result.stances:
-                action = s.stance.upper()
                 rat = (s.rationale or "").split(".")[0].strip()[:60]
-                lines.append(f"{s.ticker} {action}" + (f" — {rat}" if rat else ""))
+                lines.append(f"{s.ticker} {s.stance.upper()}" + (f" — {rat}" if rat else ""))
             messaging.send_advisor_message(cfg, "PM Brief", "\n".join(lines))
     except Exception as e:
         logger.warning("post-batch PM brief failed: %s", e)
