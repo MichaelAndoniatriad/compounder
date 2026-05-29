@@ -442,9 +442,18 @@ def _post_batch_pm_brief(cfg: Dict[str, Any], results: List[Dict[str, Any]]) -> 
         verdicts = "\n".join(f"{r['ticker']}: {r['verdict']}" for r in results if r.get("verdict"))
         context = (
             f"Research batch just completed. Individual results:\n{verdicts}\n\n"
-            "Summarise what we learned and what you're doing next. If you queued more "
-            "research or have a candidate recommendation, set push_note to tell the "
-            "human — they want to hear this."
+            "Your job now:\n"
+            "1. Call get_sleeve_mix() to confirm the current catalyst allocation.\n"
+            "2. Rank the researched candidates against each other using compare_candidates "
+            "— not each in isolation, but relative to what the portfolio needs right now.\n"
+            "3. If catalyst sleeve is empty and cash > $500: pick the BEST available "
+            "candidate (even if Hold-rated long-term) and call propose_trade with a "
+            "~$300-500 starter size. A Hold long-term rating is fine for a catalyst entry "
+            "if there is a near-term event setup. If no candidate has a clear catalyst, "
+            "queue catalyst_scan job_type on the top 2 names to get catalyst-specific "
+            "research.\n"
+            "4. Set push_note with your recommendation or next step. The human wants to "
+            "hear what you decided, not just what the research said."
         )
         result = run_pm_cycle(cfg, trigger="batch_complete", extra_context=context)
         # Send push_note as urgent (bypasses quiet hours) when the PM has something to say.

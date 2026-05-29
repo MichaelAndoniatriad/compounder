@@ -30,6 +30,7 @@ class AdvisorJobSpec(BaseModel):
         "weekly_summary",
         "post_earnings",
         "routine_monitoring",
+        "catalyst_scan",
     ] = Field(
         default="routine_monitoring",
         description=(
@@ -88,6 +89,7 @@ class AdvisorPMAppendJob(BaseModel):
         "weekly_summary",
         "post_earnings",
         "routine_monitoring",
+        "catalyst_scan",
     ] = Field(default="thesis_check")
     rationale: str = Field(default="", description="Why this job should run.")
     source: Literal[

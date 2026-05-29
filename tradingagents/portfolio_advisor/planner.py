@@ -69,7 +69,7 @@ Rules:
 - Use action skip to omit noise.
 - scheduled_at must be ISO-8601 with timezone offset (prefer Z or +00:00).
 - For every deep_research job set execution_tier to single_model when the task is a light thesis check, a weekly style summary recap, post earnings review with a likely clear verdict, or routine monitoring with stable metrics. The safe default when unsure is single_model because it is cheaper than the full graph. Use full_graph only when the book shows a new name, when thesis break levels are undefined or in dispute, when post print ambiguity is high, when drawdown risk already signals stress, or when any validator would need the full multi agent stack.
-- Set job_type on each deep_research job to exactly one of Literal["thesis_check", "weekly_summary", "post_earnings", "routine_monitoring"]. Match the value to the narrative in rationale; the schema rejects any other string.
+- Set job_type on each deep_research job to exactly one of Literal["thesis_check", "weekly_summary", "post_earnings", "routine_monitoring", "catalyst_scan"]. Match the value to the narrative in rationale; the schema rejects any other string. Use catalyst_scan for watchlist candidates when the catalyst sleeve is empty — it asks specifically what near-term event makes the name worth a short-term entry rather than evaluating long-term thesis.
 - Leave flags as an empty list unless you add short freeform tags you want surfaced in metadata.
 
 Portfolio snapshot:

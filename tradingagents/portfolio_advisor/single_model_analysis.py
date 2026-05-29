@@ -144,11 +144,48 @@ List any missing figures explicitly. Do not guess prices or dates not shown abov
 """
 
 
+_CATALYST_SCAN_PROMPT = """You are the desk lead evaluating whether a watchlist name fits as a CATALYST sleeve entry.
+A catalyst entry is short-term and event-driven: entry before a dated catalyst, hard stop at -8%, trailing
+stop after +10%, time-stop if the catalyst passes without the move, 30-day max hold.
+Advisory only. No trade orders.
+{shared}
+
+Deliver exactly these sections (plain text, no decorative separators):
+
+CATALYST SCAN {sym} {today}
+
+VERDICT
+State BUY (start a catalyst position), WATCH (catalyst coming but setup not clean), or PASS (no catalyst).
+One sentence. State it first.
+
+CATALYST
+What is the specific upcoming event (earnings date, product launch, regulatory decision, guidance revision)?
+Date if known. If no near-term catalyst within 60 days: state NONE and set VERDICT to PASS.
+
+ENTRY CASE
+Why does the risk/reward make sense NOW relative to the catalyst? What is the entry price zone?
+If PASS: skip this section.
+
+POSITION SIZE
+Suggested starter size in dollars (target 5-10% of portfolio). This is the CATALYST sleeve — sized for
+a short-term trade, not a long-term hold. If PASS: skip.
+
+INVALIDATION
+What specific event or price level would invalidate the trade BEFORE the catalyst? This is the stop.
+
+DATA GAPS
+List any missing figures explicitly. Do not guess prices or dates not shown above.
+
+{rules}
+"""
+
+
 _JOB_TYPE_PROMPTS = {
     "thesis_check": _THESIS_CHECK_PROMPT,
     "weekly_summary": _WEEKLY_SUMMARY_PROMPT,
     "post_earnings": _POST_EARNINGS_PROMPT,
     "routine_monitoring": _ROUTINE_MONITORING_PROMPT,
+    "catalyst_scan": _CATALYST_SCAN_PROMPT,
 }
 
 
