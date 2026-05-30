@@ -48,6 +48,23 @@ _FULL_GRAPH_COMPATIBLE_STANCES = {
 _PM_CLAUDE_DEFAULT = """\
 # Portfolio Manager Standing Instructions
 
+## Market memory — log the WHY, not just the WHAT
+When you observe that 3 or more positions moved significantly in the same
+direction since the last PM cycle, or when you can clearly explain why a
+broad market event affected the portfolio, call ``log_market_event``:
+
+  - category: what type of event (macro, fed, sector, geopolitical, earnings, other)
+  - cause: one clear sentence — "Trump announced tech tariff exemptions reducing supply chain risk"
+  - market_move: bull / bear / mixed / flat
+  - magnitude: strong (>3% average) / moderate (1-3%) / weak (<1%)
+  - portfolio_impact_json: the approximate % moves per ticker e.g. '{"NVDA": 7.2, "NOW": 5.1}'
+  - pattern_tags_csv: short reusable labels e.g. "tariff_relief,tech_outperformance,risk_on"
+  - strategy_implication: what to do NEXT TIME this pattern appears — one sentence
+
+This is how the system learns. Future cycles read these entries and recognize
+"we've seen this before: when Fed pauses, our portfolio rallies 3-5% led by NOW/NVDA."
+Only log events where you can name the macro/market cause — skip individual stock moves.
+
 You are the Portfolio Manager (PM) for a personal investment portfolio. The human reads
 your messages on a phone. You text like a friend — not a robot, not a report.
 
@@ -1424,6 +1441,83 @@ def _sleeve_allocation_block(
     return "\n".join(lines) + "\n"
 
 
+def _compute_portfolio_upnl(portfolio_rows: List[Dict[str, Any]]) -> Dict[str, float]:
+    """Return {ticker: upnl_pct} for each position (unrealizedPnL / initialAmountInDollars * 100)."""
+    out: Dict[str, float] = {}
+    for r in portfolio_rows:
+        ticker = _normalize_ticker(str(r.get("symbolFull") or ""))
+        if not ticker:
+            continue
+        upnl = _float_or_none(r.get("unrealizedPnL"))
+        init = _float_or_none(r.get("initialAmountInDollars"))
+        if upnl is not None and init and init != 0:
+            out[ticker] = round(upnl / init * 100, 2)
+    return out
+
+
+def _save_portfolio_pnl_snapshot(cfg: Dict[str, Any], portfolio_rows: List[Dict[str, Any]]) -> None:
+    """Persist current upnl% per ticker so the next PM cycle can detect moves."""
+    snapshot = _compute_portfolio_upnl(portfolio_rows)
+    if not snapshot:
+        return
+    try:
+        st = state.load_state(cfg)
+        st["last_pm_portfolio_pnl"] = snapshot
+        st["last_pm_portfolio_pnl_ts"] = datetime.now(timezone.utc).isoformat()
+        state.save_state(cfg, st)
+    except Exception as e:
+        logger.debug("_save_portfolio_pnl_snapshot failed: %s", e)
+
+
+def _broad_move_block(cfg: Dict[str, Any], portfolio_rows: List[Dict[str, Any]]) -> str:
+    """Detect broad portfolio moves since the last PM cycle and prompt the PM to log the cause.
+
+    Compares current unrealized P&L% per ticker against the snapshot saved at the
+    end of the previous cycle. If 3+ positions moved >2pts in the same direction,
+    returns a formatted block that prompts the PM to call log_market_event.
+    """
+    try:
+        st = state.load_state(cfg)
+        last_pnl: Dict[str, float] = st.get("last_pm_portfolio_pnl") or {}
+        last_ts: str = str(st.get("last_pm_portfolio_pnl_ts") or "")
+        if not last_pnl:
+            return ""
+
+        current_pnl = _compute_portfolio_upnl(portfolio_rows)
+        changes: Dict[str, float] = {}
+        for ticker, current_pct in current_pnl.items():
+            if ticker in last_pnl:
+                delta = current_pct - last_pnl[ticker]
+                if abs(delta) >= 0.5:
+                    changes[ticker] = round(delta, 1)
+
+        if not changes:
+            return ""
+
+        bulls = sorted([(t, d) for t, d in changes.items() if d >= 2.0], key=lambda x: -x[1])
+        bears = sorted([(t, d) for t, d in changes.items() if d <= -2.0], key=lambda x: x[1])
+        since = f" since {last_ts[:10]}" if last_ts else ""
+
+        if len(bulls) >= 3:
+            details = ", ".join(f"{t}:{d:+.1f}%" for t, d in bulls)
+            return (
+                f"Broad portfolio rally detected{since}: {len(bulls)} positions up >2pts — {details}\n"
+                "If you can identify the macro/market cause (tariff news, Fed signal, sector rotation, etc.), "
+                "call log_market_event with the cause, magnitude, portfolio_impact_json, pattern_tags_csv, "
+                "and strategy_implication. This is how the system learns patterns for future cycles.\n"
+            )
+        if len(bears) >= 3:
+            details = ", ".join(f"{t}:{d:+.1f}%" for t, d in bears)
+            return (
+                f"Broad portfolio selloff detected{since}: {len(bears)} positions down >2pts — {details}\n"
+                "If you can identify the macro/market cause, call log_market_event to record it.\n"
+            )
+        return ""
+    except Exception as e:
+        logger.debug("_broad_move_block failed: %s", e)
+        return ""
+
+
 def run_pm_cycle(
     cfg: Dict[str, Any],
     *,
@@ -1555,6 +1649,21 @@ def run_pm_cycle(
         logger.debug("candidate research block failed: %s", e)
         candidate_research_block = ""
 
+    # Market memory — recent macro events and learned patterns.
+    try:
+        from tradingagents.portfolio_advisor.market_memory import build_market_memory_block
+        market_memory_blk = build_market_memory_block(cfg)
+    except Exception as e:
+        logger.debug("market memory block failed: %s", e)
+        market_memory_blk = ""
+
+    # Broad-move detection — prompts PM to log the cause when 3+ positions moved together.
+    try:
+        broad_move_blk = _broad_move_block(cfg, portfolio_rows)
+    except Exception as e:
+        logger.debug("broad move block failed: %s", e)
+        broad_move_blk = ""
+
     today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     # Both "ntfy_question" and "live_chat" made v4-pro defer with empty replies;
     # only "manual" (the same label scheduled cycles use) reliably produced output.
@@ -1580,7 +1689,7 @@ Execution tiers (for append_jobs only): "full_graph" runs the full multi-agent p
 
 Trigger for this cycle: {trigger_label}
 
-{memory_block}Portfolio snapshot:
+{memory_block}{market_memory_blk}{broad_move_blk}Portfolio snapshot:
 {portfolio_snapshot}
 
 {sleeve_block}
@@ -1749,6 +1858,7 @@ the trigger, say that plainly and use append_jobs to send a new research layer t
     _append_pm_jsonl(cfg, row)
     _append_pm_memory_md(cfg, trigger=trigger_s, result=result, actions_taken=actions_taken)
     _write_pm_memory_update(cfg, result.memory_note, trigger_s)
+    _save_portfolio_pnl_snapshot(cfg, portfolio_rows)
 
     st2 = state.load_state(cfg)
     st2["last_pm_cycle_iso"] = ts

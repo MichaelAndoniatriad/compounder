@@ -244,6 +244,65 @@ def build_pm_tools(cfg: Dict[str, Any], live_tickers: set) -> List[Any]:
         except Exception as e:
             return f"error recording proposal: {e}"
 
+    @tool
+    def log_market_event(
+        category: str,
+        cause: str,
+        market_move: str = "mixed",
+        magnitude: str = "moderate",
+        portfolio_impact_json: str = "{}",
+        pattern_tags_csv: str = "",
+        strategy_implication: str = "",
+        notes: str = "",
+    ) -> str:
+        """Log a structured market observation explaining WHY the portfolio moved.
+
+        Call this when you observe a significant portfolio-wide or sector move
+        and can explain the macro/market cause. This builds a pattern library
+        that future PM cycles use to recognize similar conditions and adjust
+        strategy — for example, when all tech stocks jump on tariff news, Fed
+        signals, or earnings waves.
+
+        category: macro | sector | fed | geopolitical | earnings | earnings_sector | other
+        market_move: bull | bear | mixed | flat
+        magnitude: strong (>3% avg move) | moderate (1-3%) | weak (<1%)
+        portfolio_impact_json: JSON string like '{"NVDA": 7.2, "NOW": 5.1}' with % changes
+        pattern_tags_csv: comma-separated tags e.g. "tariff_relief,tech_outperformance"
+        strategy_implication: one sentence on what to do next time this pattern appears
+        notes: any extra context worth remembering
+
+        Do NOT call this for individual stock moves — only for broad portfolio or
+        sector events where the cause is a macro/market driver you can name.
+        """
+        import json as _json
+        from tradingagents.portfolio_advisor.market_memory import append_market_event, already_logged_today
+        from datetime import datetime, timezone
+
+        cause_clean = (cause or "").strip()
+        cat_clean = (category or "other").strip().lower()
+
+        if already_logged_today(cfg, cat_clean, cause_clean[:60]):
+            return f"skipped: a similar {cat_clean} event was already logged today"
+
+        try:
+            impact = _json.loads(portfolio_impact_json) if (portfolio_impact_json or "").strip().startswith("{") else {}
+        except Exception:
+            impact = {}
+
+        tags = [t.strip() for t in (pattern_tags_csv or "").split(",") if t.strip()]
+        event_id = append_market_event(cfg, {
+            "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            "category": cat_clean,
+            "cause": cause_clean,
+            "market_move": (market_move or "mixed").strip().lower(),
+            "magnitude": (magnitude or "moderate").strip().lower(),
+            "portfolio_impact": impact,
+            "pattern_tags": tags,
+            "strategy_implication": (strategy_implication or "").strip(),
+            "notes": (notes or "").strip(),
+        })
+        return f"market event logged (id={event_id}): {cat_clean}/{market_move}/{magnitude} — {cause_clean[:80]}"
+
     return [
         queue_research,
         mark_action_done,
@@ -253,4 +312,5 @@ def build_pm_tools(cfg: Dict[str, Any], live_tickers: set) -> List[Any]:
         get_sleeve_mix,
         adjust_position_plan,
         propose_trade,
+        log_market_event,
     ]
