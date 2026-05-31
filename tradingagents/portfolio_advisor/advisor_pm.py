@@ -65,6 +65,31 @@ This is how the system learns. Future cycles read these entries and recognize
 "we've seen this before: when Fed pauses, our portfolio rallies 3-5% led by NOW/NVDA."
 Only log events where you can name the macro/market cause — skip individual stock moves.
 
+## Self-improvement — learn from your own decisions
+You have a rule book (PM_RULES.md) that you write to and read from across all sessions.
+This is how you compound experience over time. Use these tools proactively:
+
+**log_decision_lesson** — when you see an outcome_recorded event and can say what the
+original call got right or wrong:
+  - ticker, stance_was, outcome_quality (correct/incorrect/partial)
+  - lesson: the transferable insight in one sentence
+  - pattern_tags_csv: reusable labels for pattern matching later
+
+**update_pm_rule** — add or update a rule in the rule book:
+  - action=add: new rule from pattern you've observed
+  - action=confirm: a decision that followed a rule worked (builds confidence)
+  - action=violate: a decision that followed a rule failed (may downgrade it)
+  - action=revise: refine a rule based on new evidence
+  - action=retire: rule no longer applies or was superseded
+
+Rules gain confidence as they accumulate confirming evidence. You read them every
+cycle. This is your institutional memory — not just what happened, but WHY it worked
+and what to do next time.
+
+Example: After NVDA's post-earnings drift confirmed momentum exhaustion, you would:
+1. call log_decision_lesson (NVDA, hold, correct, "dropped 12% then recovered", lesson)
+2. call update_pm_rule (add/confirm "post-earnings-momentum-exhaustion" rule)
+
 You are the Portfolio Manager (PM) for a personal investment portfolio. The human reads
 your messages on a phone. You text like a friend — not a robot, not a report.
 
@@ -1269,6 +1294,33 @@ def _trigger_run_due_async() -> None:
         logger.warning("Failed to trigger async run-due: %s", e)
 
 
+def _record_stance_decisions(
+    cfg: Dict[str, Any],
+    result: AdvisorPMCycleResult,
+    live_tickers: set,
+) -> int:
+    """Persist each non-trivial stance (the action AND the WHY) into its plan history.
+
+    So a position's decision_history carries not just buy/sell/trim proposals but
+    the reasoning behind every hold/watch call too. Deduped across cycles inside
+    append_position_decision (identical action+rationale is not re-logged), and a
+    no-op for tickers without a plan on file.
+    """
+    recorded = 0
+    for s in (result.stances or []):
+        tk = str(s.ticker or "").strip().upper()
+        stance = str(s.stance or "").strip().lower()
+        rationale = (s.rationale or "").strip()
+        if not tk or tk not in live_tickers or stance in ("", "unknown") or not rationale:
+            continue
+        try:
+            if pos_plans.append_position_decision(cfg, tk, stance, rationale, source="pm_cycle"):
+                recorded += 1
+        except Exception as e:
+            logger.debug("append_position_decision failed for %s: %s", tk, e)
+    return recorded
+
+
 def _notify_action_stances(
     cfg: Dict[str, Any],
     result: AdvisorPMCycleResult,
@@ -1664,6 +1716,30 @@ def run_pm_cycle(
         logger.debug("broad move block failed: %s", e)
         broad_move_blk = ""
 
+    # PM rule book — evolved heuristics from past decisions.
+    try:
+        from tradingagents.portfolio_advisor.rule_book import build_rule_book_prompt_block
+        rule_book_blk = build_rule_book_prompt_block(cfg)
+    except Exception as e:
+        logger.debug("rule book block failed: %s", e)
+        rule_book_blk = ""
+
+    # Decision lessons — past retrospectives on right/wrong calls.
+    try:
+        from tradingagents.portfolio_advisor.rule_book import build_lessons_prompt_block
+        lessons_blk = build_lessons_prompt_block(cfg)
+    except Exception as e:
+        logger.debug("lessons block failed: %s", e)
+        lessons_blk = ""
+
+    # Outcomes to review — recent closed positions for lesson extraction.
+    try:
+        from tradingagents.portfolio_advisor.rule_book import build_outcomes_to_review_block
+        outcomes_review_blk = build_outcomes_to_review_block(cfg)
+    except Exception as e:
+        logger.debug("outcomes review block failed: %s", e)
+        outcomes_review_blk = ""
+
     today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     # Both "ntfy_question" and "live_chat" made v4-pro defer with empty replies;
     # only "manual" (the same label scheduled cycles use) reliably produced output.
@@ -1689,7 +1765,7 @@ Execution tiers (for append_jobs only): "full_graph" runs the full multi-agent p
 
 Trigger for this cycle: {trigger_label}
 
-{memory_block}{market_memory_blk}{broad_move_blk}Portfolio snapshot:
+{rule_book_blk}{lessons_blk}{memory_block}{market_memory_blk}{broad_move_blk}Portfolio snapshot:
 {portfolio_snapshot}
 
 {sleeve_block}
@@ -1715,7 +1791,7 @@ disagree, cite newer completed evidence than that full-graph decision or queue c
 Last bootstrap summary (JSON, may be empty):
 {summ_txt or "(none)"}
 
-{prior_block}{tm_block}Extra notes from caller (may be empty):
+{outcomes_review_blk}{prior_block}{tm_block}Extra notes from caller (may be empty):
 {extra_excerpt or "(none)"}
 
 Structured output fields (use defaults when unsure):
@@ -1825,6 +1901,7 @@ the trigger, say that plainly and use append_jobs to send a new research layer t
         pending_jobs=pend,
         trigger=trigger_s,
     )
+    _record_stance_decisions(cfg, result, live_tickers)
     actions_taken = apply_pm_cycle_followups(cfg, result)
 
     # Always sync the action log from stances so a chat-mode "hold" actually

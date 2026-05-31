@@ -216,11 +216,23 @@ def build_pm_tools(cfg: Dict[str, Any], live_tickers: set) -> List[Any]:
         the exact proposal (ticker, action buy/sell/trim, shares, dollar size,
         sleeve, and your reason) to ~/.tradingagents/portfolio_advisor/proposed_trades.jsonl
         so the human sees a precise actionable list. action ∈ {buy, sell, trim, add}.
+
+        reason is REQUIRED — explain WHY (what changed, the catalyst, the rule that
+        fired, the thesis read). A proposal with no reason is rejected. For a held
+        name, the reason is also appended to that position's decision_history so the
+        rationale behind every move stays attached to the position.
         """
         tk = (ticker or "").strip().upper()
         act = (action or "").strip().lower()
         if not tk or act not in ("buy", "sell", "trim", "add"):
             return "error: need ticker + action in {buy, sell, trim, add}"
+        reason_clean = (reason or "").strip()
+        if not reason_clean:
+            return (
+                "error: a reason is required — explain WHY before proposing this trade "
+                "(what changed, the catalyst, the rule that fired, or the thesis read). "
+                "Don't just propose buy/sell/trim with no rationale."
+            )
         try:
             import json
             from pathlib import Path
@@ -234,11 +246,23 @@ def build_pm_tools(cfg: Dict[str, Any], live_tickers: set) -> List[Any]:
                 "approx_usd": float(approx_usd or 0),
                 "target_price": float(target_price or 0),
                 "sleeve": (sleeve or "").strip().lower() or None,
-                "reason": (reason or "").strip()[:500],
+                "reason": reason_clean[:500],
                 "status": "proposed",
             }
             with p.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps(entry) + "\n")
+            # Mirror the decision + WHY into the position plan's history so the
+            # rationale travels with the holding (held names; new buys stay in
+            # proposed_trades.jsonl until the position is opened and a plan exists).
+            try:
+                from tradingagents.portfolio_advisor import position_plans as _pp
+                _pp.append_position_decision(
+                    cfg, tk, act, reason_clean,
+                    source="propose_trade",
+                    price=(float(target_price) or None),
+                )
+            except Exception:
+                pass
             qty = f"{shares:g} sh" if shares else (f"~${approx_usd:.0f}" if approx_usd else "size TBD")
             return f"PROPOSAL recorded: {act} {tk} {qty} (advisory only; human executes)"
         except Exception as e:
@@ -303,6 +327,112 @@ def build_pm_tools(cfg: Dict[str, Any], live_tickers: set) -> List[Any]:
         })
         return f"market event logged (id={event_id}): {cat_clean}/{market_move}/{magnitude} — {cause_clean[:80]}"
 
+    @tool
+    def log_decision_lesson(
+        ticker: str,
+        stance_was: str,
+        outcome_quality: str,
+        pnl_description: str,
+        lesson: str,
+        pattern_tags_csv: str = "",
+        rule_name: str = "",
+    ) -> str:
+        """Log a lesson extracted from a past decision outcome.
+
+        Call this when you see an outcome_recorded event and can articulate what
+        your prior stance got right or wrong and why. This builds the PM's
+        accumulated trading experience that persists across all future sessions.
+
+        ticker: the position ticker (e.g. NVDA)
+        stance_was: what the PM recommended (buy/hold/sell/trim/watch)
+        outcome_quality: correct | incorrect | partial | unclear
+        pnl_description: brief description e.g. "dropped 12% then recovered to +8%"
+        lesson: one clear sentence — the transferable insight
+        pattern_tags_csv: reusable labels e.g. "momentum_exhaustion,post_earnings_drift"
+        rule_name: if this lesson confirms or violates an existing rule, name it here
+
+        Example lesson: "Momentum exhaustion (MACD histogram -90%) after a 150%+
+        rally reliably signals a 2-4 week pullback even when fundamentals are strong.
+        Hold is correct; adding is a mistake."
+        """
+        from tradingagents.portfolio_advisor.rule_book import append_lesson
+        tags = [t.strip() for t in (pattern_tags_csv or "").split(",") if t.strip()]
+        lesson_id = append_lesson(cfg, {
+            "ticker": (ticker or "").strip().upper(),
+            "stance_was": (stance_was or "").strip().lower(),
+            "outcome_quality": (outcome_quality or "").strip().lower(),
+            "pnl_description": (pnl_description or "").strip(),
+            "lesson": (lesson or "").strip(),
+            "pattern_tags": tags,
+            "rule_updated": rule_name.strip() or None,
+        })
+        return f"lesson logged (id={lesson_id}): {ticker} [{stance_was}→{outcome_quality}] — {(lesson or '')[:80]}"
+
+    @tool
+    def update_pm_rule(
+        rule_name: str,
+        action: str,
+        pattern: str = "",
+        rule_text: str = "",
+        confidence: str = "",
+        evidence_note: str = "",
+    ) -> str:
+        """Add or update a rule in the PM rule book (PM_RULES.md).
+
+        This is how the PM evolves its own strategy based on accumulated experience.
+        Rules are persistent — they survive across all future PM sessions and are
+        injected into every cycle prompt so prior experience shapes current reasoning.
+
+        action:
+          add     — create a new rule (requires pattern + rule_text)
+          confirm — a decision that followed this rule worked out (+1 confirmed)
+          violate — a decision that followed this rule failed (-1, may downgrade confidence)
+          revise  — update the pattern and/or rule text (provide new pattern/rule_text)
+          retire  — mark the rule as retired (too many violations or superseded)
+
+        confidence: emerging (default) | medium | high | weak | retired
+        evidence_note: one sentence tying this update to a specific outcome or observation
+
+        Example — add a new rule:
+          rule_name="post-earnings-momentum-exhaustion"
+          action="add"
+          pattern="Stock up 100%+ in 4-6 weeks, MACD histogram collapsing, post-earnings drift lower despite beat"
+          rule_text="Hold existing position. Do not add. Wait for 50-day SMA pullback (10-15%). Re-evaluate in 3 weeks."
+          confidence="emerging"
+          evidence_note="NVDA 2026-05-21: Hold at $223 after 173% rally was correct — stock pulled back to $195."
+
+        Example — confirm after outcome:
+          rule_name="post-earnings-momentum-exhaustion"
+          action="confirm"
+          evidence_note="NVDA pulled back 12% within 2 weeks of the Hold call, exactly as predicted."
+        """
+        from tradingagents.portfolio_advisor.rule_book import add_rule, update_rule
+        action_clean = (action or "").strip().lower()
+        name_clean = (rule_name or "").strip()
+        if not name_clean:
+            return "error: rule_name is required"
+        if action_clean == "add":
+            if not pattern.strip() or not rule_text.strip():
+                return "error: add requires both pattern and rule_text"
+            return add_rule(
+                cfg,
+                name=name_clean,
+                pattern=pattern.strip(),
+                rule_text=rule_text.strip(),
+                confidence=(confidence or "emerging").strip(),
+                evidence_note=evidence_note.strip(),
+            )
+        else:
+            return update_rule(
+                cfg,
+                name=name_clean,
+                action=action_clean,
+                pattern=pattern.strip(),
+                rule_text=rule_text.strip(),
+                confidence=confidence.strip(),
+                evidence_note=evidence_note.strip(),
+            )
+
     return [
         queue_research,
         mark_action_done,
@@ -313,4 +443,6 @@ def build_pm_tools(cfg: Dict[str, Any], live_tickers: set) -> List[Any]:
         adjust_position_plan,
         propose_trade,
         log_market_event,
+        log_decision_lesson,
+        update_pm_rule,
     ]
