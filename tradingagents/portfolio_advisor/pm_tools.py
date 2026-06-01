@@ -289,23 +289,19 @@ def build_pm_tools(cfg: Dict[str, Any], live_tickers: set) -> List[Any]:
                 "Don't just propose buy/sell/trim with no rationale."
             )
         try:
-            import json
-            from pathlib import Path
-            p = pa_state.advisor_dir(cfg) / "proposed_trades.jsonl"
-            p.parent.mkdir(parents=True, exist_ok=True)
-            entry = {
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "ticker": tk,
-                "action": act,
-                "shares": float(shares or 0),
-                "approx_usd": float(approx_usd or 0),
-                "target_price": float(target_price or 0),
-                "sleeve": (sleeve or "").strip().lower() or None,
-                "reason": reason_clean[:500],
-                "status": "proposed",
-            }
-            with p.open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps(entry) + "\n")
+            from tradingagents.portfolio_advisor import proposals as _proposals
+            # add() supersedes any existing open proposal for the same ticker+side,
+            # so a rule that keeps re-firing can't pile up duplicate pending rows.
+            _proposals.add(
+                cfg,
+                ticker=tk,
+                action=act,
+                shares=shares,
+                approx_usd=approx_usd,
+                target_price=target_price,
+                sleeve=sleeve,
+                reason=reason_clean,
+            )
             # Mirror the decision + WHY into the position plan's history so the
             # rationale travels with the holding (held names; new buys stay in
             # proposed_trades.jsonl until the position is opened and a plan exists).

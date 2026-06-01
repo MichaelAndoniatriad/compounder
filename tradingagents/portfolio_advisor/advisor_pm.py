@@ -1581,6 +1581,14 @@ def run_pm_cycle(
 
     live_tickers = etoro_scan.current_ticker_set(tickers)
 
+    # Clear exit proposals for names that are no longer in the book — so once a
+    # position is actually closed, the PM stops re-surfacing a stale sell/trim.
+    try:
+        from tradingagents.portfolio_advisor import proposals as _proposals
+        _proposals.reconcile_with_portfolio(cfg, live_tickers)
+    except Exception:
+        logger.debug("proposal reconcile skipped", exc_info=True)
+
     st = state.load_state(cfg)
     summ = st.get("last_bootstrap_summary")
     summ_txt = ""
