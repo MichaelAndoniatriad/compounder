@@ -67,7 +67,7 @@ def build_pm_tools(cfg: Dict[str, Any], live_tickers: set) -> List[Any]:
 
         Use this when the latest evidence overrides a prior sell call (e.g.,
         the human told you to hold, or a fresh full_graph flipped to Hold),
-        so the morning/evening digest stops nagging about the stale action.
+        so you stop carrying a stale action into your next check-in.
         Returns how many were closed.
         """
         tk = (ticker or "").strip().upper()
@@ -113,6 +113,61 @@ def build_pm_tools(cfg: Dict[str, Any], live_tickers: set) -> List[Any]:
             return f"{tk} [{latest.get('event_type')} {str(latest.get('timestamp',''))[:10]}]: {excerpt}"
         except Exception as e:
             return f"error reading research log: {e}"
+
+    @tool
+    def get_research_detail(ticker: str) -> str:
+        """Read the FULL saved deep-research report for a ticker and return the actual
+        reasoning — the Final decision plus the Market / Sentiment / News / Fundamentals
+        sections — NOT just the short verdict excerpt that get_recent_research gives you.
+
+        Call this whenever the human asks "why" about a holding or one of your
+        recommendations, or any time you need the real argument behind a rating rather
+        than the one-line label. Returns "no saved report" if a deep dive was never run.
+        """
+        tk = (ticker or "").strip().upper()
+        if not tk:
+            return "error: empty ticker"
+        try:
+            import re
+            from pathlib import Path
+
+            base = Path(str(cfg.get("results_dir", "."))) / "clerk_deep" / tk
+            reports = sorted(base.glob("*.md")) if base.is_dir() else []
+            if not reports:
+                return (
+                    f"no saved deep report for {tk} — only the short verdict is on file. "
+                    "Use get_recent_research, or queue a full_graph dive if you need the full case."
+                )
+            latest = reports[-1]
+            date = latest.stem.split("_")[0]
+            text = latest.read_text(encoding="utf-8", errors="replace")
+
+            # Section caps keep the whole thing phone-sized while preserving the reasoning.
+            caps = {
+                "final decision": 1400,
+                "market": 700,
+                "sentiment": 700,
+                "news": 700,
+                "fundamentals": 700,
+                "research plan": 700,
+                "trader plan": 700,
+            }
+            out = [f"{tk} deep report ({date}):"]
+            for chunk in re.split(r"\n## ", text):
+                head, _, body = chunk.strip().partition("\n")
+                title = head.strip().lstrip("# ").strip()
+                cap = caps.get(title.lower())
+                if cap is None:  # title/date header block or unknown section
+                    continue
+                body = body.strip()
+                if body:
+                    out.append(f"\n## {title}\n{body[:cap]}")
+            result = "\n".join(out).strip()
+            return result[:5000] if len(out) > 1 else (
+                f"{tk} report on file ({date}) but no readable sections — verdict only via get_recent_research."
+            )
+        except Exception as e:
+            return f"error reading deep report: {e}"
 
     @tool
     def compare_candidates(ticker_a: str, ticker_b: str, days: int = 21) -> str:
@@ -437,6 +492,7 @@ def build_pm_tools(cfg: Dict[str, Any], live_tickers: set) -> List[Any]:
         queue_research,
         mark_action_done,
         get_recent_research,
+        get_research_detail,
         compare_candidates,
         cancel_pending_job,
         get_sleeve_mix,

@@ -192,47 +192,39 @@ def format_digest(cfg: Dict[str, Any]) -> str:
     return "\n\n".join(sections)
 
 
-def run_morning_digest(cfg: Dict[str, Any]) -> bool:
-    """Send morning digest of open action items + trigger a PM cycle if stale.
+def _run_proactive_checkin(cfg: Dict[str, Any], trigger: str) -> bool:
+    """Run a PM check-in and let the PM decide whether to message you.
 
-    The PM only fires after a research batch completes, so on quiet days
-    (no jobs executing) it can go 24h+ without a check-in. If the last
-    PM cycle was >12h ago, run one now so the PM can surface the sleeve
-    gap, propose candidate research, and send a proactive brief.
-    Returns True if a digest message was sent.
+    There is no formatted action-item dump anymore. The PM cycle itself sends a
+    conversational message ONLY when it wants to flag something, recommend an
+    action, or report a material change in the portfolio — see _notify_action_stances
+    and the push_note send in run_pm_cycle. On a quiet day with nothing material,
+    nothing goes out. Returns True if the cycle produced a user-facing signal
+    (for cron logging only).
     """
-    from tradingagents.portfolio_advisor import messaging, state as pa_state
-
-    # Trigger a proactive PM cycle if it's been too long since the last one.
+    from tradingagents.portfolio_advisor.advisor_pm import run_pm_cycle
     try:
-        st = pa_state.load_state(cfg)
-        last_iso = st.get("last_pm_cycle_iso") or ""
-        stale_h = int(cfg.get("portfolio_advisor_pm_proactive_hours", 12) or 12)
-        if last_iso:
-            from datetime import datetime as _dt, timezone as _tz, timedelta as _td
-            age = _dt.now(_tz.utc) - _dt.fromisoformat(last_iso)
-            if age.total_seconds() > stale_h * 3600:
-                from tradingagents.portfolio_advisor.advisor_pm import run_pm_cycle
-                run_pm_cycle(cfg, trigger="morning_proactive")
-        elif not last_iso:
-            from tradingagents.portfolio_advisor.advisor_pm import run_pm_cycle
-            run_pm_cycle(cfg, trigger="morning_proactive")
+        result = run_pm_cycle(cfg, trigger=trigger)
     except Exception as e:
         import logging
-        logging.getLogger(__name__).debug("morning proactive PM cycle failed: %s", e)
-
-    body = format_digest(cfg)
-    if not body:
+        logging.getLogger(__name__).debug("%s PM cycle failed: %s", trigger, e)
         return False
-    messaging.send_advisor_message(cfg, "Morning action digest", body, urgent=True)
-    return True
+    pushed = bool((getattr(result, "push_note", "") or "").strip())
+    actionable = any(s.stance in ("sell", "trim") for s in (getattr(result, "stances", None) or []))
+    return pushed or actionable
+
+
+def run_morning_digest(cfg: Dict[str, Any]) -> bool:
+    """Morning portfolio check-in.
+
+    The PM evaluates the book and texts you ONLY when there's something to flag,
+    an action to recommend, or a material change to report — no routine open-actions
+    dump. Returns True if the PM had something to say.
+    """
+    return _run_proactive_checkin(cfg, trigger="morning_checkin")
 
 
 def run_evening_digest(cfg: Dict[str, Any]) -> bool:
-    """Send evening digest of open action items. Returns True if anything was sent."""
-    from tradingagents.portfolio_advisor import messaging
-    body = format_digest(cfg)
-    if not body:
-        return False
-    messaging.send_advisor_message(cfg, "Evening action digest", body, urgent=True)
-    return True
+    """Evening portfolio check-in. Same contract as the morning check-in:
+    the PM messages only when it wants to flag, act, or report a material change."""
+    return _run_proactive_checkin(cfg, trigger="evening_checkin")

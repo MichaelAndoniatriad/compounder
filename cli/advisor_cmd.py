@@ -222,16 +222,16 @@ def portfolio_advisor_run_due(
 def portfolio_morning_digest(
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ):
-    """Send morning digest of open action items via ntfy."""
+    """Run the morning PM check-in. The PM messages only if it has something to flag, act on, or report."""
     _configure_logging(verbose)
     cfg = DEFAULT_CONFIG.copy()
     try:
         from tradingagents.portfolio_advisor.action_log import run_morning_digest
         sent = run_morning_digest(cfg)
         if sent:
-            console.print("[green]Morning digest sent.[/green]")
+            console.print("[green]Morning check-in done — PM had something to say.[/green]")
         else:
-            console.print("[yellow]No open action items — nothing sent.[/yellow]")
+            console.print("[yellow]Morning check-in done — nothing material, no message sent.[/yellow]")
     except Exception as e:
         console.print(f"[red]{e}[/red]")
         raise typer.Exit(1) from e
@@ -241,16 +241,16 @@ def portfolio_morning_digest(
 def portfolio_evening_digest(
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ):
-    """Send evening digest of open action items via ntfy."""
+    """Run the evening PM check-in. The PM messages only if it has something to flag, act on, or report."""
     _configure_logging(verbose)
     cfg = DEFAULT_CONFIG.copy()
     try:
         from tradingagents.portfolio_advisor.action_log import run_evening_digest
         sent = run_evening_digest(cfg)
         if sent:
-            console.print("[green]Evening digest sent.[/green]")
+            console.print("[green]Evening check-in done — PM had something to say.[/green]")
         else:
-            console.print("[yellow]No open action items — nothing sent.[/yellow]")
+            console.print("[yellow]Evening check-in done — nothing material, no message sent.[/yellow]")
     except Exception as e:
         console.print(f"[red]{e}[/red]")
         raise typer.Exit(1) from e

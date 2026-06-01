@@ -88,6 +88,49 @@ def _is_trivial(text: str) -> bool:
     return s in {"", "/start", "start", "hello", "hi", "hey", "test"}
 
 
+# Rolling chat transcript so multi-turn conversations stay coherent. Without
+# this, every message spawns an isolated PM cycle that can't see prior turns,
+# and a back-and-forth drifts / contradicts itself.
+_CHAT_TURNS_KEPT = 8  # last N messages (human + PM combined)
+_CHAT_HISTORY_CHARS = 1800  # cap injected into extra_context so we stay under the PM cap
+
+
+def _load_chat_history(cfg: Dict[str, Any]) -> List[Dict[str, str]]:
+    hist = _load_state(cfg).get("chat_history")
+    return [h for h in hist if isinstance(h, dict)] if isinstance(hist, list) else []
+
+
+def _append_chat_turn(cfg: Dict[str, Any], user_text: str, pm_reply: str) -> None:
+    st = _load_state(cfg)
+    hist = st.get("chat_history")
+    hist = [h for h in hist if isinstance(h, dict)] if isinstance(hist, list) else []
+    hist.append({"role": "user", "text": user_text.strip()})
+    hist.append({"role": "pm", "text": pm_reply.strip()})
+    st["chat_history"] = hist[-_CHAT_TURNS_KEPT:]
+    _save_state(cfg, st)
+
+
+def _history_block(history: List[Dict[str, str]]) -> str:
+    if not history:
+        return ""
+    lines: List[str] = []
+    for turn in history:
+        who = "User" if turn.get("role") == "user" else "You (PM)"
+        text = " ".join(str(turn.get("text") or "").split())
+        if text:
+            lines.append(f"{who}: {text}")
+    if not lines:
+        return ""
+    block = "\n".join(lines)
+    if len(block) > _CHAT_HISTORY_CHARS:
+        block = "…" + block[-_CHAT_HISTORY_CHARS:]
+    return (
+        "Recent conversation so far (oldest first). Continue THIS thread "
+        "coherently — don't repeat yourself or contradict what you just said:\n"
+        f"{block}\n\n"
+    )
+
+
 def _format_pm_reply(result: AdvisorPMCycleResult) -> str:
     """Return the PM's conversational reply. The PM writes prose; we don't decorate it.
 
@@ -123,7 +166,8 @@ def answer_text(cfg: Dict[str, Any], text: str) -> str:
         return cancel_last_action(cfg)
 
     extra = (
-        f"Telegram human question (live chat):\n{s}\n\n"
+        f"{_history_block(_load_chat_history(cfg))}"
+        f"Latest Telegram human message (reply to THIS):\n{s}\n\n"
         "Put your conversational answer in executive_summary — text them like a "
         "friend per your standing instructions, end with a question if there's a "
         "real decision. Keep doing the rest of the cycle normally: stances, "
@@ -162,6 +206,10 @@ def process_update(cfg: Dict[str, Any], update: Dict[str, Any]) -> Optional[str]
     ok = messaging.send_telegram_message(cfg, "PM", reply)
     if not ok:
         raise RuntimeError("Telegram reply failed.")
+    # Record real Q&A turns so follow-up messages keep the thread coherent.
+    # Skip greetings and CANCEL — they aren't part of the substantive thread.
+    if not _is_trivial(text) and text.upper() != "CANCEL":
+        _append_chat_turn(cfg, text, reply)
     return reply
 
 

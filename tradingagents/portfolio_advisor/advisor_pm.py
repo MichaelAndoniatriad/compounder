@@ -170,8 +170,13 @@ Research & verdicts:
 - `queue_research(ticker, tier, reason)` — actually queues a research job.
   tier is "single_model" (cheap thesis check) or "full_graph" (full deep dive).
   Prefer this over filling append_jobs.
-- `get_recent_research(ticker, days)` — look up the latest verdict for ANY
-  ticker (holding or watchlist). Use it on demand instead of asking the human.
+- `get_recent_research(ticker, days)` — look up the latest one-line verdict for
+  ANY ticker (holding or watchlist). Use it on demand instead of asking the human.
+- `get_research_detail(ticker)` — read the FULL saved deep report (Market,
+  Sentiment, News, Fundamentals, Final decision) for the real reasoning behind a
+  rating. **When the human asks "why" about a holding or a recommendation, call
+  this BEFORE answering** and explain the actual argument in your own words — never
+  just say "the research said so" or repeat the rating label.
 - `compare_candidates(ticker_a, ticker_b, days)` — fetch both verdicts
   side-by-side so you can pick the stronger move.
 - `cancel_pending_job(ticker_or_job_id)` — cancel pending research that's no
@@ -180,7 +185,7 @@ Research & verdicts:
 Portfolio actions:
 - `mark_action_done(ticker)` — close any open SELL/TRIM action in the log
   when your verdict overrides a prior sell (e.g., fresh full_graph flipped
-  to Hold). The action stops appearing in the morning/evening digest.
+  to Hold). The action stops being carried into your next check-in.
 - `get_sleeve_mix()` — current core/catalyst/cash vs target. Call before
   proposing a deploy or rebalance.
 - `adjust_position_plan(ticker, strategy, target_horizon, notes)` — edit a
@@ -379,10 +384,17 @@ def _mentioned_open_rates(text: str) -> set[str]:
 
 
 def _format_close_instruction(ticker: str, stance: str, rationale: str, rows: List[Dict[str, Any]]) -> str:
-    """Turn a sell/trim stance into exact lot-level instructions from the live book."""
+    """Plain-English sell/trim instruction from the live book — no IDs, no jargon.
+
+    This is the fallback used only when the PM didn't write its own conversational
+    push_note. The caller prepends ``"{ticker}: "``, so the phrase here must NOT repeat
+    the symbol. We keep the only facts the human needs to act — how many shares and what
+    it's worth now — and drop positionId, capital/base, and the per-lot P/L dump that
+    made these messages read like a database row.
+    """
     lots = _rows_for_ticker(rows, ticker)
     if not lots:
-        return "No live eToro lots found for this ticker; verify manually before doing anything."
+        return "I couldn't find live eToro lots for it — double-check before doing anything."
 
     mentioned = _mentioned_open_rates(rationale)
     selected = []
@@ -395,54 +407,31 @@ def _format_close_instruction(ticker: str, stance: str, rationale: str, rows: Li
     if not selected and stance == "sell":
         selected = lots
 
+    def _shares(units: float) -> str:
+        return f"{_num(units, 2)} shares"
+
+    def _value(rows_: List[Dict[str, Any]]) -> float:
+        return sum(
+            (_float_or_none(l.get("unitsBaseValueDollars")) or 0.0)
+            + (_float_or_none(l.get("unrealizedPnL")) or 0.0)
+            for l in rows_
+        )
+
+    # Trim with no specific lots called out — ask for the size instead of guessing.
+    if stance == "trim" and not selected:
+        all_units = sum((_float_or_none(l.get("units")) or 0.0) for l in lots)
+        return (
+            f"worth trimming, but I didn't pin down how much — you're holding about "
+            f"{_shares(all_units)} (~{_money(_value(lots))}). Want me to size the trim?"
+        )
+
     total_units = sum((_float_or_none(l.get("units")) or 0.0) for l in selected)
-    total_capital = sum((_float_or_none(l.get("unitsBaseValueDollars")) or 0.0) for l in selected)
-    total_current = sum(
-        (_float_or_none(l.get("unitsBaseValueDollars")) or 0.0)
-        + (_float_or_none(l.get("unrealizedPnL")) or 0.0)
-        for l in selected
-    )
+    total_current = _value(selected)
 
     if stance == "sell":
-        header = (
-            f"Close {len(selected)} {ticker} position(s): {_num(total_units)} units, "
-            f"about {_money(total_current)} current value ({_money(total_capital)} capital/base)."
-        )
-    else:
-        if not selected:
-            lot_count = len(lots)
-            total_all_units = sum((_float_or_none(l.get("units")) or 0.0) for l in lots)
-            total_all_capital = sum((_float_or_none(l.get("unitsBaseValueDollars")) or 0.0) for l in lots)
-            total_all_current = sum(
-                (_float_or_none(l.get("unitsBaseValueDollars")) or 0.0)
-                + (_float_or_none(l.get("unrealizedPnL")) or 0.0)
-                for l in lots
-            )
-            return (
-                f"Trim requested but no exact lots/amount were specified. Open {ticker} lots: "
-                f"{lot_count} position(s), {_num(total_all_units)} units, about {_money(total_all_current)} "
-                f"current value ({_money(total_all_capital)} capital/base). "
-                "Ask PM for exact trim size before executing."
-            )
-        header = (
-            f"Trim by closing these {len(selected)} {ticker} lot(s): {_num(total_units)} units, "
-            f"about {_money(total_current)} current value ({_money(total_capital)} capital/base)."
-        )
-
-    details = []
-    for lot in selected[:8]:
-        pid = lot.get("positionId")
-        pid_s = f"id {pid}, " if pid not in (None, "") else ""
-        capital = _float_or_none(lot.get("unitsBaseValueDollars"))
-        upnl = _float_or_none(lot.get("unrealizedPnL"))
-        current = (capital + upnl) if capital is not None and upnl is not None else None
-        details.append(
-            f"{pid_s}{_num(lot.get('units'))} units opened at {_money(lot.get('openRate'))}, "
-            f"current {_money(current)}, capital/base {_money(capital)}, P/L {_money(upnl)}"
-        )
-    if len(selected) > 8:
-        details.append(f"... plus {len(selected) - 8} more lot(s)")
-    return header + " " + " | ".join(details)
+        whole = "the whole position" if len(selected) == len(lots) else f"{len(selected)} of the lots"
+        return f"time to close {whole} — about {_shares(total_units)}, worth ~{_money(total_current)} right now."
+    return f"trim it — sell about {_shares(total_units)} (~{_money(total_current)})."
 
 
 def _trading_memory_digest_block(cfg: Dict[str, Any]) -> str:

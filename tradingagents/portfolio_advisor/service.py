@@ -435,8 +435,22 @@ def _run_job(j: Dict[str, Any], cfg: Dict[str, Any], live: set, trade_date: str)
         return {"ticker": tid, "status": "failed", "verdict": ""}
 
 
+def _all_hold(results: List[Dict[str, Any]]) -> bool:
+    """True iff every completed verdict text starts with HOLD (cheap heuristic)."""
+    if not results:
+        return False
+    for r in results:
+        v = str(r.get("verdict") or "").strip().upper()
+        if not v.startswith("HOLD"):
+            return False
+    return True
+
+
 def _post_batch_pm_brief(cfg: Dict[str, Any], results: List[Dict[str, Any]]) -> None:
     """After all jobs finish, run one PM cycle and send a consolidated brief."""
+    if bool(cfg.get("portfolio_advisor_pm_skip_if_all_hold", True)) and _all_hold(results):
+        logger.info("post-batch PM brief skipped: all %d verdicts were HOLD", len(results))
+        return
     try:
         from tradingagents.portfolio_advisor.advisor_pm import run_pm_cycle
         verdicts = "\n".join(f"{r['ticker']}: {r['verdict']}" for r in results if r.get("verdict"))
@@ -479,9 +493,45 @@ def _post_batch_pm_brief(cfg: Dict[str, Any], results: List[Dict[str, Any]]) -> 
         logger.warning("post-batch PM brief failed: %s", e)
 
 
+def _check_daily_budget(cfg: Dict[str, Any]) -> bool:
+    """Return False (and throttle-alert) when today's LLM spend is over cap."""
+    from tradingagents.llm_clients.budget_guard import is_over_daily_cap
+
+    over, spent, cap = is_over_daily_cap(cfg)
+    if not over:
+        return True
+    logger.warning("daily budget cap hit: $%.2f >= $%.2f — skipping run_due batch", spent, cap)
+    throttle_h = int(cfg.get("portfolio_advisor_daily_cost_alert_throttle_hours") or 6)
+    try:
+        with _state_lock:
+            st = state.load_state(cfg)
+            last_iso = str(st.get("last_budget_cap_alert_iso") or "")
+            last_dt = _parse_iso(last_iso) if last_iso else None
+            should_alert = (
+                last_dt is None
+                or (_utc_now() - last_dt).total_seconds() >= throttle_h * 3600
+            )
+            if should_alert:
+                st["last_budget_cap_alert_iso"] = _utc_now().isoformat()
+                state.save_state(cfg, st)
+        if should_alert:
+            messaging.send_advisor_message(
+                cfg,
+                "Advisor: daily LLM budget cap hit",
+                f"Today's logged spend ${spent:.2f} >= cap ${cap:.2f}. "
+                "Non-urgent job batches will skip until midnight UTC. Watchdog + chat replies still run.",
+                urgent=True,
+            )
+    except Exception:
+        logger.exception("budget cap alert failed")
+    return False
+
+
 def run_due_jobs(cfg: Dict[str, Any]) -> int:
     """Execute all due jobs in parallel, then send a PM brief when done."""
     set_config(cfg)
+    if not _check_daily_budget(cfg):
+        return 0
     max_run = int(cfg.get("portfolio_advisor_run_due_max") or 8)
     try:
         _p, _t, live_tickers, rows = etoro_scan.fetch_portfolio_rows()

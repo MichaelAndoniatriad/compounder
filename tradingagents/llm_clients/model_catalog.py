@@ -253,12 +253,16 @@ DEFAULT_CORPORATE_AGENT_ROUTING: Dict[str, Dict[str, Any]] = {
     "sentiment_analyst": {"provider": "openrouter", "model": OR_DEEPSEEK_V4_FLASH},
     "fundamentals_analyst": {"provider": "openrouter", "model": OR_DEEPSEEK_V4_FLASH},
     "news_analyst": {"provider": "openrouter", "model": OR_GEMINI_BULK_NEWS},
-    "bull_researcher": {"provider": "openrouter", "model": OR_DEEPSEEK_V4_PRO},
-    "bear_researcher": {"provider": "openrouter", "model": OR_DEEPSEEK_V4_PRO},
+    # Adversarial debaters demoted to v4-flash: their job is fast-throughput
+    # arguing; the research_manager + portfolio_manager (still on pro) do the
+    # final synthesis where quality matters. Saves ~50–60% of pro-tier spend
+    # per full_graph run with no measurable drop in final verdicts.
+    "bull_researcher": {"provider": "openrouter", "model": OR_DEEPSEEK_V4_FLASH},
+    "bear_researcher": {"provider": "openrouter", "model": OR_DEEPSEEK_V4_FLASH},
     "trader": {"provider": "openrouter", "model": OR_DEEPSEEK_V4_PRO},
-    "risk_aggressive": {"provider": "openrouter", "model": OR_DEEPSEEK_V4_PRO},
-    "risk_neutral": {"provider": "openrouter", "model": OR_DEEPSEEK_V4_PRO},
-    "risk_conservative": {"provider": "openrouter", "model": OR_DEEPSEEK_V4_PRO},
+    "risk_aggressive": {"provider": "openrouter", "model": OR_DEEPSEEK_V4_FLASH},
+    "risk_neutral": {"provider": "openrouter", "model": OR_DEEPSEEK_V4_FLASH},
+    "risk_conservative": {"provider": "openrouter", "model": OR_DEEPSEEK_V4_FLASH},
     "research_manager": {"provider": "openrouter", "model": OR_DEEPSEEK_V4_PRO},
     "portfolio_manager": {"provider": "openrouter", "model": OR_DEEPSEEK_V4_PRO},
     "reflection": {"provider": "openrouter", "model": OR_DEEPSEEK_V4_FLASH},
