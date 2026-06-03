@@ -135,6 +135,19 @@ class AdvisorPMCandidateComparison(BaseModel):
     )
 
 
+class WatchdogUpdate(BaseModel):
+    """PM-issued update to a price-watchdog latch for one ticker."""
+
+    ticker: str = Field(description="Ticker whose watchdog latch to update.")
+    action: Literal["acknowledge", "mute", "clear", "note"] = Field(
+        description=(
+            "acknowledge = seen/handled, keep latched but silent; mute = suppress until it escalates; "
+            "clear = drop the latch entirely; note = just attach a note without changing status."
+        ),
+    )
+    note: str = Field(default="", description="Short reason/context for this update. Max 300 chars.")
+
+
 class AdvisorPMCycleResult(BaseModel):
     """One PM council pass: big picture, stances, forward work, durable memory note."""
 
@@ -198,5 +211,13 @@ class AdvisorPMCycleResult(BaseModel):
             "A short observation worth pushing to the human right now — deadline approaching, "
             "unexpected data point, stance change, catalyst in next 48h. Max 280 chars. "
             "Leave empty if nothing urgent or new. Do not repeat what was already said this cycle."
+        ),
+    )
+    watchdog_updates: List[WatchdogUpdate] = Field(
+        default_factory=list,
+        description=(
+            "Updates to active price-watchdog latches shown in context. Use to acknowledge, mute, "
+            "clear, or annotate a watchdog trigger once you have reasoned about it. Tickers not in "
+            "the live snapshot are ignored."
         ),
     )

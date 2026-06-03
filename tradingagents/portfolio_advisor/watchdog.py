@@ -199,6 +199,103 @@ def _watchdog_check_position_changes(
         logger.exception("watchdog: PM cycle on position change failed")
 
 
+_HANDOFF_KIND = {
+    "new": "NEW",
+    "escalated": "ESCALATED",
+    "deescalated": "de-escalated",
+    "refresh": "ongoing",
+}
+_HANDOFF_BUCKET = {
+    "dd40_mandatory_exit": "40% drawdown \u2014 mandatory-exit policy",
+    "trim_half": "double or pre-earnings \u2014 sell-half policy",
+    "dd30_review": "30% drawdown \u2014 review window",
+}
+
+
+def _format_watchdog_handoff(
+    changes: List[Dict[str, Any]], cleared: List[str]
+) -> str:
+    """Plain-text summary of watchdog changes for the PM's extra_context."""
+    lines = [
+        "Watchdog price triggers changed (price-only monitor, no graph). "
+        "You decide if and what reaches the user.",
+        "",
+    ]
+    for ch in changes:
+        t = ch["data"]
+        lines.append(
+            f"- {ch['ticker']}: {_HANDOFF_KIND.get(ch['kind'], ch['kind'])} "
+            f"-> {_HANDOFF_BUCKET.get(ch['bucket'], ch['bucket'])}; "
+            f"gain {float(t.get('gain_pct') or 0.0):+.1f}%, "
+            f"drawdown {float(t.get('drawdown_pct') or 0.0):.1f}% "
+            f"(entry ~${float(t.get('entry') or 0.0):.2f}, now ~${float(t.get('price') or 0.0):.2f})."
+        )
+    if cleared:
+        lines.append(f"- Cleared (no longer triggering): {', '.join(sorted(cleared))}.")
+    lines.append("")
+    lines.append(
+        "Use watchdog_updates to acknowledge, mute, clear, or annotate any of these "
+        "once you have reasoned about them."
+    )
+    return "\n".join(lines)
+
+
+def _send_direct_watchdog_alerts(
+    cfg: Dict[str, Any],
+    mandatory: List[Dict[str, Any]],
+    trim: List[Dict[str, Any]],
+    review: List[Dict[str, Any]],
+) -> int:
+    """Legacy path: DM the user directly per non-empty bucket. Off by default."""
+    sent = 0
+    if mandatory:
+        lines = [
+            "Watchdog CRITICAL (price only, no graph).",
+            "Policy: full exit within your written window. This is not a sell half trim.",
+            "",
+        ]
+        for t in mandatory:
+            lines.extend(_format_ticker_block(t))
+        messaging.send_advisor_message(
+            cfg,
+            "Watchdog: mandatory exit (40% drawdown hit)",
+            "\n".join(lines),
+            urgent=True,
+        )
+        sent += 1
+    if trim:
+        lines = [
+            "Watchdog HIGH sell half policy (price only, no graph).",
+            "Policy: trim or scale per your rules (often sell half), not a mandatory full exit unless you also have dd40 in a separate notice.",
+            "",
+        ]
+        for t in trim:
+            lines.extend(_format_ticker_block(t))
+        messaging.send_advisor_message(
+            cfg,
+            "Watchdog: sell half (double or pre-earnings trim)",
+            "\n".join(lines),
+            urgent=True,
+        )
+        sent += 1
+    if review:
+        lines = [
+            "Watchdog HIGH dd30 review (price only, no graph).",
+            "Policy: review window, not a mandatory full exit by itself.",
+            "",
+        ]
+        for t in review:
+            lines.extend(_format_ticker_block(t))
+        messaging.send_advisor_message(
+            cfg,
+            "Watchdog: drawdown review (30% threshold)",
+            "\n".join(lines),
+            urgent=True,
+        )
+        sent += 1
+    return sent
+
+
 def run_watchdog(cfg: Dict[str, Any], *, ignore_market_hours: bool = False) -> int:
     """Return count of outbound watchdog notifications (0 to 3 if all buckets fire)."""
     if not ignore_market_hours and not in_us_equity_watch_window_utc():
@@ -233,77 +330,139 @@ def run_watchdog(cfg: Dict[str, Any], *, ignore_market_hours: bool = False) -> i
     _watchdog_check_position_changes(cfg, _tickers, rows)
 
     mandatory, trim, review = _split_watchdog_triggers(rows)
-    sent = 0
-    if mandatory:
-        lines = [
-            "Watchdog CRITICAL (price only, no graph).",
-            "Policy: full exit within your written window. This is not a sell half trim.",
-            "",
-        ]
-        for t in mandatory:
-            lines.extend(_format_ticker_block(t))
-        messaging.send_advisor_message(
-            cfg,
-            "Watchdog: mandatory exit (40% drawdown hit)",
-            "\n".join(lines),
-            urgent=True,
+
+    # The watchdog is an input to the PM, not a direct user channel. Instead of
+    # DMing the user every 5 minutes, latch each trigger in state and wake the PM
+    # only when something *changes* (a ticker enters a bucket, escalates,
+    # de-escalates, or clears). The PM then owns what (if anything) reaches the
+    # user, through its quiet-hours-aware push_note.
+    from datetime import datetime as _dt, timezone as _tz
+
+    now_iso = _dt.now(_tz.utc).isoformat()
+    bucketed: List[tuple] = (
+        [("dd40_mandatory_exit", t) for t in mandatory]
+        + [("trim_half", t) for t in trim]
+        + [("dd30_review", t) for t in review]
+    )
+
+    st = pa_state.load_state(cfg)
+    changes: List[Dict[str, Any]] = []
+    active: List[str] = []
+    for bucket, t in bucketed:
+        sym = str(t.get("ticker") or "").strip().upper()
+        if not sym:
+            continue
+        active.append(sym)
+        res = pa_state.upsert_watchdog_trigger(
+            st,
+            sym,
+            bucket=bucket,
+            codes=list(t.get("codes") or []),
+            gain_pct=float(t.get("gain_pct") or 0.0),
+            drawdown_pct=float(t.get("drawdown_pct") or 0.0),
+            now_iso=now_iso,
+            entry=float(t.get("entry") or 0.0),
+            price=float(t.get("price") or 0.0),
         )
+        if res.get("changed"):
+            changes.append(
+                {
+                    "ticker": sym,
+                    "bucket": bucket,
+                    "kind": res.get("kind"),
+                    "prev_bucket": res.get("prev_bucket"),
+                    "data": t,
+                }
+            )
+    cleared = pa_state.clear_watchdog_triggers_not_in(st, active, now_iso)
+
+    # Mark this tick's genuine changes as needing a PM hand-off.
+    wt_now = pa_state.get_watchdog_triggers(st)
+    for ch in changes:
+        row = wt_now.get(ch["ticker"])
+        if isinstance(row, dict):
+            row["handoff_pending"] = True
+
+    # The hand-off set is every latch still awaiting delivery — this tick's
+    # changes PLUS any earlier trigger whose hand-off failed (e.g. the PM was
+    # out of credits). That way the PM still learns about it once it recovers.
+    pending = [tk for tk, row in wt_now.items()
+               if isinstance(row, dict) and row.get("handoff_pending")]
+
+    if not pending and not cleared:
+        pa_state.save_state(cfg, st)
+        logger.info("watchdog: nothing changed or pending (active=%d)", len(active))
+        return 0
+
+    # Audit log: one event per genuine change this tick. The PM reads these.
+    for ch in changes:
+        d = ch["data"]
         append_event(
             cfg,
             {
-                "ticker": "*",
-                "event_type": "watchdog_critical_alert",
-                "key_data": {"triggers": mandatory},
+                "ticker": ch["ticker"],
+                "event_type": "watchdog_trigger_change",
+                "key_data": {
+                    "bucket": ch["bucket"],
+                    "kind": ch["kind"],
+                    "prev_bucket": ch["prev_bucket"],
+                    "gain_pct": d.get("gain_pct"),
+                    "drawdown_pct": d.get("drawdown_pct"),
+                },
                 "outcome": None,
             },
         )
-        sent += 1
-    if trim:
-        lines = [
-            "Watchdog HIGH sell half policy (price only, no graph).",
-            "Policy: trim or scale per your rules (often sell half), not a mandatory full exit unless you also have dd40 in a separate notice.",
-            "",
-        ]
-        for t in trim:
-            lines.extend(_format_ticker_block(t))
-        messaging.send_advisor_message(
-            cfg,
-            "Watchdog: sell half (double or pre-earnings trim)",
-            "\n".join(lines),
-            urgent=True,
-        )
-        append_event(
-            cfg,
-            {
-                "ticker": "*",
-                "event_type": "watchdog_trim_alert",
-                "key_data": {"triggers": trim},
-                "outcome": None,
+
+    # Legacy: direct-to-user alerts. Off by default — the PM is the user channel now.
+    if bool(cfg.get("portfolio_advisor_watchdog_direct_alerts", False)):
+        _send_direct_watchdog_alerts(cfg, mandatory, trim, review)
+
+    # Build the hand-off payload from the full pending set, reconstructing each
+    # ticker's data from its latch so retries read the same as fresh changes.
+    kind_by_ticker = {c["ticker"]: c["kind"] for c in changes}
+    handoff_changes: List[Dict[str, Any]] = []
+    for tk in sorted(pending):
+        row = wt_now[tk]
+        handoff_changes.append({
+            "ticker": tk,
+            "bucket": row.get("bucket"),
+            "kind": kind_by_ticker.get(tk, "pending"),
+            "prev_bucket": None,
+            "data": {
+                "ticker": tk,
+                "gain_pct": row.get("gain_pct"),
+                "drawdown_pct": row.get("drawdown_pct"),
+                "entry": row.get("entry", 0.0),
+                "price": row.get("price", 0.0),
+                "codes": row.get("codes"),
             },
-        )
-        sent += 1
-    if review:
-        lines = [
-            "Watchdog HIGH dd30 review (price only, no graph).",
-            "Policy: review window, not a mandatory full exit by itself.",
-            "",
-        ]
-        for t in review:
-            lines.extend(_format_ticker_block(t))
-        messaging.send_advisor_message(
-            cfg,
-            "Watchdog: drawdown review (30% threshold)",
-            "\n".join(lines),
-            urgent=True,
-        )
-        append_event(
-            cfg,
-            {
-                "ticker": "*",
-                "event_type": "watchdog_high_alert",
-                "key_data": {"triggers": review},
-                "outcome": None,
-            },
-        )
-        sent += 1
-    return sent
+        })
+
+    # Hand off to the PM. Best-effort: a PM failure must not crash the watchdog,
+    # and must leave the triggers pending so the next tick retries them.
+    handed_off = False
+    if handoff_changes and bool(cfg.get("portfolio_advisor_pm_enabled", True)) and bool(
+        cfg.get("portfolio_advisor_watchdog_pm_handoff", True)
+    ):
+        extra = _format_watchdog_handoff(handoff_changes, cleared)
+        try:
+            from tradingagents.portfolio_advisor.advisor_pm import run_pm_cycle
+
+            run_pm_cycle(cfg, trigger="watchdog_price_trigger", extra_context=extra)
+            handed_off = True
+        except Exception:
+            logger.exception("watchdog: PM hand-off cycle failed (will retry next tick)")
+
+    if handed_off:
+        for tk in pending:
+            row = wt_now.get(tk)
+            if isinstance(row, dict):
+                row["handoff_pending"] = False
+                row["last_pm_handoff_iso"] = now_iso
+
+    pa_state.save_state(cfg, st)
+    logger.info(
+        "watchdog: %d changed, %d pending, %d cleared, pm_handoff=%s",
+        len(changes), len(pending), len(cleared), handed_off,
+    )
+    return len(changes)

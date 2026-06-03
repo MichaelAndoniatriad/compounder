@@ -491,6 +491,44 @@ def _trading_memory_digest_block(cfg: Dict[str, Any]) -> str:
         return ""
 
 
+def _watchdog_state_block(cfg: Dict[str, Any]) -> str:
+    """Render active price-watchdog latches so the PM can see and answer about them.
+
+    The watchdog is a price-only monitor that hands off to the PM on change; this
+    block surfaces the current latches (and their PM-set status) into the prompt.
+    """
+    try:
+        st = state.load_state(cfg)
+        wt = st.get("watchdog_triggers") or {}
+        if not isinstance(wt, dict) or not wt:
+            return ""
+        blabel = {
+            "dd40_mandatory_exit": "40% DD mandatory-exit",
+            "trim_half": "double/pre-earnings sell-half",
+            "dd30_review": "30% DD review",
+        }
+        lines = [
+            "Active price-watchdog triggers (price-only monitor that hands off to you; "
+            "you own these via watchdog_updates):"
+        ]
+        for tk in sorted(wt):
+            row = wt[tk]
+            if not isinstance(row, dict):
+                continue
+            note = row.get("pm_note")
+            lines.append(
+                f"  {tk} [{blabel.get(str(row.get('bucket')), row.get('bucket'))}] "
+                f"status={row.get('status', 'open')} since {str(row.get('first_seen') or '')[:10]}: "
+                f"gain {float(row.get('gain_pct') or 0.0):+.1f}%, "
+                f"dd {float(row.get('drawdown_pct') or 0.0):.1f}%"
+                + (f" -- note: {note}" if note else "")
+            )
+        return "\n".join(lines) + "\n\n"
+    except Exception as e:
+        logger.debug("_watchdog_state_block failed: %s", e)
+        return ""
+
+
 def _recent_analysis_block(cfg: Dict[str, Any], tickers: List[str]) -> str:
     """Build a block of the most recent analysis verdict per ticker from the event log.
 
@@ -888,6 +926,10 @@ def _pm_model(cfg: Dict[str, Any]) -> str:
 
 
 def _pm_provider(cfg: Dict[str, Any], model: str) -> str:
+    # Explicit PM provider wins (e.g. native DeepSeek instead of OpenRouter).
+    explicit = cfg.get("portfolio_advisor_pm_provider")
+    if isinstance(explicit, str) and explicit.strip():
+        return explicit.strip().lower()
     if "/" in model:
         return "openrouter"
     return (cfg.get("llm_provider") or "openrouter").lower()
@@ -1171,6 +1213,21 @@ def apply_pm_cycle_followups(cfg: Dict[str, Any], result: AdvisorPMCycleResult) 
     }
     if not actions["apply_enabled"]:
         return actions
+
+    # PM-driven price-watchdog latch updates (acknowledge / mute / clear / note).
+    if getattr(result, "watchdog_updates", None):
+        try:
+            st_wd = state.load_state(cfg)
+            applied = []
+            for u in result.watchdog_updates:
+                if state.set_watchdog_trigger_status(st_wd, u.ticker, u.action, note=u.note):
+                    applied.append({"ticker": str(u.ticker).strip().upper(), "action": u.action})
+            if applied:
+                state.save_state(cfg, st_wd)
+            actions["watchdog_updates_applied"] = applied
+        except Exception:
+            logger.exception("PM watchdog updates failed")
+            actions["watchdog_updates_applied"] = []
 
     actions["replan_outcome"] = None
     actions["replan_error"] = None
@@ -1625,6 +1682,7 @@ def run_pm_cycle(
     prior_txt = _prior_pm_context(cfg, current_tickers=live_tickers)
     prior_block = f"Prior PM context (most recent cycles):\n{prior_txt}\n\n" if prior_txt else ""
     tm_block = _trading_memory_digest_block(cfg)
+    wd_block = _watchdog_state_block(cfg)
     recent_analysis_block = _recent_analysis_block(cfg, sorted(live_tickers))
     evidence_context = _pm_evidence_context(cfg, sorted(live_tickers), pend)
     evidence_block = _pm_json_for_prompt(
@@ -1791,7 +1849,7 @@ disagree, cite newer completed evidence than that full-graph decision or queue c
 Last bootstrap summary (JSON, may be empty):
 {summ_txt or "(none)"}
 
-{outcomes_review_blk}{prior_block}{tm_block}Extra notes from caller (may be empty):
+{outcomes_review_blk}{prior_block}{tm_block}{wd_block}Extra notes from caller (may be empty):
 {extra_excerpt or "(none)"}
 
 Structured output fields (use defaults when unsure):

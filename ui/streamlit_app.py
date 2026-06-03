@@ -86,6 +86,7 @@ _WATCHDOG_EVENT_TYPES = [
     "watchdog_critical_alert",
     "watchdog_trim_alert",
     "watchdog_high_alert",
+    "watchdog_trigger_change",
 ]
 
 # Snake_case event_type → short title for lists and tables (fallback: title-cased snake).
@@ -104,6 +105,7 @@ EVENT_TYPE_LABELS: Dict[str, str] = {
     "watchdog_critical_alert": "Watchdog: critical",
     "watchdog_trim_alert": "Watchdog: trim",
     "watchdog_high_alert": "Watchdog: elevated",
+    "watchdog_trigger_change": "Watchdog: change",
     "pending_outcome_30d": "30-day outcome pending",
     "partial_close_outcome": "Partial close outcome",
 }

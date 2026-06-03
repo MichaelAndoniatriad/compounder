@@ -51,6 +51,7 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_PORTFOLIO_ADVISOR_INJECT_PRIOR_CLERK": "portfolio_advisor_inject_prior_clerk_report",
     "TRADINGAGENTS_PORTFOLIO_ADVISOR_PRIOR_CLERK_MAX_CHARS": "portfolio_advisor_prior_clerk_report_max_chars",
     "TRADINGAGENTS_PORTFOLIO_ADVISOR_PM_MODEL": "portfolio_advisor_pm_model",
+    "TRADINGAGENTS_PORTFOLIO_ADVISOR_PM_PROVIDER": "portfolio_advisor_pm_provider",
     "TRADINGAGENTS_PORTFOLIO_ADVISOR_PM_LOG_PATH": "portfolio_advisor_pm_log_path",
     "TRADINGAGENTS_PORTFOLIO_ADVISOR_PM_AFTER_BOOTSTRAP": "portfolio_advisor_pm_cycle_after_bootstrap",
     "TRADINGAGENTS_PORTFOLIO_ADVISOR_PM_ENABLED": "portfolio_advisor_pm_enabled",
@@ -129,7 +130,10 @@ DEFAULT_CONFIG = _apply_env_overrides({
     "portfolio_advisor_inject_prior_clerk_report": True,
     "portfolio_advisor_prior_clerk_report_max_chars": 16000,
     # Advisor-level PM council (separate from LangGraph's Portfolio Manager node).
-    "portfolio_advisor_pm_model": "deepseek/deepseek-v4-pro",
+    "portfolio_advisor_pm_model": "deepseek-v4-pro",
+    # Route the PM at native DeepSeek (not OpenRouter). Set to None to fall
+    # back to slug-based routing (a model with "/" implies openrouter).
+    "portfolio_advisor_pm_provider": "deepseek",
     "portfolio_advisor_pm_log_path": None,
     # Master switch for advisor PM (set False only to pause all PM automation, e.g. tests or cost cap).
     "portfolio_advisor_pm_enabled": True,

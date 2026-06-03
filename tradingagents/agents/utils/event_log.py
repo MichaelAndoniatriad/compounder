@@ -19,6 +19,7 @@ EVENT_WEIGHTS: Dict[str, int] = {
     "watchdog_critical_alert": 9,
     "watchdog_trim_alert": 8,
     "watchdog_high_alert": 7,
+    "watchdog_trigger_change": 8,
     "plan_validation_override": 8,
     "outcome_recorded": 8,
     "single_model_analysis": 7,

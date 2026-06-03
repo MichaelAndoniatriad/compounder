@@ -43,6 +43,12 @@ def default_state() -> Dict[str, Any]:
         "last_book_units_by_ticker": {},
         "last_pm_cycle_iso": None,
         "last_pm_executive_prefix": None,
+        # Per-ticker price-watchdog latches keyed by TICKER:
+        #   {bucket, codes, gain_pct, drawdown_pct, first_seen, last_seen,
+        #    status, pm_note, last_pm_handoff_iso}
+        # Lets the watchdog hand off to the PM only on *change* instead of
+        # DMing the user every 5 minutes.
+        "watchdog_triggers": {},
         "jobs": [],
     }
 
@@ -155,3 +161,120 @@ def cancel_all_pending(state: Dict[str, Any], reason: str) -> int:
 def append_jobs(state: Dict[str, Any], new_jobs: List[Dict[str, Any]]) -> None:
     jobs = state.setdefault("jobs", [])
     jobs.extend(new_jobs)
+
+
+# --- Price-watchdog latches -------------------------------------------------
+# Bucket severity ranking; higher wins when a ticker would match several.
+_WATCHDOG_BUCKET_RANK = {"dd30_review": 1, "trim_half": 2, "dd40_mandatory_exit": 3}
+
+
+def get_watchdog_triggers(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the mutable watchdog-trigger map, creating it if absent."""
+    wt = state.get("watchdog_triggers")
+    if not isinstance(wt, dict):
+        wt = {}
+        state["watchdog_triggers"] = wt
+    return wt
+
+
+def upsert_watchdog_trigger(
+    state: Dict[str, Any],
+    ticker: str,
+    *,
+    bucket: str,
+    codes: List[str],
+    gain_pct: float,
+    drawdown_pct: float,
+    now_iso: str,
+    entry: float = 0.0,
+    price: float = 0.0,
+) -> Dict[str, Any]:
+    """Insert or refresh one ticker latch.
+
+    Returns {"changed": bool, "kind": new|escalated|deescalated|refresh,
+    "prev_bucket": str|None}. "changed" is True only when the PM should be
+    woken: a ticker newly enters a bucket, escalates, or de-escalates. A
+    still-true unchanged trigger returns changed=False (no PM, no message).
+    """
+    tid = str(ticker or "").strip().upper()
+    wt = get_watchdog_triggers(state)
+    prev = wt.get(tid) if isinstance(wt.get(tid), dict) else None
+    prev_bucket = str(prev.get("bucket")) if prev else None
+    prev_status = str(prev.get("status")) if prev else None
+
+    if prev is None:
+        kind, changed = "new", True
+        first_seen, status = now_iso, "open"
+    else:
+        first_seen = str(prev.get("first_seen") or now_iso)
+        new_rank = _WATCHDOG_BUCKET_RANK.get(bucket, 0)
+        old_rank = _WATCHDOG_BUCKET_RANK.get(prev_bucket or "", 0)
+        if new_rank > old_rank:
+            kind, changed, status = "escalated", True, "open"  # re-arm even if muted
+        elif new_rank < old_rank:
+            kind, changed, status = "deescalated", True, (prev_status or "open")
+        else:
+            kind, changed, status = "refresh", False, (prev_status or "open")
+
+    wt[tid] = {
+        "ticker": tid,
+        "bucket": bucket,
+        "codes": list(codes or []),
+        "gain_pct": round(float(gain_pct or 0.0), 2),
+        "drawdown_pct": round(float(drawdown_pct or 0.0), 2),
+        "first_seen": first_seen,
+        "last_seen": now_iso,
+        "status": status,
+        "entry": round(float(entry or 0.0), 4),
+        "price": round(float(price or 0.0), 4),
+        "pm_note": (prev.get("pm_note") if prev else "") or "",
+        "last_pm_handoff_iso": (prev.get("last_pm_handoff_iso") if prev else None),
+        # True once a trigger needs the PM but the hand-off has not yet
+        # succeeded (e.g. PM was down). Retried each tick until delivered.
+        "handoff_pending": bool(prev.get("handoff_pending")) if prev else False,
+    }
+    return {"changed": changed, "kind": kind, "prev_bucket": prev_bucket}
+
+
+def clear_watchdog_triggers_not_in(
+    state: Dict[str, Any], active_tickers: Any, now_iso: str
+) -> List[str]:
+    """Drop latches for tickers no longer triggering. Returns cleared tickers."""
+    active = {str(t).strip().upper() for t in (active_tickers or [])}
+    wt = get_watchdog_triggers(state)
+    cleared = [t for t in list(wt.keys()) if t not in active]
+    for t in cleared:
+        wt.pop(t, None)
+    return cleared
+
+
+def mark_watchdog_handoff(state: Dict[str, Any], tickers: List[str], now_iso: str) -> None:
+    """Stamp last_pm_handoff_iso on the tickers we just handed to the PM."""
+    wt = get_watchdog_triggers(state)
+    for t in tickers or []:
+        row = wt.get(str(t).strip().upper())
+        if isinstance(row, dict):
+            row["last_pm_handoff_iso"] = now_iso
+
+
+def set_watchdog_trigger_status(
+    state: Dict[str, Any], ticker: str, action: str, note: str = ""
+) -> bool:
+    """PM-facing latch update. action: acknowledge|ack|mute|open|clear|note.
+
+    clear drops the latch; acknowledge/mute/open set status; note just attaches
+    a note without changing status. Returns True when something was applied.
+    """
+    tid = str(ticker or "").strip().upper()
+    wt = get_watchdog_triggers(state)
+    if action == "clear":
+        return wt.pop(tid, None) is not None
+    row = wt.get(tid)
+    if not isinstance(row, dict):
+        return False
+    mapping = {"acknowledge": "acknowledged", "ack": "acknowledged", "mute": "muted", "open": "open"}
+    if action in mapping:
+        row["status"] = mapping[action]
+    if note:
+        row["pm_note"] = str(note)[:300]
+    return True
