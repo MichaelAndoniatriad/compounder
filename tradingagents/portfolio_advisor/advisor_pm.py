@@ -1716,6 +1716,7 @@ def run_pm_cycle(
     strategies_blk = _pmws.load_strategies(cfg)
     ep_open_blk = _pmws.load_ep_open_trades_block(cfg)
     ep_stats_blk = _pmws.load_ep_stats_block(cfg)
+    conv_blk = _pmws.load_conversation_block(cfg)
     strategy_block = (
         f"Strategy docs (rules/strategies/, FOLLOW EXACTLY when reasoning about a trade in their domain):\n{strategies_blk}\n\n"
         if strategies_blk else ""
@@ -1860,7 +1861,7 @@ Execution tiers (for append_jobs only): "full_graph" runs the full multi-agent p
 
 Trigger for this cycle: {trigger_label}
 
-{strategy_block}{rules_blk}{rule_book_blk}{lessons_blk}{mem_blk}{ep_open_blk}{ep_stats_blk}{decisions_blk}{memory_block}{market_memory_blk}{broad_move_blk}Portfolio snapshot:
+{strategy_block}{rules_blk}{rule_book_blk}{lessons_blk}{mem_blk}{ep_open_blk}{ep_stats_blk}{conv_blk}{decisions_blk}{memory_block}{market_memory_blk}{broad_move_blk}Portfolio snapshot:
 {portfolio_snapshot}
 
 {sleeve_block}
@@ -1998,6 +1999,11 @@ the trigger, say that plainly and use append_jobs to send a new research layer t
     )
     _record_stance_decisions(cfg, result, live_tickers)
     actions_taken = apply_pm_cycle_followups(cfg, result)
+    try:
+        _pmws.prune_conversation(cfg)
+    except Exception:
+        pass
+
 
     # Always sync the action log from stances so a chat-mode "hold" actually
     # clears the matching SELL action (the digest stops contradicting the PM).

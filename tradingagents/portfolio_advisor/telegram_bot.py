@@ -13,6 +13,7 @@ import requests
 
 from tradingagents.portfolio_advisor import messaging, state
 from tradingagents.portfolio_advisor.advisor_pm import cancel_last_action, run_pm_cycle
+from tradingagents.portfolio_advisor import pm_workspace as pmws
 from tradingagents.portfolio_advisor.models import AdvisorPMCycleResult
 
 logger = logging.getLogger(__name__)
@@ -155,10 +156,20 @@ def process_update(cfg: Dict[str, Any], update: Dict[str, Any]) -> Optional[str]
         logger.info("Ignoring Telegram message from unauthorized chat_id=%s", chat_id)
         return None
     text = str(msg.get("text") or "").strip()
+    try:
+        if text:
+            pmws.record_user_message(cfg, text, channel="telegram")
+    except Exception:
+        logger.debug("record_user_message failed", exc_info=True)
     if _is_trivial(text):
         reply = "Hi. Ask me a portfolio question, for example: what should I do?"
     else:
         reply = answer_text(cfg, text)
+    try:
+        if reply:
+            pmws.record_pm_message(cfg, reply, kind="reply", channel="telegram")
+    except Exception:
+        logger.debug("record_pm_message failed", exc_info=True)
     ok = messaging.send_telegram_message(cfg, "PM", reply)
     if not ok:
         raise RuntimeError("Telegram reply failed.")

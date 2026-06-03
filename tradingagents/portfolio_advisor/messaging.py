@@ -449,4 +449,12 @@ def send_advisor_message(
         )
     except Exception:
         logger.debug("message log persist skipped", exc_info=True)
+    # Log every actual push to the conversation history so the PM remembers
+    # what it already told the human and avoids repeating itself next cycle.
+    try:
+        if sent:
+            from tradingagents.portfolio_advisor import pm_workspace as _pmws
+            _pmws.record_pm_message(cfg, body, kind="push", subject=subject)
+    except Exception:
+        logger.debug("conversation log on send failed", exc_info=True)
     return sent

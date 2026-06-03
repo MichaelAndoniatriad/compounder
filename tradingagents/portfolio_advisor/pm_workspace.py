@@ -87,6 +87,11 @@ def decisions_md_path(cfg: Dict[str, Any]) -> Path:
     return memory_dir(cfg) / "decisions.md"
 
 
+def conversation_jsonl_path(cfg: Dict[str, Any]) -> Path:
+    return memory_dir(cfg) / "conversation.jsonl"
+
+
+
 def ensure_workspace(cfg: Dict[str, Any]) -> None:
     rules_dir(cfg).mkdir(parents=True, exist_ok=True)
     positions_dir(cfg).mkdir(parents=True, exist_ok=True)
@@ -527,3 +532,112 @@ def _render_ep_trades_md(cfg: Dict[str, Any], rows: List[Dict[str, Any]]) -> Non
             lines.append(f"- Notes: {r.get('notes')}")
         lines.append("")
     p.write_text("\n".join(lines), encoding="utf-8")
+
+# --- conversation history (PM <-> human messages) ---------------------------
+# Append-only log of every exchange so the PM can read what was JUST said and
+# answer with continuity instead of restarting cold each turn.
+
+def _append_conversation(cfg: Dict[str, Any], row: Dict[str, Any]) -> None:
+    ensure_workspace(cfg)
+    p = conversation_jsonl_path(cfg)
+    line = json.dumps(row, ensure_ascii=False) + "\n"
+    with p.open("a", encoding="utf-8") as fh:
+        fh.write(line)
+
+
+def record_user_message(cfg: Dict[str, Any], text: str, *, channel: str = "telegram") -> None:
+    """Append one inbound user message to the conversation log."""
+    text = (text or "").strip()
+    if not text:
+        return
+    _append_conversation(cfg, {
+        "ts": _now_iso(),
+        "role": "user",
+        "channel": channel,
+        "text": text[:3000],
+    })
+
+
+def record_pm_message(
+    cfg: Dict[str, Any],
+    text: str,
+    *,
+    kind: str = "reply",
+    subject: str = "",
+    channel: str = "telegram",
+) -> None:
+    """Append one outbound PM message to the conversation log.
+
+    kind: "reply" (user-initiated chat answer), "push" (proactive action_check
+    push_note or scheduled alert), or "system" (errors / status).
+    """
+    text = (text or "").strip()
+    if not text:
+        return
+    _append_conversation(cfg, {
+        "ts": _now_iso(),
+        "role": "pm",
+        "kind": kind,
+        "subject": (subject or "")[:120],
+        "channel": channel,
+        "text": text[:3000],
+    })
+
+
+def _load_conversation_tail(cfg: Dict[str, Any], n: int = 20) -> List[Dict[str, Any]]:
+    p = conversation_jsonl_path(cfg)
+    if not p.is_file():
+        return []
+    try:
+        # Cheap tail: read full file, take last n. Pruned periodically below.
+        lines = p.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    out: List[Dict[str, Any]] = []
+    for line in lines[-n:]:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return out
+
+
+def load_conversation_block(cfg: Dict[str, Any], *, n: int = 12, per_cap: int = 600, total_cap: int = 4000) -> str:
+    """Render the last N exchanges for the PM prompt with role + timestamp."""
+    rows = _load_conversation_tail(cfg, n=n)
+    if not rows:
+        return ""
+    lines = [
+        "Recent conversation with the human (newest last). Read this BEFORE replying or pushing -- "
+        "never repeat what you already said in the last day unless it materially changed:",
+    ]
+    for r in rows:
+        ts = str(r.get("ts") or "")[:16].replace("T", " ")
+        role = r.get("role", "?")
+        if role == "pm":
+            tag = f"PM {r.get('kind', 'reply')}"
+            if r.get("subject"):
+                tag = f"{tag} [{r.get('subject')}]"
+        else:
+            tag = "HUMAN"
+        text = str(r.get("text") or "").replace("\n", " ").strip()[:per_cap]
+        lines.append(f"  [{ts}] {tag}: {text}")
+    out = "\n".join(lines)
+    return out[-total_cap:] + "\n\n"
+
+
+def prune_conversation(cfg: Dict[str, Any], *, keep: int = 500) -> None:
+    """Keep only the most-recent ``keep`` rows. Idempotent; safe to call often."""
+    p = conversation_jsonl_path(cfg)
+    if not p.is_file():
+        return
+    try:
+        lines = p.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+    if len(lines) <= keep:
+        return
+    p.write_text("\n".join(lines[-keep:]) + "\n", encoding="utf-8")
