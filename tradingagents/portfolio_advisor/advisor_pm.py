@@ -516,12 +516,21 @@ def _watchdog_state_block(cfg: Dict[str, Any]) -> str:
             if not isinstance(row, dict):
                 continue
             note = row.get("pm_note")
+            consumed = bool(row.get("double_trim_consumed"))
+            extra = ""
+            if consumed:
+                extra += (
+                    " -- SELL-HALF ALREADY EXECUTED (position size dropped): do NOT recommend "
+                    "trimming again; the remaining runner staying >100% is expected and correct."
+                )
+            if note:
+                extra += f" -- note: {note}"
             lines.append(
                 f"  {tk} [{blabel.get(str(row.get('bucket')), row.get('bucket'))}] "
                 f"status={row.get('status', 'open')} since {str(row.get('first_seen') or '')[:10]}: "
                 f"gain {float(row.get('gain_pct') or 0.0):+.1f}%, "
                 f"dd {float(row.get('drawdown_pct') or 0.0):.1f}%"
-                + (f" -- note: {note}" if note else "")
+                + extra
             )
         return "\n".join(lines) + "\n\n"
     except Exception as e:

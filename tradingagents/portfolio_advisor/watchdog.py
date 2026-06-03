@@ -128,12 +128,14 @@ def _split_watchdog_triggers(
             and gain >= 15.0
             and 0 <= (ed - date.today()).days <= 14
         )
+        units = sum(_to_float(l.get("units")) for l in lots)
         base = {
             "ticker": sym,
             "entry": entry,
             "price": px,
             "gain_pct": gain,
             "drawdown_pct": dd,
+            "units": units,
         }
         if dd >= 40.0:
             mandatory.append({**base, "codes": ["dd40_mandatory_exit"]})
@@ -363,6 +365,7 @@ def run_watchdog(cfg: Dict[str, Any], *, ignore_market_hours: bool = False, supp
             now_iso=now_iso,
             entry=float(t.get("entry") or 0.0),
             price=float(t.get("price") or 0.0),
+            units=float(t.get("units") or 0.0),
         )
         if res.get("changed"):
             changes.append(
@@ -386,6 +389,41 @@ def run_watchdog(cfg: Dict[str, Any], *, ignore_market_hours: bool = False, supp
     # The hand-off set is every latch still awaiting delivery — this tick's
     # changes PLUS any earlier trigger whose hand-off failed (e.g. the PM was
     # out of credits). That way the PM still learns about it once it recovers.
+    # One-shot trims: a sell-half-on-double is consumed once executed. Detect
+    # via a units drop vs the size when it first latched; the remaining runner
+    # staying >100% is expected and must not re-alert. Re-arm only if the
+    # position grows back (a genuine new entry). Also honor an explicit human
+    # decision that the action is handled.
+    from tradingagents.portfolio_advisor import pm_workspace as _pmws
+    _settled_choices = {"executed", "done", "sold", "trimmed", "hold", "holding", "skip"}
+    suppressed: set = set()
+    for _sym, _row in wt_now.items():
+        if not isinstance(_row, dict):
+            continue
+        _codes = _row.get("codes") or []
+        _uat = _row.get("units_at_trigger")
+        _cur = _row.get("units")
+        if _row.get("bucket") == "trim_half" and "double_from_entry" in _codes and _uat and _cur is not None:
+            if float(_cur) <= float(_uat) * 0.6:
+                _row["double_trim_consumed"] = True
+            elif float(_cur) > float(_uat) * 1.1:
+                _row["double_trim_consumed"] = False
+                _row["units_at_trigger"] = float(_cur)
+        if _row.get("double_trim_consumed"):
+            suppressed.add(_sym)
+        try:
+            _dec = _pmws.active_decision(cfg, _sym)
+        except Exception:
+            _dec = None
+        if _dec and str(_dec.get("choice", "")).strip().lower() in _settled_choices:
+            suppressed.add(_sym)
+    if suppressed:
+        changes = [c for c in changes if c["ticker"] not in suppressed]
+        for _s in suppressed:
+            _r = wt_now.get(_s)
+            if isinstance(_r, dict):
+                _r["handoff_pending"] = False
+
     pending = [tk for tk, row in wt_now.items()
                if isinstance(row, dict) and row.get("handoff_pending")]
 

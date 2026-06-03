@@ -188,6 +188,7 @@ def upsert_watchdog_trigger(
     now_iso: str,
     entry: float = 0.0,
     price: float = 0.0,
+    units: float = 0.0,
 ) -> Dict[str, Any]:
     """Insert or refresh one ticker latch.
 
@@ -227,6 +228,13 @@ def upsert_watchdog_trigger(
         "status": status,
         "entry": round(float(entry or 0.0), 4),
         "price": round(float(price or 0.0), 4),
+        "units": round(float(units or 0.0), 6),
+        # Baseline size when the trigger first latched, so we can tell when a
+        # one-time trim (e.g. sell-half-on-double) was actually executed.
+        "units_at_trigger": (
+            prev.get("units_at_trigger") if (prev and prev.get("units_at_trigger")) else round(float(units or 0.0), 6)
+        ),
+        "double_trim_consumed": bool(prev.get("double_trim_consumed")) if prev else False,
         "pm_note": (prev.get("pm_note") if prev else "") or "",
         "last_pm_handoff_iso": (prev.get("last_pm_handoff_iso") if prev else None),
         # True once a trigger needs the PM but the hand-off has not yet
