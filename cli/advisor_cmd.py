@@ -416,6 +416,25 @@ def portfolio_advisor_pm_cycle(
         raise typer.Exit(1) from e
 
 
+@portfolio_app.command("action-check")
+def portfolio_advisor_action_check(
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+):
+    """Proactive action pass (3x/day cron). Refreshes price latches, runs one PM
+    cycle, and messages the human ONLY when there is an action to take."""
+    _configure_logging(verbose)
+    cfg = DEFAULT_CONFIG.copy()
+    try:
+        from tradingagents.portfolio_advisor.advisor_pm import run_action_check
+
+        out = run_action_check(cfg)
+        pushed = bool((out.push_note or "").strip())
+        console.print(f"[cyan]Advisor action-check:[/cyan] action message sent={pushed}.")
+    except Exception as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1) from e
+
+
 @portfolio_app.command("cost-report")
 def portfolio_cost_report(
     days: int = typer.Option(7, "--days", help="Lookback window in days (default 7)."),

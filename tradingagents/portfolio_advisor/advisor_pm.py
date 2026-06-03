@@ -1383,6 +1383,7 @@ def _notify_action_stances(
     result: AdvisorPMCycleResult,
     portfolio_rows: List[Dict[str, Any]],
     notify_alert: bool = True,
+    require_push_note: bool = False,
 ) -> bool:
     """Update action log from PM stances; push one conversational alert when something is new.
 
@@ -1418,6 +1419,9 @@ def _notify_action_stances(
             return False
 
         push = (result.push_note or "").strip()
+        if require_push_note and not push:
+            # action_check pass: only the PM's deliberate action message goes out.
+            return False
         if push:
             body = push
         else:
@@ -1683,6 +1687,23 @@ def run_pm_cycle(
     prior_block = f"Prior PM context (most recent cycles):\n{prior_txt}\n\n" if prior_txt else ""
     tm_block = _trading_memory_digest_block(cfg)
     wd_block = _watchdog_state_block(cfg)
+    from tradingagents.portfolio_advisor import pm_workspace as _pmws
+    _live_sorted = sorted(live_tickers)
+    _pf_rules = _pmws.load_portfolio_rules(cfg)
+    _scoped_rules = _pmws.load_scoped_rules(cfg, _live_sorted)
+    rules_blk = ""
+    if _pf_rules:
+        rules_blk += f"Portfolio-wide rules (rules/_portfolio.md):\n{_pf_rules}\n\n"
+    if _scoped_rules:
+        rules_blk += f"Per-ticker rules for current holdings (rules/<TICKER>.md):\n{_scoped_rules}\n\n"
+    _mem_index = _pmws.load_memory_index(cfg)
+    _pos_mem = _pmws.load_position_memory(cfg, _live_sorted)
+    mem_blk = ""
+    if _mem_index:
+        mem_blk += f"Memory index (memory/MEMORY.md):\n{_mem_index}\n\n"
+    if _pos_mem:
+        mem_blk += f"Per-position memory for current holdings (memory/positions/<TICKER>.md):\n{_pos_mem}\n\n"
+    decisions_blk = _pmws.load_decisions_block(cfg, _live_sorted)
     recent_analysis_block = _recent_analysis_block(cfg, sorted(live_tickers))
     evidence_context = _pm_evidence_context(cfg, sorted(live_tickers), pend)
     evidence_block = _pm_json_for_prompt(
@@ -1823,7 +1844,7 @@ Execution tiers (for append_jobs only): "full_graph" runs the full multi-agent p
 
 Trigger for this cycle: {trigger_label}
 
-{rule_book_blk}{lessons_blk}{memory_block}{market_memory_blk}{broad_move_blk}Portfolio snapshot:
+{rules_blk}{rule_book_blk}{lessons_blk}{mem_blk}{decisions_blk}{memory_block}{market_memory_blk}{broad_move_blk}Portfolio snapshot:
 {portfolio_snapshot}
 
 {sleeve_block}
@@ -1969,6 +1990,7 @@ the trigger, say that plainly and use append_jobs to send a new research layer t
     action_alert_sent = _notify_action_stances(
         cfg, result, portfolio_rows,
         notify_alert=(trigger_s != "ntfy_question"),
+        require_push_note=(trigger_s == "action_check"),
     )
 
     # Push note — only when it is not already included in the consolidated action alert.
@@ -2126,3 +2148,19 @@ def optional_pm_cycle_on_portfolio_change(
         run_pm_cycle(cfg, trigger=trigger, extra_context=extra)
     except Exception:
         logger.exception("PM cycle on portfolio change failed (trigger=%s)", trigger)
+
+
+def run_action_check(cfg: Dict[str, Any]) -> "AdvisorPMCycleResult":
+    """Proactive 3x/day pass: refresh price latches, then run ONE PM cycle that
+    messages the human only when there's an action to take.
+
+    Decisions the human already made suppress settled calls (the decisions block
+    is in the prompt); action_check messaging is gated to the PM's push_note.
+    """
+    set_config(cfg)
+    try:
+        from tradingagents.portfolio_advisor import watchdog as _wd
+        _wd.run_watchdog(cfg, ignore_market_hours=True, suppress_pm_handoff=True)
+    except Exception:
+        logger.debug("action_check: watchdog latch refresh failed", exc_info=True)
+    return run_pm_cycle(cfg, trigger="action_check")

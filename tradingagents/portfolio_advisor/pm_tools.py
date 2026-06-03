@@ -16,6 +16,7 @@ from langchain_core.tools import tool
 
 from tradingagents.portfolio_advisor import action_log as al
 from tradingagents.portfolio_advisor import state as pa_state
+from tradingagents.portfolio_advisor import pm_workspace as pmws
 
 
 def build_pm_tools(cfg: Dict[str, Any], live_tickers: set) -> List[Any]:
@@ -433,6 +434,75 @@ def build_pm_tools(cfg: Dict[str, Any], live_tickers: set) -> List[Any]:
                 evidence_note=evidence_note.strip(),
             )
 
+    @tool
+    def record_decision(
+        ticker: str,
+        recommended: str,
+        choice: str,
+        reason: str = "",
+        until: str = "",
+    ) -> str:
+        """Record what the human decided when you recommended an action.
+
+        Call this whenever the human accepts, defers, or overrides an action
+        you proposed (e.g. you said "sell half DDOG" and they said "holding
+        through earnings"). It writes a durable decision so you stop re-nagging
+        a settled call and remember WHY next cycle.
+
+        - recommended: the action you advised (e.g. "sell half", "trim", "exit").
+        - choice: what the human chose (e.g. "hold", "sell half", "defer").
+        - reason: the human's stated reason (quote it briefly).
+        - until: optional ISO date (YYYY-MM-DD) the decision holds until
+          (e.g. through an earnings date). Empty = open-ended.
+        """
+        tk = (ticker or "").strip().upper()
+        if not tk:
+            return "error: empty ticker"
+        row = pmws.record_decision(
+            cfg,
+            ticker=tk,
+            recommended=recommended,
+            choice=choice,
+            reason=reason,
+            until=(until.strip() or None),
+        )
+        return f"recorded decision for {tk}: human chose {row['choice']} (reason: {row['reason'] or 'none'})"
+
+    @tool
+    def clear_decision(ticker: str) -> str:
+        """Clear the active standing decision for a ticker (re-arm alerts on it)."""
+        tk = (ticker or "").strip().upper()
+        if not tk:
+            return "error: empty ticker"
+        return f"cleared decision for {tk}" if pmws.clear_decision(cfg, tk) else f"no active decision for {tk}"
+
+    @tool
+    def update_position_memory(ticker: str, note: str) -> str:
+        """Append a durable note to a position's memory file (memory/positions/<TICKER>.md).
+
+        Use for thesis updates, what changed, what you learned — facts your next
+        self should know about this holding. Keep each note tight.
+        """
+        tk = (ticker or "").strip().upper()
+        if not tk or not (note or "").strip():
+            return "error: need ticker and note"
+        pmws.update_position_memory(cfg, tk, note)
+        return f"updated position memory for {tk}"
+
+    @tool
+    def update_scoped_rule(ticker: str, rule_text: str) -> str:
+        """Add a per-ticker rule to rules/<TICKER>.md.
+
+        Use for a durable rule specific to one name (e.g. an entry/exit trigger
+        the human set, or a learned constraint). Portfolio-wide rules belong in
+        rules/_portfolio.md; do not put them here.
+        """
+        tk = (ticker or "").strip().upper()
+        if not tk or not (rule_text or "").strip():
+            return "error: need ticker and rule_text"
+        pmws.update_scoped_rule(cfg, tk, rule_text)
+        return f"added scoped rule for {tk}"
+
     return [
         queue_research,
         mark_action_done,
@@ -445,4 +515,8 @@ def build_pm_tools(cfg: Dict[str, Any], live_tickers: set) -> List[Any]:
         log_market_event,
         log_decision_lesson,
         update_pm_rule,
+        record_decision,
+        clear_decision,
+        update_position_memory,
+        update_scoped_rule,
     ]

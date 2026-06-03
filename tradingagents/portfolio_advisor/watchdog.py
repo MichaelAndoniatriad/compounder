@@ -296,7 +296,7 @@ def _send_direct_watchdog_alerts(
     return sent
 
 
-def run_watchdog(cfg: Dict[str, Any], *, ignore_market_hours: bool = False) -> int:
+def run_watchdog(cfg: Dict[str, Any], *, ignore_market_hours: bool = False, suppress_pm_handoff: bool = False) -> int:
     """Return count of outbound watchdog notifications (0 to 3 if all buckets fire)."""
     if not ignore_market_hours and not in_us_equity_watch_window_utc():
         logger.info("watchdog skipped (outside US equity watch window UTC)")
@@ -441,7 +441,7 @@ def run_watchdog(cfg: Dict[str, Any], *, ignore_market_hours: bool = False) -> i
     # Hand off to the PM. Best-effort: a PM failure must not crash the watchdog,
     # and must leave the triggers pending so the next tick retries them.
     handed_off = False
-    if handoff_changes and bool(cfg.get("portfolio_advisor_pm_enabled", True)) and bool(
+    if handoff_changes and not suppress_pm_handoff and bool(cfg.get("portfolio_advisor_pm_enabled", True)) and bool(
         cfg.get("portfolio_advisor_watchdog_pm_handoff", True)
     ):
         extra = _format_watchdog_handoff(handoff_changes, cleared)
