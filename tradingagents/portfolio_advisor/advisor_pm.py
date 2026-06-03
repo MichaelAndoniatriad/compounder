@@ -1713,6 +1713,13 @@ def run_pm_cycle(
     if _pos_mem:
         mem_blk += f"Per-position memory for current holdings (memory/positions/<TICKER>.md):\n{_pos_mem}\n\n"
     decisions_blk = _pmws.load_decisions_block(cfg, _live_sorted)
+    strategies_blk = _pmws.load_strategies(cfg)
+    ep_open_blk = _pmws.load_ep_open_trades_block(cfg)
+    ep_stats_blk = _pmws.load_ep_stats_block(cfg)
+    strategy_block = (
+        f"Strategy docs (rules/strategies/, FOLLOW EXACTLY when reasoning about a trade in their domain):\n{strategies_blk}\n\n"
+        if strategies_blk else ""
+    )
     recent_analysis_block = _recent_analysis_block(cfg, sorted(live_tickers))
     evidence_context = _pm_evidence_context(cfg, sorted(live_tickers), pend)
     evidence_block = _pm_json_for_prompt(
@@ -1853,7 +1860,7 @@ Execution tiers (for append_jobs only): "full_graph" runs the full multi-agent p
 
 Trigger for this cycle: {trigger_label}
 
-{rules_blk}{rule_book_blk}{lessons_blk}{mem_blk}{decisions_blk}{memory_block}{market_memory_blk}{broad_move_blk}Portfolio snapshot:
+{strategy_block}{rules_blk}{rule_book_blk}{lessons_blk}{mem_blk}{ep_open_blk}{ep_stats_blk}{decisions_blk}{memory_block}{market_memory_blk}{broad_move_blk}Portfolio snapshot:
 {portfolio_snapshot}
 
 {sleeve_block}

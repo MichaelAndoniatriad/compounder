@@ -503,6 +503,135 @@ def build_pm_tools(cfg: Dict[str, Any], live_tickers: set) -> List[Any]:
         pmws.update_scoped_rule(cfg, tk, rule_text)
         return f"added scoped rule for {tk}"
 
+    @tool
+    def emit_ep_candidate(
+        ticker: str,
+        tier: str,
+        catalyst: str,
+        orb_level: float,
+        stop_price: float,
+        risk_pct: float = 1.0,
+        sector: str = "",
+        gap_pct: float = 0.0,
+        notes: str = "",
+    ) -> str:
+        """Push a structured Episodic Pivot playbook checklist to the human.
+
+        Call this when you have identified a qualifying EP setup per
+        rules/strategies/episodic_pivot.md Section 4. It computes risk-based
+        sizing (Section 5.1, default 1%% portfolio risk) and emits an action
+        message with the entry trigger, stop, and exact share/USD size, so the
+        human can execute on eToro. The trade is logged when the human confirms.
+
+        - tier: "Tier 1" or "Tier 2" (per Section 3).
+        - orb_level: the 5-min opening range high (entry trigger price).
+        - stop_price: planned hard stop (Section 6.1).
+        - risk_pct: percent of portfolio equity to risk on this trade (default 1.0).
+        - sector: free-text sector, for the Section 5.2 1-per-sector check.
+        - gap_pct: catalyst-day gap percentage, for journal.
+        - notes: anything else the human needs to see (catalyst description, etc.).
+        """
+        from tradingagents.portfolio_advisor import etoro_scan, messaging
+        tk = (ticker or "").strip().upper()
+        if not tk:
+            return "error: empty ticker"
+        try:
+            _payload, portfolio_text, _t, _rows = etoro_scan.fetch_portfolio_rows()
+        except Exception as e:
+            return f"error: portfolio fetch failed: {e}"
+        # Best-effort equity estimate from the first-line totals.
+        import re as _re
+        eq = None
+        m = _re.search(r"total_portfolio_value_usd=([0-9.]+)", portfolio_text)
+        if m:
+            try:
+                eq = float(m.group(1))
+            except ValueError:
+                pass
+        if eq is None:
+            m2 = _re.search(r"available_balance=['\"]?([0-9.]+)", portfolio_text)
+            eq = float(m2.group(1)) * 5.0 if m2 else 10000.0  # rough fallback
+        usd_risk = round(eq * float(risk_pct) / 100.0, 2)
+        risk_per_share = max(float(orb_level) - float(stop_price), 0.0001)
+        shares = round(usd_risk / risk_per_share, 4)
+        usd_position = round(shares * float(orb_level), 2)
+        body = (
+            f"EP CANDIDATE: {tk} [{tier}]\n"
+            f"Catalyst: {catalyst}\n"
+            f"Gap: {gap_pct:+.1f}%  |  Sector: {sector or 'unknown'}\n"
+            f"ORB level (entry trigger): ${float(orb_level):.2f}\n"
+            f"Stop: ${float(stop_price):.2f}  (-{((float(orb_level)-float(stop_price))/float(orb_level)*100):.1f}%)\n"
+            f"Risk: ${usd_risk:.0f}  ({float(risk_pct):.1f}% of ~${eq:.0f} equity)\n"
+            f"Size: {shares:.2f} shares  /  ~${usd_position:.0f} position\n"
+            f"Action: enter on 5-min ORB break + volume confirmation (Section 4.5).\n"
+            f"Reply: 'entered {tk} <shares>sh @ <price>' to log; 'skipped' to discard.\n"
+            + (f"Notes: {notes}\n" if notes else "")
+        )
+        messaging.send_advisor_message(cfg, "PM", body, urgent=True)
+        return f"emitted EP candidate for {tk}: orb=${orb_level} stop=${stop_price} risk=${usd_risk} shares={shares}"
+
+    @tool
+    def log_ep_trade(
+        ticker: str,
+        tier: str,
+        catalyst: str,
+        entry_date: str,
+        entry_price: float,
+        stop_price: float,
+        shares: float,
+        usd_position: float,
+        usd_risk: float,
+        sector: str = "",
+        notes: str = "",
+    ) -> str:
+        """Log a NEW open EP trade to memory/strategies/ep_trades.jsonl (Section 10 mandate).
+
+        Call this when the human confirms execution of an EP candidate. After
+        this, the trade appears in the "Open EP trades" prompt block every
+        cycle, so you can apply Section 15 checkpoints as sessions progress.
+        """
+        row = pmws.log_ep_trade(
+            cfg,
+            ticker=ticker, tier=tier, catalyst=catalyst,
+            entry_date=entry_date, entry_price=entry_price, stop_price=stop_price,
+            shares=shares, usd_position=usd_position, usd_risk=usd_risk,
+            sector=sector, notes=notes,
+        )
+        return f"logged EP trade {row['id']} for {row['ticker']}"
+
+    @tool
+    def update_ep_trade(
+        ticker: str = "",
+        trade_id: str = "",
+        new_stop: float = 0.0,
+        exit_date: str = "",
+        exit_price: float = 0.0,
+        exit_reason: str = "",
+        pnl_usd: float = 0.0,
+        r_multiple: float = 0.0,
+        note: str = "",
+    ) -> str:
+        """Update an EP trade: raise the stop (per Section 6.2) or close it on exit.
+
+        Match by trade_id when known, otherwise by latest open trade for ticker.
+        Stop-raise: pass new_stop only. Close: pass exit_price + exit_reason
+        (pnl/R are auto-computed from prices+risk if not supplied).
+        """
+        out = pmws.update_ep_trade(
+            cfg,
+            trade_id=trade_id, ticker=ticker,
+            new_stop=(new_stop or None),
+            exit_date=exit_date, exit_price=(exit_price or None),
+            exit_reason=exit_reason,
+            pnl_usd=(pnl_usd or None), r_multiple=(r_multiple or None),
+            note=note,
+        )
+        if not out:
+            return f"no matching open EP trade for {ticker or trade_id}"
+        if out.get("status") == "closed":
+            return f"closed EP trade {out['id']} {out['ticker']} pnl=${out.get('pnl_usd')} ({out.get('r_multiple')}R)"
+        return f"updated EP trade {out['id']} {out['ticker']} stop=${out.get('stop_price')}"
+
     return [
         queue_research,
         mark_action_done,
@@ -519,4 +648,7 @@ def build_pm_tools(cfg: Dict[str, Any], live_tickers: set) -> List[Any]:
         clear_decision,
         update_position_memory,
         update_scoped_rule,
+        emit_ep_candidate,
+        log_ep_trade,
+        update_ep_trade,
     ]

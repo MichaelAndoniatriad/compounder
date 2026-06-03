@@ -59,6 +59,18 @@ def positions_dir(cfg: Dict[str, Any]) -> Path:
     return memory_dir(cfg) / "positions"
 
 
+def strategies_dir(cfg: Dict[str, Any]) -> Path:
+    return rules_dir(cfg) / "strategies"
+
+
+def ep_trades_jsonl_path(cfg: Dict[str, Any]) -> Path:
+    return memory_dir(cfg) / "strategies" / "ep_trades.jsonl"
+
+
+def ep_trades_md_path(cfg: Dict[str, Any]) -> Path:
+    return memory_dir(cfg) / "strategies" / "ep_trades.md"
+
+
 def portfolio_rules_path(cfg: Dict[str, Any]) -> Path:
     return rules_dir(cfg) / "_portfolio.md"
 
@@ -78,6 +90,8 @@ def decisions_md_path(cfg: Dict[str, Any]) -> Path:
 def ensure_workspace(cfg: Dict[str, Any]) -> None:
     rules_dir(cfg).mkdir(parents=True, exist_ok=True)
     positions_dir(cfg).mkdir(parents=True, exist_ok=True)
+    strategies_dir(cfg).mkdir(parents=True, exist_ok=True)
+    (memory_dir(cfg) / "strategies").mkdir(parents=True, exist_ok=True)
 
 
 # --- rules ------------------------------------------------------------------
@@ -285,5 +299,231 @@ def _render_decisions_md(cfg: Dict[str, Any], rows: List[Dict[str, Any]]) -> Non
         if r.get("until"):
             lines.append(f"- Until: {str(r.get('until'))[:10]}")
         lines.append(f"- Reason: {r.get('reason') or '(none given)'}")
+        lines.append("")
+    p.write_text("\n".join(lines), encoding="utf-8")
+
+# --- strategies (rules/strategies/*.md, always-loaded into the PM prompt) ----
+def load_strategies(cfg: Dict[str, Any], *, per_cap: int = 12000, total_cap: int = 16000) -> str:
+    """Return concatenated text of all strategy docs under rules/strategies/.
+
+    Strategy docs are big and authoritative. They are loaded in full (up to
+    per-doc cap) on every PM cycle so the PM can answer about them without
+    paraphrasing. Kept under total_cap to bound prompt growth.
+    """
+    d = strategies_dir(cfg)
+    if not d.is_dir():
+        return ""
+    parts: List[str] = []
+    for p in sorted(d.glob("*.md")):
+        body = _read(p)
+        if not body:
+            continue
+        parts.append(f"### Strategy: {p.stem}\n{body[:per_cap]}")
+    return ("\n\n".join(parts))[:total_cap]
+
+
+# --- EP trade journal (Section 10 of episodic_pivot.md) --------------------
+def _load_ep_trades(cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
+    p = ep_trades_jsonl_path(cfg)
+    if not p.is_file():
+        return []
+    out: List[Dict[str, Any]] = []
+    try:
+        for line in p.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    except OSError:
+        return []
+    return out
+
+
+def _save_ep_trades(cfg: Dict[str, Any], rows: List[Dict[str, Any]]) -> None:
+    ensure_workspace(cfg)
+    p = ep_trades_jsonl_path(cfg)
+    p.write_text(
+        "\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + ("\n" if rows else ""),
+        encoding="utf-8",
+    )
+    _render_ep_trades_md(cfg, rows)
+
+
+def log_ep_trade(
+    cfg: Dict[str, Any],
+    *,
+    ticker: str,
+    tier: str,
+    catalyst: str,
+    entry_date: str,
+    entry_price: float,
+    stop_price: float,
+    shares: float,
+    usd_position: float,
+    usd_risk: float,
+    sector: str = "",
+    notes: str = "",
+) -> Dict[str, Any]:
+    """Append one OPEN EP trade to the journal."""
+    row = {
+        "id": uuid.uuid4().hex[:16],
+        "ticker": _safe_ticker(ticker),
+        "tier": str(tier or "").strip()[:8],
+        "catalyst": str(catalyst or "").strip()[:300],
+        "sector": str(sector or "").strip()[:60],
+        "entry_date": str(entry_date or "").strip(),
+        "entry_price": round(float(entry_price), 4),
+        "stop_price": round(float(stop_price), 4),
+        "shares": round(float(shares), 4),
+        "usd_position": round(float(usd_position), 2),
+        "usd_risk": round(float(usd_risk), 2),
+        "status": "open",
+        "notes": str(notes or "").strip()[:600],
+        "created_at": _now_iso(),
+    }
+    rows = _load_ep_trades(cfg)
+    rows.append(row)
+    _save_ep_trades(cfg, rows)
+    return row
+
+
+def update_ep_trade(
+    cfg: Dict[str, Any],
+    *,
+    trade_id: str = "",
+    ticker: str = "",
+    exit_date: str = "",
+    exit_price: Optional[float] = None,
+    exit_reason: str = "",
+    pnl_usd: Optional[float] = None,
+    r_multiple: Optional[float] = None,
+    note: str = "",
+    new_stop: Optional[float] = None,
+) -> Optional[Dict[str, Any]]:
+    """Update an existing EP trade. Match by id, else by latest open trade for ticker."""
+    rows = _load_ep_trades(cfg)
+    target = None
+    tid = (trade_id or "").strip()
+    if tid:
+        for r in rows:
+            if r.get("id") == tid:
+                target = r
+                break
+    if target is None and ticker:
+        t = _safe_ticker(ticker)
+        opens = [r for r in rows if r.get("ticker") == t and r.get("status") == "open"]
+        target = opens[-1] if opens else None
+    if target is None:
+        return None
+    if new_stop is not None:
+        target["stop_price"] = round(float(new_stop), 4)
+        target["stop_updated_at"] = _now_iso()
+    if exit_price is not None:
+        target["exit_price"] = round(float(exit_price), 4)
+        target["exit_date"] = exit_date or _now_iso()[:10]
+        target["exit_reason"] = exit_reason or ""
+        target["status"] = "closed"
+        target["closed_at"] = _now_iso()
+        if pnl_usd is not None:
+            target["pnl_usd"] = round(float(pnl_usd), 2)
+        if r_multiple is not None:
+            target["r_multiple"] = round(float(r_multiple), 3)
+        # If the human did not supply pnl/r, compute from prices+risk where possible.
+        if "pnl_usd" not in target and target.get("shares") and target.get("entry_price"):
+            target["pnl_usd"] = round(
+                (float(target["exit_price"]) - float(target["entry_price"])) * float(target["shares"]),
+                2,
+            )
+        if "r_multiple" not in target and target.get("usd_risk"):
+            try:
+                target["r_multiple"] = round(float(target.get("pnl_usd", 0.0)) / float(target["usd_risk"]), 3)
+            except (TypeError, ZeroDivisionError):
+                pass
+    if note:
+        existing = target.get("notes") or ""
+        target["notes"] = (existing + " | " if existing else "") + str(note)[:600]
+    _save_ep_trades(cfg, rows)
+    return target
+
+
+def _session_n(entry_date: str) -> Optional[int]:
+    """Approximate trading-session count from entry_date to today (skips weekends).
+
+    Holidays not deducted -- the PM should treat this as an approximation and
+    re-derive when the exact session matters for a checkpoint decision.
+    """
+    try:
+        ed = datetime.fromisoformat(entry_date.replace("Z", "+00:00")).date()
+    except (ValueError, AttributeError):
+        return None
+    from datetime import date as _date, timedelta as _td
+    today = _date.today()
+    if today < ed:
+        return None
+    days = 0
+    d = ed
+    while d < today:
+        d = d + _td(days=1)
+        if d.weekday() < 5:
+            days += 1
+    return days + 1  # session 1 = entry day
+
+
+def load_ep_open_trades_block(cfg: Dict[str, Any], *, cap: int = 3000) -> str:
+    """Render currently-open EP trades for the PM prompt, with session count."""
+    rows = [r for r in _load_ep_trades(cfg) if r.get("status") == "open"]
+    if not rows:
+        return ""
+    lines = ["Open EP trades (Episodic Pivot journal; apply Section 15 checkpoints by session):"]
+    for r in sorted(rows, key=lambda x: str(x.get("entry_date") or "")):
+        sn = _session_n(str(r.get("entry_date") or ""))
+        sn_s = f"session ~{sn}" if sn else "session ?"
+        lines.append(
+            f"  {r.get('ticker')} [{r.get('tier')}] entry {r.get('entry_date','?')} @ "
+            f"${float(r.get('entry_price') or 0):.2f}, stop ${float(r.get('stop_price') or 0):.2f}, "
+            f"{float(r.get('shares') or 0):.2f}sh / ${float(r.get('usd_position') or 0):.0f}, "
+            f"risk ${float(r.get('usd_risk') or 0):.0f} -- {sn_s} -- {str(r.get('catalyst') or '')[:80]}"
+        )
+    return ("\n".join(lines))[:cap] + "\n\n"
+
+
+def load_ep_stats_block(cfg: Dict[str, Any], *, lookback: int = 50) -> str:
+    """Render rolling EP stats (per Section 10) for the PM prompt."""
+    closed = [r for r in _load_ep_trades(cfg) if r.get("status") == "closed"]
+    if not closed:
+        return ""
+    closed = sorted(closed, key=lambda x: str(x.get("closed_at") or ""))[-lookback:]
+    n = len(closed)
+    wins = [r for r in closed if float(r.get("r_multiple") or 0) > 0]
+    losses = [r for r in closed if float(r.get("r_multiple") or 0) <= 0]
+    win_rate = (len(wins) / n) if n else 0.0
+    avg_win = (sum(float(r.get("r_multiple") or 0) for r in wins) / len(wins)) if wins else 0.0
+    avg_loss = (sum(float(r.get("r_multiple") or 0) for r in losses) / len(losses)) if losses else 0.0
+    expectancy = win_rate * avg_win + (1 - win_rate) * avg_loss
+    lines = [
+        f"EP stats (last {n} closed trades):",
+        f"  win_rate={win_rate*100:.0f}%  avg_win={avg_win:+.2f}R  avg_loss={avg_loss:+.2f}R  "
+        f"expectancy={expectancy:+.2f}R/trade",
+    ]
+    return "\n".join(lines) + "\n\n"
+
+
+def _render_ep_trades_md(cfg: Dict[str, Any], rows: List[Dict[str, Any]]) -> None:
+    p = ep_trades_md_path(cfg)
+    lines = ["# EP trade journal", "", "Mandatory Section 10 log. Auto-generated; edit the .jsonl directly.", ""]
+    for r in sorted(rows, key=lambda x: str(x.get("entry_date") or ""), reverse=True):
+        lines.append(f"## {r.get('entry_date','?')} {r.get('ticker','?')} [{r.get('tier','?')}] {r.get('status','?')}")
+        lines.append(f"- Catalyst: {r.get('catalyst','')}")
+        lines.append(f"- Entry ${r.get('entry_price')} stop ${r.get('stop_price')} -- {r.get('shares')}sh / ${r.get('usd_position')} (risk ${r.get('usd_risk')})")
+        if r.get("status") == "closed":
+            lines.append(
+                f"- Exit ${r.get('exit_price')} on {r.get('exit_date','?')} -- {r.get('exit_reason','?')} "
+                f"-- pnl ${r.get('pnl_usd','?')} ({r.get('r_multiple','?')}R)"
+            )
+        if r.get("notes"):
+            lines.append(f"- Notes: {r.get('notes')}")
         lines.append("")
     p.write_text("\n".join(lines), encoding="utf-8")
