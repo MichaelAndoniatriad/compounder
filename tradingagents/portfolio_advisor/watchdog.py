@@ -52,7 +52,6 @@ def _current_price_from_lots(lots: list) -> float | None:
 
 ACTION_LINES = {
     "dd40_mandatory_exit": "Required action: full exit. No exceptions. No deliberating.",
-    "double_from_entry": "Required action: sell half. Lock in recovered capital. Let remainder run.",
     "pre_earnings_trim_window": "Required action: sell half before the earnings print.",
     "dd30_review": "Required action: review window open. Decision point is next scheduled earnings.",
 }
@@ -140,9 +139,11 @@ def _split_watchdog_triggers(
         if dd >= 40.0:
             mandatory.append({**base, "codes": ["dd40_mandatory_exit"]})
             continue
+        # The double_from_entry rule was removed: per-share gain%% does not
+        # change when the human sells shares, so a position that stayed >100%%
+        # after a half-sell would re-trigger forever. The user trims on their
+        # own discretion now; the watchdog only handles drawdown + pre-earnings.
         trim_codes: List[str] = []
-        if gain >= 100.0:
-            trim_codes.append("double_from_entry")
         if pre:
             trim_codes.append("pre_earnings_trim_window")
         if trim_codes:
