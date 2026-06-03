@@ -97,6 +97,10 @@ def ensure_workspace(cfg: Dict[str, Any]) -> None:
     positions_dir(cfg).mkdir(parents=True, exist_ok=True)
     strategies_dir(cfg).mkdir(parents=True, exist_ok=True)
     (memory_dir(cfg) / "strategies").mkdir(parents=True, exist_ok=True)
+    try:
+        regenerate_memory_index(cfg)
+    except Exception:
+        pass  # never block a workspace op on index regen
 
 
 # --- rules ------------------------------------------------------------------
@@ -641,3 +645,91 @@ def prune_conversation(cfg: Dict[str, Any], *, keep: int = 500) -> None:
     if len(lines) <= keep:
         return
     p.write_text("\n".join(lines[-keep:]) + "\n", encoding="utf-8")
+
+# --- MEMORY.md auto-regeneration -------------------------------------------
+# Single source of truth for "where do I write what." Regenerated on every
+# workspace operation so it never drifts from filesystem reality. Strictly
+# structural -- semantic notes live in per-position/per-ticker files.
+
+def _safe_ls_stems(d: Path) -> List[str]:
+    if not d.is_dir():
+        return []
+    out: List[str] = []
+    for p in sorted(d.glob("*.md")):
+        if p.stem.startswith("_"):
+            continue
+        out.append(p.stem)
+    return out
+
+
+def regenerate_memory_index(cfg: Dict[str, Any]) -> str:
+    """Rewrite memory/MEMORY.md as a navigation index.
+
+    Lists every file in the workspace, what each one is for, and which tool
+    writes to which file. Intentionally machine-friendly: the PM should be
+    able to scan this and know exactly where to put a new fact.
+    """
+    rule_tickers = _safe_ls_stems(rules_dir(cfg))
+    pos_tickers = _safe_ls_stems(positions_dir(cfg))
+    strategy_files = sorted(p.stem for p in strategies_dir(cfg).glob("*.md")) if strategies_dir(cfg).is_dir() else []
+    ep_rows = _load_ep_trades(cfg)
+    ep_open = sum(1 for r in ep_rows if r.get("status") == "open")
+    ep_closed = sum(1 for r in ep_rows if r.get("status") == "closed")
+    decisions = load_decisions(cfg)
+    dec_active = sum(1 for r in decisions if r.get("status") == "active" and not _expired(r))
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    lines = [
+        "# PM workspace index",
+        "",
+        f"_Auto-regenerated {ts}. Do not edit by hand; this file is overwritten on every PM cycle._",
+        "",
+        "## File map",
+        "```",
+        "portfolio_advisor/",
+        "  PM_CLAUDE.md                       global standing rules (you, the PM)",
+        "  position_plans.json                per-position sleeve + entry + horizon",
+        "  rules/",
+        "    _portfolio.md                    portfolio-wide rules (sleeves, stops, discipline)",
+        "    <TICKER>.md                      per-ticker scoped rules",
+        "    strategies/",
+        "      <strategy>.md                  full strategy playbooks (EP etc.)",
+        "  memory/",
+        "    MEMORY.md                        THIS FILE -- the navigation index",
+        "    decisions.jsonl / .md            standing human decisions (one entry per call)",
+        "    conversation.jsonl               full PM <-> human chat history",
+        "    positions/<TICKER>.md            per-position thesis + history + lessons",
+        "    strategies/ep_trades.jsonl/.md   EP trade journal (Section 10)",
+        "```",
+        "",
+        "## Where to write what (tool -> file)",
+        "| Update type                | Tool                          | File                              |",
+        "|----------------------------|-------------------------------|-----------------------------------|",
+        "| New durable per-ticker rule| `update_scoped_rule`          | `rules/<TICKER>.md`               |",
+        "| New thesis / position note | `update_position_memory`      | `memory/positions/<TICKER>.md`    |",
+        "| Human's decision on action | `record_decision`             | `memory/decisions.jsonl`          |",
+        "| Sleeve/horizon retag       | `adjust_position_plan`        | `position_plans.json`             |",
+        "| New EP trade entry         | `log_ep_trade`                | `memory/strategies/ep_trades.jsonl`|",
+        "| EP stop raise / exit       | `update_ep_trade`             | `memory/strategies/ep_trades.jsonl`|",
+        "",
+        "## Coverage (current)",
+        f"- Strategy playbooks loaded: {', '.join(strategy_files) or '(none)'}",
+        f"- Per-ticker rules on file ({len(rule_tickers)}): {', '.join(rule_tickers) or '(none)'}",
+        f"- Per-position memory on file ({len(pos_tickers)}): {', '.join(pos_tickers) or '(none)'}",
+        f"- EP journal: {ep_open} open, {ep_closed} closed",
+        f"- Standing decisions (active): {dec_active}",
+        "",
+        "## Always-on prompt blocks (you see these every cycle)",
+        "- Portfolio-wide rules + per-ticker rules for live holdings",
+        "- Memory index (this file) + per-position memory for live holdings",
+        "- Strategy docs (rules/strategies/*.md)",
+        "- Open EP trades (with auto-computed session count) + rolling EP stats",
+        "- Recent conversation (last ~12 exchanges)",
+        "- Standing human decisions",
+        "- Live eToro snapshot + sleeve allocation vs target",
+        "",
+    ]
+    body = "\n".join(lines)
+    p = memory_index_path(cfg)
+    p.write_text(body, encoding="utf-8")
+    return body
