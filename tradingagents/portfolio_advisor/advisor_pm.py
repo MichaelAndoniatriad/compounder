@@ -2186,3 +2186,41 @@ def run_action_check(cfg: Dict[str, Any]) -> "AdvisorPMCycleResult":
     except Exception:
         logger.debug("action_check: watchdog latch refresh failed", exc_info=True)
     return run_pm_cycle(cfg, trigger="action_check")
+
+def run_ep_scan_cycle(cfg: Dict[str, Any]) -> "AdvisorPMCycleResult":
+    """Run a catalyst scan and hand the pre-filtered candidates to the PM.
+
+    1. ep_scanner pulls recent news, surfaces ticker hits, applies Section 2 /
+       4.1 / 9 gates -- returns a structured candidate list with all the data
+       the PM needs to classify per Section 3.
+    2. One PM cycle is run with the scan output as extra_context. The PM (with
+       the EP strategy doc loaded into its prompt every cycle) classifies each
+       candidate as Tier 1 / 2 / Disqualified and calls emit_ep_candidate for
+       qualifiers, which pushes a sized checklist to the human.
+    3. Scan run is appended to memory/strategies/ep_scans.jsonl for audit.
+
+    Messaging is the PM's call -- a scan with 0 qualifiers stays silent.
+    """
+    set_config(cfg)
+    from tradingagents.portfolio_advisor import ep_scanner as _eps
+    from tradingagents.portfolio_advisor import pm_workspace as _pmws
+
+    scan = _eps.scan_for_ep_candidates(cfg)
+    try:
+        _pmws.ensure_workspace(cfg)
+        path = _pmws.memory_dir(cfg) / "strategies" / "ep_scans.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({
+                "scanned_at": scan.get("scanned_at"),
+                "news_items": scan.get("news_items"),
+                "ticker_hits": scan.get("ticker_hits"),
+                "market": scan.get("market"),
+                "candidates": [c.get("ticker") for c in scan.get("candidates") or []],
+                "skipped": [{"t": s["ticker"], "r": s["reason"]} for s in (scan.get("skipped") or [])[:30]],
+            }, ensure_ascii=False) + "\n")
+    except Exception:
+        logger.debug("ep_scan: failed to append run log", exc_info=True)
+
+    extra = _eps.format_scan_for_pm(scan)
+    return run_pm_cycle(cfg, trigger="ep_scan", extra_context=extra)
