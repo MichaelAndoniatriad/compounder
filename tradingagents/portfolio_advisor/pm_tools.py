@@ -559,28 +559,31 @@ def build_pm_tools(cfg: Dict[str, Any], live_tickers: set) -> List[Any]:
         ticker: str,
         tier: str,
         catalyst: str,
-        orb_level: float,
+        entry_price: float,
         stop_price: float,
         risk_pct: float = 1.0,
         sector: str = "",
         gap_pct: float = 0.0,
         notes: str = "",
     ) -> str:
-        """Push a structured Episodic Pivot playbook checklist to the human.
+        """Push a structured Episodic Pivot recommendation to the human via Telegram.
 
         Call this when you have identified a qualifying EP setup per
-        rules/strategies/episodic_pivot.md Section 4. It computes risk-based
-        sizing (Section 5.1, default 1%% portfolio risk) and emits an action
-        message with the entry trigger, stop, and exact share/USD size, so the
-        human can execute on eToro. The trade is logged when the human confirms.
+        rules/strategies/episodic_pivot.md Section 5. It computes risk-based
+        sizing (Section 6.1, default 1%% portfolio risk) and emits a Telegram
+        message with the suggested entry, stop, and exact share/USD size.
 
-        - tier: "Tier 1" or "Tier 2" (per Section 3).
-        - orb_level: the 5-min opening range high (entry trigger price).
-        - stop_price: planned hard stop (Section 6.1).
-        - risk_pct: percent of portfolio equity to risk on this trade (default 1.0).
-        - sector: free-text sector, for the Section 5.2 1-per-sector check.
+        This is ADVISORY ONLY. The human decides whether to execute on eToro.
+        Entry is recommended at the next session open, per the AI Advisory
+        Edition (v2) workflow Section 9.3.
+
+        - tier: "Tier 1" or "Tier 2" (per Section 4).
+        - entry_price: recommended entry at next session open (today's close).
+        - stop_price: hard stop (Section 7.1 — catalyst day low or -8% max).
+        - risk_pct: percent of portfolio equity to risk (default 1.0).
+        - sector: free-text sector, for the Section 6.2 1-per-sector check.
         - gap_pct: catalyst-day gap percentage, for journal.
-        - notes: anything else the human needs to see (catalyst description, etc.).
+        - notes: catalyst description, drift thesis, invalidation triggers.
         """
         from tradingagents.portfolio_advisor import etoro_scan, messaging
         tk = (ticker or "").strip().upper()
@@ -603,23 +606,23 @@ def build_pm_tools(cfg: Dict[str, Any], live_tickers: set) -> List[Any]:
             m2 = _re.search(r"available_balance=['\"]?([0-9.]+)", portfolio_text)
             eq = float(m2.group(1)) * 5.0 if m2 else 10000.0  # rough fallback
         usd_risk = round(eq * float(risk_pct) / 100.0, 2)
-        risk_per_share = max(float(orb_level) - float(stop_price), 0.0001)
+        risk_per_share = max(float(entry_price) - float(stop_price), 0.0001)
         shares = round(usd_risk / risk_per_share, 4)
-        usd_position = round(shares * float(orb_level), 2)
+        usd_position = round(shares * float(entry_price), 2)
         body = (
-            f"EP CANDIDATE: {tk} [{tier}]\n"
+            f"EP RECOMMENDATION: {tk} [{tier}]\n"
             f"Catalyst: {catalyst}\n"
             f"Gap: {gap_pct:+.1f}%  |  Sector: {sector or 'unknown'}\n"
-            f"ORB level (entry trigger): ${float(orb_level):.2f}\n"
-            f"Stop: ${float(stop_price):.2f}  (-{((float(orb_level)-float(stop_price))/float(orb_level)*100):.1f}%)\n"
+            f"Entry (next session open): ${float(entry_price):.2f}\n"
+            f"Stop: ${float(stop_price):.2f}  (-{((float(entry_price)-float(stop_price))/float(entry_price)*100):.1f}%)\n"
             f"Risk: ${usd_risk:.0f}  ({float(risk_pct):.1f}% of ~${eq:.0f} equity)\n"
             f"Size: {shares:.2f} shares  /  ~${usd_position:.0f} position\n"
-            f"Action: enter on 5-min ORB break + volume confirmation (Section 4.5).\n"
+            f"Action: enter at next session open if gap held through close (Section 5.2).\n"
             f"Reply: 'entered {tk} <shares>sh @ <price>' to log; 'skipped' to discard.\n"
             + (f"Notes: {notes}\n" if notes else "")
         )
         messaging.send_advisor_message(cfg, "PM", body, urgent=True)
-        return f"emitted EP candidate for {tk}: orb=${orb_level} stop=${stop_price} risk=${usd_risk} shares={shares}"
+        return f"emitted EP recommendation for {tk}: entry=${entry_price} stop=${stop_price} risk=${usd_risk} shares={shares}"
 
     @tool
     def log_ep_trade(

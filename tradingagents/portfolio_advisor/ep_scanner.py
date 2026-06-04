@@ -1,13 +1,16 @@
 """News-driven Episodic Pivot candidate discovery.
 
-The EP doc Section 8.1 specifies a pre-market scan for catalyst-driven gappers.
-This module is the *pre-filter*: it pulls recent news, surfaces tickers with
-catalyst-relevant headlines, computes the Section 2 / 4.1 / 4.4 gates and the
-Section 9 market-wide disqualifiers, and returns a structured candidate list.
+The EP strategy (v2, AI Advisory Edition) Section 9.1 specifies a pre-market
+scan for catalyst-driven gappers. This module is the *pre-filter*: it pulls
+recent news, surfaces tickers with catalyst-relevant headlines, computes the
+Section 3 (universe) / Section 5.1 (gap) / Section 10 (disqualifiers) gates,
+and returns a structured candidate list.
 
-The LLM (PM cycle with the EP doc loaded) does Section 3 Tier 1/2/Disqualified
-classification on the survivors -- this module deliberately stays deterministic
+The LLM (PM cycle with the EP doc loaded) does Section 4 Tier 1/2/Disqualified
+classification on the survivors — this module deliberately stays deterministic
 so the gates are debuggable.
+
+Entry recommendations are issued post-close per Section 9.3, not intraday.
 """
 
 from __future__ import annotations
@@ -321,11 +324,12 @@ def format_scan_for_pm(scan: Dict[str, Any]) -> str:
             lines.append(f"  - {s['ticker']}: {s['reason']}")
     lines.append("")
     lines.append(
-        "For each candidate: apply Section 3 (Tier 1/2/Disq) using the news + sentiment + your "
+        "For each candidate: apply Section 4 (Tier 1/2/Disqualified) using the news + sentiment + your "
         "own knowledge of what the catalyst means. For each that you classify as Tier 1 or Tier 2 "
-        "AND that meets Section 4 (gap >= 10%% is confirmed; trend context, no upcoming earnings <10 "
-        "sessions out -- check via your tools), CALL `emit_ep_candidate(ticker, tier, catalyst, "
-        "orb_level, stop_price)`. Disqualified or weak setups: explain WHY in your summary. Do not "
-        "emit a candidate that fails any Section 4 condition or any Section 9 disqualifier."
+        "AND that meets Section 5 (gap >= 10%% held through close, trend context, no upcoming earnings <10 "
+        "sessions out — check via your tools), CALL `emit_ep_candidate(ticker, tier, catalyst, "
+        "entry_price, stop_price)`. Entry recommendation is for the next session open, not intraday. "
+        "Disqualified or weak setups: explain WHY in your summary. Do not "
+        "emit a candidate that fails any Section 5 condition or any Section 10 disqualifier."
     )
     return "\n".join(lines)
