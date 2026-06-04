@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 
 def _reasoning_client(cfg: Dict[str, Any]):
-    model = (cfg.get("portfolio_advisor_reasoning_model") or "deepseek/deepseek-r1").strip()
+    model = (cfg.get("portfolio_advisor_reasoning_model") or "deepseek-reasoner").strip()
     provider = (cfg.get("llm_provider") or "openrouter").lower()
     if "/" in model and provider != "openrouter":
         provider = "openrouter"

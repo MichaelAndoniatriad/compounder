@@ -129,7 +129,7 @@ DEFAULT_CONFIG = _apply_env_overrides({
     "portfolio_advisor_inject_prior_clerk_report": True,
     "portfolio_advisor_prior_clerk_report_max_chars": 8000,
     # Advisor-level PM council (separate from LangGraph's Portfolio Manager node).
-    "portfolio_advisor_pm_model": "deepseek/deepseek-v4-pro",
+    "portfolio_advisor_pm_model": "deepseek-v4-pro",
     "portfolio_advisor_pm_log_path": None,
     # Master switch for advisor PM (set False only to pause all PM automation, e.g. tests or cost cap).
     "portfolio_advisor_pm_enabled": True,
@@ -239,10 +239,10 @@ DEFAULT_CONFIG = _apply_env_overrides({
     # a CRITICAL rule fires. OpenRouter slug recommended.
     # V4 Pro for PM/memory-review (synthesis, not fresh reasoning); R1 kept in
     # single_model_analysis via portfolio_advisor_single_model_reasoning_model below.
-    "portfolio_advisor_reasoning_model": "deepseek/deepseek-v4-pro",
+    "portfolio_advisor_reasoning_model": "deepseek-v4-pro",
     # Model used specifically for single_model_analysis jobs (fresh per-ticker reasoning
     # where R1's chain-of-thought earns its cost). Falls back to reasoning_model if unset.
-    "portfolio_advisor_single_model_reasoning_model": "deepseek/deepseek-r1",
+    "portfolio_advisor_single_model_reasoning_model": "deepseek-reasoner",
     # When True, ``advisor portfolio replan`` skips the planner LLM if live tickers and
     # the catalyst digest match the last successful plan (saves cost; pending jobs unchanged).
     "portfolio_advisor_skip_replan_llm_when_unchanged": False,
@@ -276,6 +276,15 @@ DEFAULT_CONFIG = _apply_env_overrides({
     # ignores ``llm_provider`` / ``quick_think_llm`` / ``deep_think_llm``.
     # Tuned only via this dict or Streamlit settings — not TRADINGAGENTS_* env.
     "corporate_hierarchy_enabled": True,
+    # Provider backing every corporate-hierarchy role. "openrouter" routes
+    # ``upstream/model`` slugs; "deepseek" (etc.) calls the provider's own API
+    # directly and strips the slug prefix — valid only when every routed model
+    # belongs to that provider (the routing table is all-DeepSeek by default).
+    "corporate_llm_provider": "deepseek",
+    # Same-provider rate-limit fallback model for native (non-OpenRouter) mode.
+    # OpenRouter mode uses ``llm_fallback_openrouter_model`` instead. Empty
+    # disables the fallback (single-provider has no cross-provider safety net).
+    "corporate_llm_fallback_model": "deepseek-chat",
     # Fixed temperature on graph LLMs for repeatable verdicts. 0.0 = maximum
     # determinism (cuts the model's intermittent empty-reply behavior in chat
     # mode). Set None to use provider defaults.
@@ -324,9 +333,9 @@ DEFAULT_CONFIG = _apply_env_overrides({
     "debate_llm": None,
     "execution_llm": None,
     # LLM settings (legacy single-provider graph when corporate_hierarchy_enabled is False)
-    "llm_provider": "openrouter",
-    "deep_think_llm": "openai/gpt-4o",
-    "quick_think_llm": "openai/gpt-4o-mini",
+    "llm_provider": "deepseek",
+    "deep_think_llm": "deepseek-v4-pro",
+    "quick_think_llm": "deepseek-v4-flash",
     # When None, each provider's client falls back to its own default endpoint
     # (api.openai.com for OpenAI, generativelanguage.googleapis.com for Gemini, ...).
     # The CLI overrides this per provider when the user picks one. Keeping a

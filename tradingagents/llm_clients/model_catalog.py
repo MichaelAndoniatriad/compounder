@@ -252,7 +252,10 @@ DEFAULT_CORPORATE_AGENT_ROUTING: Dict[str, Dict[str, Any]] = {
     "market_analyst": {"provider": "openrouter", "model": OR_DEEPSEEK_V4_FLASH},
     "sentiment_analyst": {"provider": "openrouter", "model": OR_DEEPSEEK_V4_FLASH},
     "fundamentals_analyst": {"provider": "openrouter", "model": OR_DEEPSEEK_V4_FLASH},
-    "news_analyst": {"provider": "openrouter", "model": OR_GEMINI_BULK_NEWS},
+    # News analyst moved off Gemini to DeepSeek so the whole hierarchy is single-provider
+    # (lets corporate_llm_provider="deepseek" route natively). DeepSeek's 128K context
+    # is ample for the news bundle; trim global_news_article_limit if a run overflows.
+    "news_analyst": {"provider": "openrouter", "model": OR_DEEPSEEK_V4_FLASH},
     # Adversarial debaters demoted to v4-flash: their job is fast-throughput
     # arguing; the research_manager + portfolio_manager (still on pro) do the
     # final synthesis where quality matters. Saves ~50–60% of pro-tier spend
