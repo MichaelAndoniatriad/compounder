@@ -45,7 +45,7 @@ def run_memory_review(cfg: Dict[str, Any], *, lookback_days: int = 120) -> str:
     jcap = cfg_int(cfg, "portfolio_advisor_memory_review_json_chars", 11000, 2000, 120000)
     sample = json.dumps(rows[-n:], separators=(",", ":"), ensure_ascii=False)[:jcap]
 
-    model = (cfg.get("portfolio_advisor_reasoning_model") or "deepseek/deepseek-r1").strip()
+    model = (cfg.get("portfolio_advisor_reasoning_model") or "deepseek-reasoner").strip()
     provider = "openrouter" if "/" in model else (cfg.get("llm_provider") or "openrouter").lower()
     base = cfg.get("corporate_openrouter_base_url") or cfg.get("backend_url")
     today = date.today().isoformat()

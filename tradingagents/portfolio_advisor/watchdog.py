@@ -167,6 +167,14 @@ def _watchdog_check_position_changes(
     except Exception:
         logger.debug("watchdog: outcome_sync skipped", exc_info=True)
 
+    # Drop exit proposals for names that left the book (position closed) so they
+    # stop being nagged about — runs every tick during market hours.
+    try:
+        from tradingagents.portfolio_advisor import proposals as _proposals
+        _proposals.reconcile_with_portfolio(cfg, live)
+    except Exception:
+        logger.debug("watchdog: proposal reconcile skipped", exc_info=True)
+
     st = pa_state.load_state(cfg)
     prev: set[str] = {str(t).upper().strip() for t in (st.get("last_portfolio_tickers") or []) if t}
     added = sorted(live - prev)

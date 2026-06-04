@@ -12,6 +12,7 @@ import os
 from copy import deepcopy
 from typing import Any, Dict, List, Optional
 
+from tradingagents.llm_clients.api_key_env import get_api_key_env
 from tradingagents.llm_clients.factory import create_llm_client
 from tradingagents.llm_clients.fallback_chat_model import RateLimitFallbackChatModel
 from tradingagents.llm_clients.model_catalog import DEFAULT_CORPORATE_AGENT_ROUTING
@@ -38,6 +39,47 @@ _ROLE_TO_SPEC_KEY: Dict[str, str] = {
 }
 
 
+def _corporate_provider(config: Dict[str, Any]) -> str:
+    """Provider backing every corporate-hierarchy role.
+
+    ``openrouter`` (default) routes ``upstream/model`` slugs through OpenRouter.
+    Set ``corporate_llm_provider`` to a native provider (e.g. ``deepseek``) to
+    call that provider's own API directly — only valid when every routed model
+    belongs to that provider.
+    """
+    return (config.get("corporate_llm_provider") or "openrouter").strip().lower()
+
+
+def _resolve_model_id(model: str, provider: str) -> str:
+    """OpenRouter uses ``upstream/model`` slugs; native providers want the bare id."""
+    if provider != "openrouter" and "/" in model:
+        return model.split("/")[-1]
+    return model
+
+
+def _provider_base_url(config: Dict[str, Any], provider: str) -> Optional[str]:
+    if provider == "openrouter":
+        url = config.get("corporate_openrouter_base_url")
+        if isinstance(url, str) and url.strip():
+            return url.strip()
+    return None
+
+
+def _fallback_spec(config: Dict[str, Any], provider: str) -> tuple[Optional[str], Optional[str]]:
+    """Return ``(model, api_key_env)`` for the rate-limit fallback, or ``(None, ...)``.
+
+    OpenRouter can fail over across upstreams (default ``openai/gpt-4o-mini``).
+    A native provider only serves its own models, so the fallback must be a
+    same-provider model id supplied via ``corporate_llm_fallback_model``; when
+    unset, the cross-provider safety net is simply disabled.
+    """
+    if provider == "openrouter":
+        model = (config.get("llm_fallback_openrouter_model") or "openai/gpt-4o-mini").strip()
+        return (model or None), "OPENROUTER_API_KEY"
+    model = (config.get("corporate_llm_fallback_model") or "").strip()
+    return (model or None), get_api_key_env(provider)
+
+
 def _openrouter_base_url(config: Dict[str, Any]) -> Optional[str]:
     url = config.get("corporate_openrouter_base_url")
     if isinstance(url, str) and url.strip():
@@ -46,6 +88,7 @@ def _openrouter_base_url(config: Dict[str, Any]) -> Optional[str]:
 
 
 def _effective_routing_table(config: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    provider = _corporate_provider(config)
     base = deepcopy(DEFAULT_CORPORATE_AGENT_ROUTING)
     overrides = config.get("agent_llm_routing") or {}
     if isinstance(overrides, dict):
@@ -56,11 +99,11 @@ def _effective_routing_table(config: Dict[str, Any]) -> Dict[str, Dict[str, Any]
                 base[key] = {}
             if isinstance(spec, dict):
                 merged = {**base.get(key, {}), **spec}
-                merged["provider"] = "openrouter"
+                merged["provider"] = provider
                 base[key] = merged
     for spec in base.values():
         if isinstance(spec, dict):
-            spec["provider"] = "openrouter"
+            spec["provider"] = provider
     return base
 
 
@@ -95,9 +138,10 @@ def _make_llm_for_spec(
     *,
     role: str,
 ) -> Any:
-    model = (spec.get("model") or "").strip()
+    provider = _corporate_provider(config)
+    model = _resolve_model_id((spec.get("model") or "").strip(), provider)
     if not model:
-        raise ValueError(f"Corporate routing for {role}: missing OpenRouter model id")
+        raise ValueError(f"Corporate routing for {role}: missing model id")
 
     client_kwargs: Dict[str, Any] = {"callbacks": callbacks}
 
@@ -114,27 +158,23 @@ def _make_llm_for_spec(
     if temp is not None:
         client_kwargs.setdefault("temperature", float(temp))
 
-    client = create_llm_client(
-        "openrouter",
-        model,
-        base_url=_openrouter_base_url(config),
-        **client_kwargs,
-    )
+    base_url = _provider_base_url(config, provider)
+    client = create_llm_client(provider, model, base_url=base_url, **client_kwargs)
     primary = client.get_llm()
 
     if not config.get("llm_rate_limit_fallback_enabled", True):
         return primary
 
-    fallback_model = (config.get("llm_fallback_openrouter_model") or "openai/gpt-4o-mini").strip()
-    if not os.environ.get("OPENROUTER_API_KEY"):
+    fallback_model, fallback_env = _fallback_spec(config, provider)
+    if not fallback_model or fallback_model == model:
         return primary
-    if fallback_model == model:
+    if fallback_env and not os.environ.get(fallback_env):
         return primary
 
     fb = create_llm_client(
-        "openrouter",
+        provider,
         fallback_model,
-        base_url=_openrouter_base_url(config),
+        base_url=base_url,
         callbacks=callbacks,
     ).get_llm()
     return RateLimitFallbackChatModel(primary, fb)

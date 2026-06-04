@@ -56,6 +56,13 @@ def build_advisor_plan(
     ramp_block = catalysts.earnings_ramp_block_for_tickers(tickers, ramp_days)
     pcap = cfg_int(cfg, "portfolio_advisor_planner_portfolio_chars", 10000, 4000, 50000)
     ccap = cfg_int(cfg, "portfolio_advisor_planner_catalyst_chars", 7000, 2000, 50000)
+    combined_daily = bool(cfg.get("portfolio_advisor_combined_daily_monitoring", True))
+    combined_block = (
+        "- COMBINED DAILY MONITORING is ON: do NOT schedule per-ticker routine_monitoring jobs. "
+        "A single combined daily single_model pass covers all live tickers. Only schedule "
+        "thesis_check / post_earnings / catalyst_scan / weekly_summary jobs explicitly.\n"
+        if combined_daily else ""
+    )
     prompt = f"""You are an autonomous portfolio advisor (not a broker). {mode.upper()} scheduling scan.
 
 Now (UTC): {now}
@@ -63,6 +70,7 @@ Now (UTC): {now}
 Rules:
 - Output advisory planning only — never claim you executed trades.
 - Schedule at most {max_jobs} deep_research jobs total; stagger times across the next 14 days in UTC.
+- COST DISCIPLINE: default cadence for thesis_check is every 14 days per position unless price moved >=10% since last check, earnings is within the ramp window, or a thesis-break metric crossed. Do not re-check the same name more frequently without a stated reason.
 - Prioritize names with nearer catalysts, larger notional risk, or stale research needs.
 - Names with earnings inside the ramp window below deserve tighter scheduling or watch_only with clear rationale.
 - Use action watch_only when a full graph run is not worth cost this week (still explain).
@@ -70,7 +78,7 @@ Rules:
 - scheduled_at must be ISO-8601 with timezone offset (prefer Z or +00:00).
 - For every deep_research job set execution_tier to single_model when the task is a light thesis check, a weekly style summary recap, post earnings review with a likely clear verdict, or routine monitoring with stable metrics. The safe default when unsure is single_model because it is cheaper than the full graph. Use full_graph only when the book shows a new name, when thesis break levels are undefined or in dispute, when post print ambiguity is high, when drawdown risk already signals stress, or when any validator would need the full multi agent stack.
 - Set job_type on each deep_research job to exactly one of Literal["thesis_check", "weekly_summary", "post_earnings", "routine_monitoring", "catalyst_scan"]. Match the value to the narrative in rationale; the schema rejects any other string. Use catalyst_scan for watchlist candidates when the catalyst sleeve is empty — it asks specifically what near-term event makes the name worth a short-term entry rather than evaluating long-term thesis.
-- Leave flags as an empty list unless you add short freeform tags you want surfaced in metadata.
+{combined_block}- Leave flags as an empty list unless you add short freeform tags you want surfaced in metadata.
 
 Portfolio snapshot:
 {portfolio_text[:pcap]}

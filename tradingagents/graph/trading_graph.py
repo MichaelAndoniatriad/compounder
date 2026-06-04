@@ -319,6 +319,7 @@ class TradingAgentsGraph:
         if not pending:
             return
 
+        reflection_enabled = bool(self.config.get("reflection_per_run_enabled", True))
         benchmark = self._resolve_benchmark(ticker)
         updates = []
         for entry in pending:
@@ -327,12 +328,15 @@ class TradingAgentsGraph:
             )
             if raw is None:
                 continue  # price not available yet — try again next run
-            reflection = self.reflector.reflect_on_final_decision(
-                final_decision=entry.get("decision", ""),
-                raw_return=raw,
-                alpha_return=alpha,
-                benchmark_name=benchmark,
-            )
+            if reflection_enabled:
+                reflection = self.reflector.reflect_on_final_decision(
+                    final_decision=entry.get("decision", ""),
+                    raw_return=raw,
+                    alpha_return=alpha,
+                    benchmark_name=benchmark,
+                )
+            else:
+                reflection = ""  # numeric outcome still recorded; LLM reflection deferred
             updates.append({
                 "ticker": ticker,
                 "trade_date": entry["date"],

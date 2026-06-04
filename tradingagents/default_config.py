@@ -121,14 +121,14 @@ DEFAULT_CONFIG = _apply_env_overrides({
     # Suppress near-identical advisor pushes inside this rolling window. Corrections are never suppressed.
     "portfolio_advisor_message_dedupe_minutes": 180,
     # Injected into PM ``past_context`` with markdown memory: rolling calendar window.
-    "memory_context_lookback_days": 90,
-    "memory_context_max_same_ticker": 8,
-    "memory_context_max_cross_ticker": 3,
+    "memory_context_lookback_days": 60,
+    "memory_context_max_same_ticker": 3,
+    "memory_context_max_cross_ticker": 2,
     # Recent JSONL lines per ticker appended to ``past_context`` for the graph PM.
-    "memory_event_log_prompt_days": 30,
+    "memory_event_log_prompt_days": 21,
     # Latest ``clerk_deep/<TICKER>/*_clerk_triggered.md`` prepended to full-graph ``past_context``.
     "portfolio_advisor_inject_prior_clerk_report": True,
-    "portfolio_advisor_prior_clerk_report_max_chars": 16000,
+    "portfolio_advisor_prior_clerk_report_max_chars": 8000,
     # Advisor-level PM council (separate from LangGraph's Portfolio Manager node).
     "portfolio_advisor_pm_model": "deepseek-v4-pro",
     # Route the PM at native DeepSeek (not OpenRouter). Set to None to fall
@@ -153,17 +153,20 @@ DEFAULT_CONFIG = _apply_env_overrides({
     # in delimiter-separated blocks ignored by TradingMemoryLog.parse; PM prompt includes a tail of that file.
     "portfolio_advisor_pm_unified_memory": True,
     # Max characters of trading_memory tail injected into the advisor PM prompt (unified mode only).
-    "portfolio_advisor_pm_trading_memory_prompt_chars": 6000,
+    "portfolio_advisor_pm_trading_memory_prompt_chars": 3500,
     # PM prompt size limits (lower = fewer tokens; raise if the model misses context).
-    "portfolio_advisor_pm_portfolio_snapshot_chars": 7000,
-    "portfolio_advisor_pm_bootstrap_summary_chars": 4000,
+    "portfolio_advisor_pm_portfolio_snapshot_chars": 4500,
+    "portfolio_advisor_pm_bootstrap_summary_chars": 2500,
     "portfolio_advisor_pm_pending_jobs_cap": 12,
     "portfolio_advisor_pm_prior_cycles": 2,
     "portfolio_advisor_pm_prior_executive_chars": 450,
     "portfolio_advisor_pm_prior_memory_note_chars": 700,
     "portfolio_advisor_pm_prior_context_total_chars": 2600,
     "portfolio_advisor_pm_compact_prompt_json": True,
-    "portfolio_advisor_pm_extra_context_chars": 3200,
+    "portfolio_advisor_pm_extra_context_chars": 2000,
+    # Skip the post-batch PM brief if every completed verdict was HOLD.
+    # PM still runs on portfolio_change / replan / chat triggers.
+    "portfolio_advisor_pm_skip_if_all_hold": True,
     # Research older than this is considered stale for PM action stances unless refreshed.
     "portfolio_advisor_pm_evidence_stale_days": 30,
     # When monthly lookout promotes a candidate, ask the PM council to compare it with current holdings.
@@ -192,21 +195,21 @@ DEFAULT_CONFIG = _apply_env_overrides({
     "portfolio_advisor_weekly_full_graph_cap": 4,
     # News researcher (weekly discovery): how many candidates to target, and prompt sizing.
     "news_researcher_target_candidates": 8,
-    "news_researcher_article_limit": 40,
-    "news_researcher_news_chars": 12000,
+    "news_researcher_article_limit": 15,
+    "news_researcher_news_chars": 6000,
     # Planner / replan LLM: portfolio export + catalyst digest size (characters).
-    "portfolio_advisor_planner_portfolio_chars": 10000,
-    "portfolio_advisor_planner_catalyst_chars": 7000,
+    "portfolio_advisor_planner_portfolio_chars": 5500,
+    "portfolio_advisor_planner_catalyst_chars": 3500,
     # Post-earnings verdict CLI: portfolio excerpt in the reasoning prompt.
-    "portfolio_advisor_post_verdict_portfolio_chars": 5500,
+    "portfolio_advisor_post_verdict_portfolio_chars": 3500,
     # Optional weekly LLM digest (when ``portfolio_advisor_weekly_llm`` is True).
-    "portfolio_advisor_weekly_llm_digest_chars": 5600,
+    "portfolio_advisor_weekly_llm_digest_chars": 3500,
     # Memory review: last N events as compact JSON in the reasoning prompt.
-    "portfolio_advisor_memory_review_sample_events": 36,
-    "portfolio_advisor_memory_review_json_chars": 11000,
+    "portfolio_advisor_memory_review_sample_events": 24,
+    "portfolio_advisor_memory_review_json_chars": 6000,
     # Single-model advisor jobs: memory + JSONL tail injected into the reasoning prompt.
-    "portfolio_advisor_single_model_memory_chars": 6800,
-    "portfolio_advisor_single_model_events_chars": 4800,
+    "portfolio_advisor_single_model_memory_chars": 3500,
+    "portfolio_advisor_single_model_events_chars": 2500,
     # After a pending decision is resolved with returns, the quick LLM may append
     # short rules to learned_rules.md (default: sibling of trading_memory.md).
     "learned_rules_enabled": True,
@@ -240,10 +243,10 @@ DEFAULT_CONFIG = _apply_env_overrides({
     # a CRITICAL rule fires. OpenRouter slug recommended.
     # V4 Pro for PM/memory-review (synthesis, not fresh reasoning); R1 kept in
     # single_model_analysis via portfolio_advisor_single_model_reasoning_model below.
-    "portfolio_advisor_reasoning_model": "deepseek/deepseek-v4-pro",
+    "portfolio_advisor_reasoning_model": "deepseek-v4-pro",
     # Model used specifically for single_model_analysis jobs (fresh per-ticker reasoning
     # where R1's chain-of-thought earns its cost). Falls back to reasoning_model if unset.
-    "portfolio_advisor_single_model_reasoning_model": "deepseek/deepseek-r1",
+    "portfolio_advisor_single_model_reasoning_model": "deepseek-reasoner",
     # When True, ``advisor portfolio replan`` skips the planner LLM if live tickers and
     # the catalyst digest match the last successful plan (saves cost; pending jobs unchanged).
     "portfolio_advisor_skip_replan_llm_when_unchanged": False,
@@ -277,6 +280,15 @@ DEFAULT_CONFIG = _apply_env_overrides({
     # ignores ``llm_provider`` / ``quick_think_llm`` / ``deep_think_llm``.
     # Tuned only via this dict or Streamlit settings — not TRADINGAGENTS_* env.
     "corporate_hierarchy_enabled": True,
+    # Provider backing every corporate-hierarchy role. "openrouter" routes
+    # ``upstream/model`` slugs; "deepseek" (etc.) calls the provider's own API
+    # directly and strips the slug prefix — valid only when every routed model
+    # belongs to that provider (the routing table is all-DeepSeek by default).
+    "corporate_llm_provider": "deepseek",
+    # Same-provider rate-limit fallback model for native (non-OpenRouter) mode.
+    # OpenRouter mode uses ``llm_fallback_openrouter_model`` instead. Empty
+    # disables the fallback (single-provider has no cross-provider safety net).
+    "corporate_llm_fallback_model": "deepseek-chat",
     # Fixed temperature on graph LLMs for repeatable verdicts. 0.0 = maximum
     # determinism (cuts the model's intermittent empty-reply behavior in chat
     # mode). Set None to use provider defaults.
@@ -285,6 +297,22 @@ DEFAULT_CONFIG = _apply_env_overrides({
     # storms (e.g. NVDA had 11 runs/14d before this). On exceeding, jobs are
     # downgraded to single_model so the work still happens cheaply.
     "portfolio_advisor_full_graph_per_ticker_14d_cap": 2,
+    # Reflection at the start of every full_graph: gate so it only runs on
+    # full_graph (not single_model) and only once per (ticker, day). The
+    # learned-rules pipeline is unaffected — outcomes still resolve in batch.
+    # Set False to disable per-run reflection entirely (a weekly batch CLI is
+    # the recommended replacement).
+    "reflection_per_run_enabled": True,
+    # Daily $ spend cap across all advisor LLM calls. When today's logged
+    # spend exceeds this, run_due_jobs claims no new jobs and queues a single
+    # urgent alert. Watchdog (price triggers) + chat replies still run.
+    # 0 or None disables the cap. Reads cost.jsonl (TRADINGAGENTS_COST_LOG).
+    "portfolio_advisor_daily_cost_cap_usd": 5.0,
+    # Throttle for the "budget cap hit" alert so it does not page every tick.
+    "portfolio_advisor_daily_cost_alert_throttle_hours": 6,
+    # Routine-monitoring jobs: combine all live tickers into one single_model
+    # call per day instead of one job per ticker. Massive prompt-token saving.
+    "portfolio_advisor_combined_daily_monitoring": True,
     # Optional partial overrides: logical agent key -> {model, extra_body?}
     # (``provider`` is always openrouter; any ``provider`` key in overrides is ignored.)
     "agent_llm_routing": {},
@@ -309,9 +337,9 @@ DEFAULT_CONFIG = _apply_env_overrides({
     "debate_llm": None,
     "execution_llm": None,
     # LLM settings (legacy single-provider graph when corporate_hierarchy_enabled is False)
-    "llm_provider": "openrouter",
-    "deep_think_llm": "openai/gpt-4o",
-    "quick_think_llm": "openai/gpt-4o-mini",
+    "llm_provider": "deepseek",
+    "deep_think_llm": "deepseek-v4-pro",
+    "quick_think_llm": "deepseek-v4-flash",
     # When None, each provider's client falls back to its own default endpoint
     # (api.openai.com for OpenAI, generativelanguage.googleapis.com for Gemini, ...).
     # The CLI overrides this per provider when the user picks one. Keeping a
@@ -338,8 +366,8 @@ DEFAULT_CONFIG = _apply_env_overrides({
     # News / data fetching parameters
     # Increase for longer lookback strategies or to broaden macro coverage;
     # decrease to reduce token usage in agent prompts.
-    "news_article_limit": 20,             # max articles per ticker (ticker-news)
-    "global_news_article_limit": 10,      # max articles for global/macro news
+    "news_article_limit": 12,             # max articles per ticker (ticker-news)
+    "global_news_article_limit": 6,       # max articles for global/macro news
     "global_news_lookback_days": 7,       # macro news lookback window
     # Search queries used by get_global_news for macro headlines. Extend or
     # replace to broaden geographic / sector coverage.

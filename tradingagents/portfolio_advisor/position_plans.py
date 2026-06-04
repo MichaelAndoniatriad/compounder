@@ -91,6 +91,9 @@ class PositionPlan:
     catalyst_date: str = ""
     catalyst_description: str = ""
     peak_price: Optional[float] = None
+    # Append-only log of each PM decision on this position (the WHAT + the WHY):
+    #   {ts, action (buy/sell/trim/add/hold/watch/…), rationale, source, price?}
+    decision_history: List[Dict[str, Any]] = field(default_factory=list)
     last_updated: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
     def __post_init__(self) -> None:
@@ -163,6 +166,7 @@ def load_position_plans(cfg: Dict[str, Any]) -> Dict[str, PositionPlan]:
                 catalyst_date=str(data.get("catalyst_date") or ""),
                 catalyst_description=str(data.get("catalyst_description") or ""),
                 peak_price=float(peak) if peak not in (None, "") else None,
+                decision_history=[d for d in (data.get("decision_history") or []) if isinstance(d, dict)],
                 last_updated=str(data.get("last_updated") or ""),
             )
         except (TypeError, ValueError):
@@ -184,6 +188,62 @@ def upsert_position_plan(cfg: Dict[str, Any], plan: PositionPlan) -> None:
     plan.last_updated = datetime.now(timezone.utc).isoformat()
     plans[plan.ticker.upper()] = plan
     save_position_plans(cfg, plans)
+
+
+_DECISION_HISTORY_MAX = 20
+
+
+def append_position_decision(
+    cfg: Dict[str, Any],
+    ticker: str,
+    action: str,
+    rationale: str,
+    *,
+    source: str = "pm",
+    price: Optional[float] = None,
+    max_entries: int = _DECISION_HISTORY_MAX,
+) -> bool:
+    """Record one dated decision (the action AND the WHY) on a held position's plan.
+
+    Returns True if a new entry was written. No-op (returns False) when:
+      - the ticker has no plan on file yet (brand-new buys live in
+        proposed_trades.jsonl until the position is opened and a plan exists), or
+      - the decision is identical in action and rationale to the most recent
+        entry (so repeated "hold, thesis intact" cycles don't balloon the log).
+    """
+    tk = (ticker or "").strip().upper()
+    act = (action or "").strip().lower()
+    why = (rationale or "").strip()
+    if not tk or not act or not why:
+        return False
+    plans = load_position_plans(cfg)
+    plan = plans.get(tk)
+    if plan is None:
+        return False
+    history = [d for d in (plan.decision_history or []) if isinstance(d, dict)]
+    if history:
+        last = history[-1]
+        if (
+            str(last.get("action") or "").strip().lower() == act
+            and str(last.get("rationale") or "").strip()[:200] == why[:200]
+        ):
+            return False
+    entry: Dict[str, Any] = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "action": act,
+        "rationale": why[:600],
+        "source": (source or "pm").strip()[:40],
+    }
+    px = _to_float(price)
+    if px is not None:
+        entry["price"] = round(px, 4)
+    history.append(entry)
+    if max_entries > 0 and len(history) > max_entries:
+        history = history[-max_entries:]
+    plan.decision_history = history
+    plans[tk] = plan
+    save_position_plans(cfg, plans)
+    return True
 
 
 def backfill_plans_from_portfolio(
@@ -315,6 +375,7 @@ class TriggerStatus:
     catalyst_date: str = ""
     catalyst_description: str = ""
     peak_price: Optional[float] = None
+    decision_history: List[Dict[str, Any]] = field(default_factory=list)
 
     def is_clean(self) -> bool:
         return not self.triggered and not self.watch
@@ -344,6 +405,15 @@ class TriggerStatus:
             lines.append("  WATCH: " + ", ".join(self.watch))
         else:
             lines.append("  status: OK")
+        if self.decision_history:
+            recent = [d for d in self.decision_history if isinstance(d, dict)][-2:]
+            notes = "; ".join(
+                f"{str(d.get('ts') or '')[:10]} {str(d.get('action') or '').lower()}: "
+                f"{str(d.get('rationale') or '').strip()[:140]}"
+                for d in recent
+            )
+            if notes:
+                lines.append(f"  recent decisions (why): {notes}")
         return "\n".join(lines)
 
     @property
@@ -519,6 +589,7 @@ def compute_trigger_status(
             catalyst_date=plan.catalyst_date,
             catalyst_description=plan.catalyst_description,
             peak_price=peak,
+            decision_history=plan.decision_history,
         )
     return out
 
