@@ -419,16 +419,20 @@ def portfolio_advisor_pm_cycle(
 @portfolio_app.command("ep-scan")
 def portfolio_advisor_ep_scan(
     verbose: bool = typer.Option(False, "--verbose", "-v"),
+    post_close: bool = typer.Option(False, "--post-close", help="Post-close scan: gate on close holding above gap (Section 5.2)"),
 ):
-    """News-driven catalyst scan (pre-market). Pre-filters via ep_scanner,
-    then runs ONE PM cycle that classifies per Section 3 and emits sized
-    checklists for qualifying candidates."""
+    """News-driven catalyst scan. Pre-filters via ep_scanner, then runs ONE PM
+    cycle that classifies per Section 4 and emits sized recommendations for
+    qualifying candidates.
+
+    Without --post-close: pre-market scan (classify only, do not emit).
+    With --post-close: post-close scan (gap-hold verified, emit recommendations)."""
     _configure_logging(verbose)
     cfg = DEFAULT_CONFIG.copy()
     try:
         from tradingagents.portfolio_advisor.advisor_pm import run_ep_scan_cycle
 
-        out = run_ep_scan_cycle(cfg)
+        out = run_ep_scan_cycle(cfg, post_close=post_close)
         pushed = bool((out.push_note or "").strip())
         console.print(f"[cyan]Advisor ep-scan:[/cyan] PM run complete; push={pushed}.")
     except Exception as e:

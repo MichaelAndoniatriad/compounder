@@ -190,8 +190,13 @@ def scan_for_ep_candidates(
     look_back_days: int = 2,
     news_limit: int = 200,
     max_candidates: int = 25,
+    post_close: bool = False,
 ) -> Dict[str, Any]:
     """Run the full pre-filter pipeline. Returns a dict suitable for PM context.
+
+    When ``post_close`` is True, an additional gate requires that the
+    close held above the 10% gap level (Section 5.2) — used by the
+    post-close recommendation scan at 16:15 ET.
 
     Output:
         {
@@ -249,15 +254,22 @@ def scan_for_ep_candidates(
                 "reason": f"gap {gap_pct:.1f}% / move {recent_move_pct:.1f}% < {_MIN_GAP_PCT}% (Section 4.1)",
             })
             continue
-        # Section 9 extended-run check.
+        # Section 10 extended-run check.
         if q.get("close_10d_ago"):
             run10 = (q["close"] / q["close_10d_ago"] - 1.0) * 100.0
             if run10 > _EXTENDED_THRESHOLD_PCT:
                 skipped.append({
                     "ticker": tk,
-                    "reason": f"up {run10:.0f}% in 10 sessions > {_EXTENDED_THRESHOLD_PCT}% (Section 9 extended)",
+                    "reason": f"up {run10:.0f}% in 10 sessions > {_EXTENDED_THRESHOLD_PCT}% (Section 10 extended)",
                 })
                 continue
+        # Post-close gate: close must hold above the 10% gap level (Section 5.2).
+        if post_close and recent_move_pct < _MIN_GAP_PCT:
+            skipped.append({
+                "ticker": tk,
+                "reason": f"close {recent_move_pct:.1f}% < {_MIN_GAP_PCT}% gap — gap did not hold through close (Section 5.2)",
+            })
+            continue
         candidates.append({
             "ticker": tk,
             "hint": h["hint"],
@@ -278,6 +290,7 @@ def scan_for_ep_candidates(
 
     return {
         "scanned_at": datetime.now(timezone.utc).isoformat(),
+        "scan_mode": "post_close" if post_close else "pre_market",
         "news_items": len(feed),
         "ticker_hits": len(hits),
         "market": market,
@@ -290,8 +303,10 @@ def format_scan_for_pm(scan: Dict[str, Any]) -> str:
     """Render the scan result as plain text for the PM's extra_context block."""
     lines: List[str] = []
     m = scan.get("market") or {}
+    mode = scan.get("scan_mode", "pre_market")
+    mode_label = "POST-CLOSE (gap-hold verified per Section 5.2)" if mode == "post_close" else "PRE-MARKET (classify only, do NOT emit recommendations)"
     lines.append(
-        f"EP catalyst scan ({scan.get('scanned_at','')[:16]}): {scan.get('news_items',0)} news items, "
+        f"EP catalyst scan [{mode_label}] ({scan.get('scanned_at','')[:16]}): {scan.get('news_items',0)} news items, "
         f"{scan.get('ticker_hits',0)} ticker hits."
     )
     spy = m.get("spy_pct"); vix = m.get("vix")
@@ -299,18 +314,18 @@ def format_scan_for_pm(scan: Dict[str, Any]) -> str:
     vix_s = f"{vix:.1f}" if vix is not None else "?"
     lines.append(f"Market: SPY today {spy_s}, VIX {vix_s}.")
     if m.get("blocked"):
-        lines.append(f"** Section 9 MARKET BLOCK: {m.get('reason')} -- skip all entries.**")
+        lines.append(f"** Section 10 MARKET BLOCK: {m.get('reason')} — skip all entries.**")
     cands = scan.get("candidates") or []
     if not cands:
-        lines.append("No candidates passed the pre-filter (Section 2 + 4.1 + 9 extended-run check).")
+        lines.append("No candidates passed the pre-filter (Section 3 + 5.1 + 10 extended-run check).")
     else:
         lines.append("")
-        lines.append(f"Pre-filtered candidates (you must classify each per Section 3 Tier 1/2/Disqualified):")
+        lines.append(f"Filtered candidates (you must classify each per Section 4 Tier 1/2/Disqualified):")
         for c in cands:
             dma = "above" if c.get("above_50dma") is True else ("below" if c.get("above_50dma") is False else "?")
             lines.append(
                 f"- {c['ticker']} [hint={c['hint']}] gap {c['gap_pct']:+.1f}% / "
-                f"move {c['today_move_pct']:+.1f}% (open ${c['open']:.2f}, now ${c['last_price']:.2f}, "
+                f"close {c['today_move_pct']:+.1f}% (open ${c['open']:.2f}, close ${c['last_price']:.2f}, "
                 f"prior ${c['prior_close']:.2f}); 50DMA: {dma}; news sentiment: {c['news_sentiment']}"
             )
             lines.append(f"    NEWS [{c['news_source']}]: {c['news_title']}")

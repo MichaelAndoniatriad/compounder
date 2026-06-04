@@ -2216,25 +2216,28 @@ def run_action_check(cfg: Dict[str, Any]) -> "AdvisorPMCycleResult":
         logger.debug("action_check: watchdog latch refresh failed", exc_info=True)
     return run_pm_cycle(cfg, trigger="action_check")
 
-def run_ep_scan_cycle(cfg: Dict[str, Any]) -> "AdvisorPMCycleResult":
+def run_ep_scan_cycle(cfg: Dict[str, Any], *, post_close: bool = False) -> "AdvisorPMCycleResult":
     """Run a catalyst scan and hand the pre-filtered candidates to the PM.
 
-    1. ep_scanner pulls recent news, surfaces ticker hits, applies Section 2 /
-       4.1 / 9 gates -- returns a structured candidate list with all the data
-       the PM needs to classify per Section 3.
-    2. One PM cycle is run with the scan output as extra_context. The PM (with
+    1. ep_scanner pulls recent news, surfaces ticker hits, applies universe /
+       gap / disqualifier gates — returns a structured candidate list with all
+       the data the PM needs to classify per Section 4.
+    2. When post_close=True, an additional gate requires the close held above
+       the gap level (Section 5.2), and the PM is instructed to emit
+       recommendations. In pre-market mode, the PM classifies only.
+    3. One PM cycle is run with the scan output as extra_context. The PM (with
        the EP strategy doc loaded into its prompt every cycle) classifies each
        candidate as Tier 1 / 2 / Disqualified and calls emit_ep_candidate for
-       qualifiers, which pushes a sized checklist to the human.
-    3. Scan run is appended to memory/strategies/ep_scans.jsonl for audit.
+       qualifiers, which pushes a sized recommendation to the human.
+    4. Scan run is appended to memory/strategies/ep_scans.jsonl for audit.
 
-    Messaging is the PM's call -- a scan with 0 qualifiers stays silent.
+    Messaging is the PM's call — a scan with 0 qualifiers stays silent.
     """
     set_config(cfg)
     from tradingagents.portfolio_advisor import ep_scanner as _eps
     from tradingagents.portfolio_advisor import pm_workspace as _pmws
 
-    scan = _eps.scan_for_ep_candidates(cfg)
+    scan = _eps.scan_for_ep_candidates(cfg, post_close=post_close)
     try:
         _pmws.ensure_workspace(cfg)
         path = _pmws.memory_dir(cfg) / "strategies" / "ep_scans.jsonl"
