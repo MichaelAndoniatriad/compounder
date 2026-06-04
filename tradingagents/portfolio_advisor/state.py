@@ -41,6 +41,12 @@ def default_state() -> Dict[str, Any]:
         "last_portfolio_tickers": [],
         # Total eToro units per normalized ticker from last successful portfolio row fetch.
         "last_book_units_by_ticker": {},
+        # Cash + total-value snapshot, updated at end of every PM cycle so the
+        # next cycle can detect deposits/withdrawals (cash diff w/o matching
+        # position-units change).
+        "last_cash_balance": None,
+        "last_total_value": None,
+        "last_cash_snapshot_iso": None,
         "last_pm_cycle_iso": None,
         "last_pm_executive_prefix": None,
         # Per-ticker price-watchdog latches keyed by TICKER:

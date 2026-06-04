@@ -733,3 +733,186 @@ def regenerate_memory_index(cfg: Dict[str, Any]) -> str:
     p = memory_index_path(cfg)
     p.write_text(body, encoding="utf-8")
     return body
+
+# --- deployment planner (cash deposits / withdrawals) -----------------------
+def compute_deployment_split(
+    new_cash: float,
+    sleeve_actuals: Dict[str, float],
+    sleeve_targets: Optional[Dict[str, float]] = None,
+) -> Dict[str, Any]:
+    """Decide how to deploy `new_cash` toward the target sleeve mix.
+
+    sleeve_actuals: {"core": $, "catalyst": $, "cash": $} BEFORE the new cash.
+    sleeve_targets: {"core": 0.50, "catalyst": 0.30, "cash": 0.20} (default).
+
+    Returns:
+      {
+        "new_total": float,
+        "split": {"core": $, "catalyst": $, "cash_buffer": $},
+        "rationale": [str, ...],
+        "after_pct": {"core": float, "catalyst": float, "cash": float},
+      }
+    """
+    tgt = sleeve_targets or {"core": 0.50, "catalyst": 0.30, "cash": 0.20}
+    core = float(sleeve_actuals.get("core") or 0.0)
+    catalyst = float(sleeve_actuals.get("catalyst") or 0.0)
+    cash = float(sleeve_actuals.get("cash") or 0.0)
+    add = max(float(new_cash or 0.0), 0.0)
+
+    new_total = core + catalyst + cash + add
+    if new_total <= 0:
+        return {
+            "new_total": 0.0,
+            "split": {"core": 0.0, "catalyst": 0.0, "cash_buffer": add},
+            "rationale": ["Total portfolio value is 0 -- holding new cash."],
+            "after_pct": {"core": 0.0, "catalyst": 0.0, "cash": 1.0},
+        }
+
+    target_core_usd = tgt.get("core", 0.5) * new_total
+    target_catalyst_usd = tgt.get("catalyst", 0.3) * new_total
+    target_cash_usd = tgt.get("cash", 0.2) * new_total
+
+    need_core = max(target_core_usd - core, 0.0)
+    need_catalyst = max(target_catalyst_usd - catalyst, 0.0)
+    need_cash_buffer = max(target_cash_usd - cash, 0.0)
+
+    rationale: List[str] = []
+    remaining = add
+    deploy_core = min(need_core, remaining)
+    remaining -= deploy_core
+    if deploy_core > 0:
+        rationale.append(
+            f"${deploy_core:,.0f} -> core (sleeve at ${core:,.0f}, target ${target_core_usd:,.0f})"
+        )
+
+    deploy_catalyst = min(need_catalyst, remaining)
+    remaining -= deploy_catalyst
+    if deploy_catalyst > 0:
+        rationale.append(
+            f"${deploy_catalyst:,.0f} -> catalyst (sleeve at ${catalyst:,.0f}, "
+            f"target ${target_catalyst_usd:,.0f}) -- only if a qualifying EP setup exists; "
+            f"else hold in cash and run an ep-scan."
+        )
+
+    cash_buffer = remaining
+    if cash_buffer > 0:
+        rationale.append(
+            f"${cash_buffer:,.0f} -> cash buffer (already meets/exceeds non-cash targets)"
+        )
+
+    after_core = core + deploy_core
+    after_catalyst = catalyst + deploy_catalyst
+    after_cash = cash + cash_buffer
+
+    return {
+        "new_total": round(new_total, 2),
+        "split": {
+            "core": round(deploy_core, 2),
+            "catalyst": round(deploy_catalyst, 2),
+            "cash_buffer": round(cash_buffer, 2),
+        },
+        "rationale": rationale or ["Already at target across all sleeves -- hold as cash."],
+        "after_pct": {
+            "core": round(after_core / new_total, 4),
+            "catalyst": round(after_catalyst / new_total, 4),
+            "cash": round(after_cash / new_total, 4),
+        },
+    }
+
+
+def load_cash_change_block(
+    cfg: Dict[str, Any],
+    *,
+    current_cash: Optional[float],
+    current_total: Optional[float],
+    sleeve_actuals: Dict[str, float],
+    closures_window: Optional[List[str]] = None,
+) -> str:
+    """Render the cash-change block for the PM prompt when a material diff exists.
+
+    Reads last_cash_balance from state. Returns empty string when no diff or
+    when the diff falls within the configured threshold (default $100).
+    """
+    from tradingagents.portfolio_advisor import state as _state
+    st = _state.load_state(cfg)
+    last_cash = st.get("last_cash_balance")
+    last_total = st.get("last_total_value")
+    last_iso = st.get("last_cash_snapshot_iso")
+    try:
+        threshold = float(cfg.get("portfolio_advisor_cash_change_threshold_usd") or 100.0)
+    except (TypeError, ValueError):
+        threshold = 100.0
+
+    if current_cash is None or last_cash is None:
+        return ""
+    delta = float(current_cash) - float(last_cash)
+    if abs(delta) < threshold:
+        return ""
+
+    total_delta = (
+        float(current_total) - float(last_total)
+        if current_total is not None and last_total is not None
+        else None
+    )
+
+    closures = ", ".join(closures_window or []) if closures_window else "(none in window)"
+    sign = "+" if delta > 0 else "-"
+    direction = "deposit" if delta > 0 else "withdrawal"
+    lines = [
+        f"## Cash change detected since last cycle",
+        f"available_balance: ${float(last_cash):,.2f} -> ${float(current_cash):,.2f} "
+        f"({sign}${abs(delta):,.2f}) [snapshotted {str(last_iso)[:16] if last_iso else 'never'}]",
+    ]
+    if total_delta is not None:
+        lines.append(
+            f"total_portfolio_value: ${float(last_total):,.2f} -> ${float(current_total):,.2f} "
+            f"({'+' if total_delta>=0 else '-'}${abs(total_delta):,.2f})"
+        )
+    lines.append(f"Position closures in window: {closures}")
+    lines.append("")
+
+    if delta > 0:
+        plan = compute_deployment_split(delta, sleeve_actuals)
+        lines.append(
+            f"If this is a {direction}, here is the toward-target deployment math "
+            f"(50/30/20 default; new total ${plan['new_total']:,.2f}):"
+        )
+        for r in plan["rationale"]:
+            lines.append(f"  - {r}")
+        lines.append(
+            f"After: core {plan['after_pct']['core']*100:.0f}% / "
+            f"catalyst {plan['after_pct']['catalyst']*100:.0f}% / "
+            f"cash {plan['after_pct']['cash']*100:.0f}%"
+        )
+    else:
+        lines.append(
+            "Cash decreased materially -- looks like a buy or withdrawal. Acknowledge to the "
+            "human and ask if a trade was executed so you can record it via record_decision "
+            "and update_position_memory."
+        )
+
+    lines.append("")
+    lines.append(
+        "ACT: acknowledge the change to the human in your push_note. If it is a deposit and a "
+        "qualifying EP candidate exists (run ep-scan if unsure), emit a sized entry via "
+        "emit_ep_candidate. Otherwise propose adding to your highest-conviction holding via "
+        "propose_trade, or explicitly say `hold in cash because <reason>`. NEVER force a deploy "
+        "without a real setup -- the EP doc says idle cash is a cost but a bad entry is worse."
+    )
+    return "\n".join(lines) + "\n\n"
+
+
+def update_cash_snapshot(
+    cfg: Dict[str, Any], *, current_cash: Optional[float], current_total: Optional[float]
+) -> None:
+    """Persist current cash + total. Called at the end of each PM cycle."""
+    from tradingagents.portfolio_advisor import state as _state
+    if current_cash is None and current_total is None:
+        return
+    st = _state.load_state(cfg)
+    if current_cash is not None:
+        st["last_cash_balance"] = round(float(current_cash), 2)
+    if current_total is not None:
+        st["last_total_value"] = round(float(current_total), 2)
+    st["last_cash_snapshot_iso"] = _now_iso()
+    _state.save_state(cfg, st)

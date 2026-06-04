@@ -1717,6 +1717,34 @@ def run_pm_cycle(
     ep_open_blk = _pmws.load_ep_open_trades_block(cfg)
     ep_stats_blk = _pmws.load_ep_stats_block(cfg)
     conv_blk = _pmws.load_conversation_block(cfg)
+    # Detect deposits / withdrawals by diffing cash + total vs last snapshot.
+    _cur_cash = _parse_available_balance(portfolio_text)
+    _cur_total = None
+    try:
+        _ubvs = [float(r['unitsBaseValueDollars']) for r in portfolio_rows
+                 if r.get('unitsBaseValueDollars') is not None]
+        _cur_total = (sum(_ubvs) + (_cur_cash or 0.0)) if _ubvs or _cur_cash is not None else None
+    except Exception:
+        _cur_total = None
+    _sleeve_actuals = {'core': 0.0, 'catalyst': 0.0, 'cash': float(_cur_cash or 0.0)}
+    try:
+        _plans_now = pos_plans.load_position_plans(cfg)
+        for _r in portfolio_rows:
+            _ubv = _float_or_none(_r.get('unitsBaseValueDollars'))
+            if _ubv is None:
+                continue
+            _tk2 = _normalize_ticker(str(_r.get('symbolFull') or ''))
+            _strat = (_plans_now.get(_tk2).strategy if _plans_now.get(_tk2) else 'core')
+            if _strat == 'catalyst':
+                _sleeve_actuals['catalyst'] += _ubv
+            else:
+                _sleeve_actuals['core'] += _ubv
+    except Exception:
+        logger.debug('sleeve_actuals build failed', exc_info=True)
+    cash_change_blk = _pmws.load_cash_change_block(
+        cfg, current_cash=_cur_cash, current_total=_cur_total,
+        sleeve_actuals=_sleeve_actuals,
+    )
     strategy_block = (
         f"Strategy docs (rules/strategies/, FOLLOW EXACTLY when reasoning about a trade in their domain):\n{strategies_blk}\n\n"
         if strategies_blk else ""
@@ -1861,7 +1889,7 @@ Execution tiers (for append_jobs only): "full_graph" runs the full multi-agent p
 
 Trigger for this cycle: {trigger_label}
 
-{strategy_block}{rules_blk}{rule_book_blk}{lessons_blk}{mem_blk}{ep_open_blk}{ep_stats_blk}{conv_blk}{decisions_blk}{memory_block}{market_memory_blk}{broad_move_blk}Portfolio snapshot:
+{strategy_block}{rules_blk}{cash_change_blk}{rule_book_blk}{lessons_blk}{mem_blk}{ep_open_blk}{ep_stats_blk}{conv_blk}{decisions_blk}{memory_block}{market_memory_blk}{broad_move_blk}Portfolio snapshot:
 {portfolio_snapshot}
 
 {sleeve_block}
@@ -2003,6 +2031,10 @@ the trigger, say that plainly and use append_jobs to send a new research layer t
         _pmws.prune_conversation(cfg)
     except Exception:
         pass
+    try:
+        _pmws.update_cash_snapshot(cfg, current_cash=_cur_cash, current_total=_cur_total)
+    except Exception:
+        logger.debug('update_cash_snapshot failed', exc_info=True)
 
 
     # Always sync the action log from stances so a chat-mode "hold" actually
