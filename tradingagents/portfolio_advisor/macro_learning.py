@@ -270,18 +270,25 @@ def _append_rules(cfg: Dict[str, Any], rules_text: str) -> int:
 
     lines = [l.strip() for l in rules_text.split("\n")]
     cleaned: List[str] = []
+    current_rule_id = ""
     for l in lines:
         if not l or l.startswith("NO_RULES") or "DUPLICATE:" in l:
             continue
-        # Skip RULE_ID lines — they're metadata, not rule content
         if l.startswith("RULE_ID:"):
             rule_id = l[8:].strip()
-            # Check if this rule ID already exists
             if rule_id and rule_id in existing:
                 logger.info("macro dedup: skipping existing rule %s", rule_id)
+                current_rule_id = ""
                 continue
-            # Prefix the next rule line with the ID
-            cleaned.append(f"[{rule_id}]")
+            current_rule_id = rule_id
+            continue
+        if current_rule_id and (l.startswith("-") or l.startswith("*")):
+            # Compute confidence from supporting event count
+            n = _count_supporting_events(l, cfg)
+            conf = "high" if n >= 5 else ("medium" if n >= 3 else "low")
+            tag = f"[{current_rule_id}] [n={n}, confidence: {conf}] "
+            cleaned.append(tag + l)
+            current_rule_id = ""
             continue
         if (l.startswith("-") or l.startswith("*")
                 or (len(l) < 120 and any(kw in l.lower() for kw in
@@ -295,6 +302,33 @@ def _append_rules(cfg: Dict[str, Any], rules_text: str) -> int:
     new_section = f"{header}{separator}### {today}\n{rule_block}\n"
     path.write_text(existing + new_section, encoding="utf-8")
     return len(cleaned)
+
+
+def _count_supporting_events(rule_text: str, cfg: Dict[str, Any]) -> int:
+    """Count how many market events match this rule's pattern keywords.
+
+    Used to tag rules with [n=X, confidence: low/medium/high].
+    This is the single source of truth for rule quality until Phase 2
+    performance data exists.
+    """
+    from tradingagents.portfolio_advisor.market_memory import load_recent_market_events
+
+    events = load_recent_market_events(cfg, days=90)
+    if not events:
+        return 0
+
+    # Extract significant keywords from the rule (words 5+ chars, lowercase)
+    keywords = {w.lower() for w in rule_text.split() if len(w) >= 5}
+    if not keywords:
+        return 0
+
+    matches = sum(
+        1 for e in events
+        if any(kw in str(e.get("cause", "")).lower() or
+               kw in ",".join(e.get("pattern_tags", [])).lower()
+               for kw in keywords)
+    )
+    return matches
 
 
 def _flag_challenged_rules(cfg: Dict[str, Any], invalidation_text: str) -> None:
