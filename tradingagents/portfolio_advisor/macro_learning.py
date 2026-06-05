@@ -39,13 +39,17 @@ A bad rule:
 - "Consider reducing risk" (no action specified)
 - "Tariffs are bad for tech" (descriptive, not prescriptive)
 
-IMPORTANT — Deduplication:
-For EACH rule you extract, assign a stable slug ID using this format:
-  RULE_ID: <category>_<YYYY-MM-DD>_<short-hyphenated-description>
+IMPORTANT — Output format and deduplication:
+For EACH rule you extract, output EXACTLY three lines:
+  RULE_ID: <category>_<YYYY-MM-DD>_<short-description>
   Example: RULE_ID: macro_2026-06-05_tariff-panic-no-selling
+  Then the rule itself on the next line, starting with "- " and containing:
+  the trigger condition, the concrete action, expiry/review, and reference.
+  Example: "- **Trigger:** SPY down >3% on tariff news... **Action:** Do not sell..."
 
-If a rule ALREADY EXISTS in the existing rules below, do NOT re-extract it.
-Instead say: DUPLICATE: <existing_rule_id>
+If a rule ALREADY EXISTS in the existing rules below, output:
+  DUPLICATE: <existing_rule_id>
+Do NOT re-extract existing rules.
 
 Rules should be written in the style of the existing _portfolio.md document.
 Below are the market events. Extract 0-3 rules maximum. If no clear pattern
@@ -274,13 +278,23 @@ def _append_rules(cfg: Dict[str, Any], rules_text: str) -> int:
     for l in lines:
         if not l or l.startswith("NO_RULES") or "DUPLICATE:" in l:
             continue
+        # Detect RULE_ID in multiple formats: "RULE_ID: xyz" or "**RULE_ID:** `xyz`"
+        rule_id_match = None
         if l.startswith("RULE_ID:"):
-            rule_id = l[8:].strip()
-            if rule_id and rule_id in existing:
-                logger.info("macro dedup: skipping existing rule %s", rule_id)
+            rule_id_match = l[8:].strip().strip("`*").strip()
+        elif "RULE_ID:" in l and ("**" in l or "`" in l):
+            # Extract from **RULE_ID:** `xyz` format
+            import re as _re
+            m = _re.search(r'RULE_ID:?\*?\*?\s*`?([a-z_0-9-]+)', l)
+            if m:
+                rule_id_match = m.group(1)
+
+        if rule_id_match:
+            if rule_id_match in existing:
+                logger.info("macro dedup: skipping existing rule %s", rule_id_match)
                 current_rule_id = ""
                 continue
-            current_rule_id = rule_id
+            current_rule_id = rule_id_match
             continue
         if current_rule_id and (l.startswith("-") or l.startswith("*")):
             # Compute confidence from supporting event count
@@ -300,8 +314,11 @@ def _append_rules(cfg: Dict[str, Any], rules_text: str) -> int:
 
     rule_block = "\n".join(f"  {line}" if not line.startswith("-") else line for line in cleaned)
     new_section = f"{header}{separator}### {today}\n{rule_block}\n"
-    path.write_text(existing + new_section, encoding="utf-8")
-    return len(cleaned)
+    path.write_text(existing + new_section)
+
+    # Count actual rules (lines starting with - or * that have confidence tags)
+    actual_rules = sum(1 for l in cleaned if (l.startswith("-") or l.startswith("*")) and "confidence:" in l)
+    return actual_rules
 
 
 def _count_supporting_events(rule_text: str, cfg: Dict[str, Any]) -> int:
