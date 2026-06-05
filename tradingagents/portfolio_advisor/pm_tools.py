@@ -377,7 +377,24 @@ def build_pm_tools(cfg: Dict[str, Any], live_tickers: set) -> List[Any]:
             "strategy_implication": (strategy_implication or "").strip(),
             "notes": (notes or "").strip(),
         })
-        return f"market event logged (id={event_id}): {cat_clean}/{market_move}/{magnitude} — {cause_clean[:80]}"
+        result = f"market event logged (id={event_id}): {cat_clean}/{market_move}/{magnitude} — {cause_clean[:80]}"
+
+        # Pre-event alert: check if this event matches any existing macro rule
+        try:
+            from tradingagents.portfolio_advisor.macro_learning import check_pre_event_alert
+            alert = check_pre_event_alert(cfg, cat_clean, cause_clean)
+            if alert:
+                from tradingagents.portfolio_advisor import messaging
+                messaging.send_advisor_message(
+                    cfg, "PM",
+                    f"MACRO ALERT — {alert}",
+                    urgent=True,
+                )
+                result += " | pre-event alert sent"
+        except Exception:
+            pass
+
+        return result
 
     @tool
     def log_decision_lesson(
