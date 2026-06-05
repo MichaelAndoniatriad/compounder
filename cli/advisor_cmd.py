@@ -440,6 +440,27 @@ def portfolio_advisor_ep_scan(
         raise typer.Exit(1) from e
 
 
+@portfolio_app.command("macro-review")
+def portfolio_advisor_macro_review(
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+):
+    """Extract durable portfolio rules from recent market event patterns.
+
+    Scans the last 90 days of market events logged by the PM, sends them to the
+    LLM for recurring-pattern extraction, and appends learned macro rules to
+    _portfolio.md so the PM internalises them permanently."""
+    _configure_logging(verbose)
+    cfg = DEFAULT_CONFIG.copy()
+    try:
+        from tradingagents.portfolio_advisor.macro_learning import run_macro_learning_review
+
+        result = run_macro_learning_review(cfg)
+        console.print(f"[cyan]Advisor macro-review:[/cyan] {result}")
+    except Exception as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1) from e
+
+
 @portfolio_app.command("action-check")
 def portfolio_advisor_action_check(
     verbose: bool = typer.Option(False, "--verbose", "-v"),

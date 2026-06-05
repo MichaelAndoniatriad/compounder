@@ -686,6 +686,25 @@ def build_pm_tools(cfg: Dict[str, Any], live_tickers: set) -> List[Any]:
             return f"closed EP trade {out['id']} {out['ticker']} pnl=${out.get('pnl_usd')} ({out.get('r_multiple')}R)"
         return f"updated EP trade {out['id']} {out['ticker']} stop=${out.get('stop_price')}"
 
+    @tool
+    def run_macro_review() -> str:
+        """Extract durable portfolio rules from recent macro event patterns.
+
+        Call this during your Saturday/weekend review to scan the last 90 days
+        of market events for recurring patterns (tariff-driven selloffs, Fed
+        relief rallies, sector rotations, etc.) and write learned rules to
+        _portfolio.md so you remember them permanently.
+
+        Rules extracted are SPECIFIC and ACTIONABLE: "when X happens, do Y."
+        They persist across sessions and feed into every future PM prompt.
+        """
+        try:
+            from tradingagents.portfolio_advisor.macro_learning import run_macro_learning_review
+            result = run_macro_learning_review(cfg)
+            return f"macro review: {result}"
+        except Exception as e:
+            return f"macro review failed: {e}"
+
     return [
         queue_research,
         mark_action_done,
@@ -706,4 +725,5 @@ def build_pm_tools(cfg: Dict[str, Any], live_tickers: set) -> List[Any]:
         emit_ep_candidate,
         log_ep_trade,
         update_ep_trade,
+        run_macro_review,
     ]
