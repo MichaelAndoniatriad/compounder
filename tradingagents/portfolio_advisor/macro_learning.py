@@ -39,10 +39,15 @@ A bad rule:
 - "Consider reducing risk" (no action specified)
 - "Tariffs are bad for tech" (descriptive, not prescriptive)
 
-Rules should be written in the style of the existing _portfolio.md document.
-Prepend "## Macro-learned rules" section if it doesn't exist, then add each
-rule as a bullet under that heading with the date it was learned.
+IMPORTANT — Deduplication:
+For EACH rule you extract, assign a stable slug ID using this format:
+  RULE_ID: <category>_<YYYY-MM-DD>_<short-hyphenated-description>
+  Example: RULE_ID: macro_2026-06-05_tariff-panic-no-selling
 
+If a rule ALREADY EXISTS in the existing rules below, do NOT re-extract it.
+Instead say: DUPLICATE: <existing_rule_id>
+
+Rules should be written in the style of the existing _portfolio.md document.
 Below are the market events. Extract 0-3 rules maximum. If no clear pattern
 exists, say "NO_RULES" and explain why."""
 
@@ -236,13 +241,19 @@ def _load_existing_rules(cfg: Dict[str, Any]) -> str:
 
 
 def _append_rules(cfg: Dict[str, Any], rules_text: str) -> int:
-    """Append extracted rules to _portfolio.md. Returns count of rules added."""
+    """Append extracted rules to _portfolio.md. Skips duplicates by RULE_ID.
+    Returns count of rules actually added."""
     if not rules_text or len(rules_text) < 10:
         return 0
 
     path = portfolio_rules_path(cfg)
     existing = path.read_text(encoding="utf-8") if path.is_file() else ""
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    # Check for explicit duplicates the LLM flagged
+    if "DUPLICATE:" in rules_text:
+        dupes = [l for l in rules_text.split("\n") if "DUPLICATE:" in l]
+        logger.info("macro dedup: LLM flagged %d duplicate(s): %s", len(dupes), dupes)
 
     if "## Macro-learned rules" not in existing:
         header = (
@@ -258,10 +269,24 @@ def _append_rules(cfg: Dict[str, Any], rules_text: str) -> int:
         separator = "\n"
 
     lines = [l.strip() for l in rules_text.split("\n")]
-    cleaned = [l for l in lines if l and not l.startswith("NO_RULES")
-               and (l.startswith("-") or l.startswith("*")
-                    or (len(l) < 120 and any(kw in l.lower() for kw in
-                       ["rule", "when", "if", "reduce", "increase", "hold", "exit", "size"])))]
+    cleaned: List[str] = []
+    for l in lines:
+        if not l or l.startswith("NO_RULES") or "DUPLICATE:" in l:
+            continue
+        # Skip RULE_ID lines — they're metadata, not rule content
+        if l.startswith("RULE_ID:"):
+            rule_id = l[8:].strip()
+            # Check if this rule ID already exists
+            if rule_id and rule_id in existing:
+                logger.info("macro dedup: skipping existing rule %s", rule_id)
+                continue
+            # Prefix the next rule line with the ID
+            cleaned.append(f"[{rule_id}]")
+            continue
+        if (l.startswith("-") or l.startswith("*")
+                or (len(l) < 120 and any(kw in l.lower() for kw in
+                    ["rule", "when", "if", "reduce", "increase", "hold", "exit", "size"]))):
+            cleaned.append(l)
 
     if not cleaned:
         return 0

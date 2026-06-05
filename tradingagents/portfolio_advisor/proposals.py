@@ -175,13 +175,44 @@ def reconcile_with_portfolio(cfg: Dict[str, Any], held_tickers: Iterable[str]) -
     for r in rows:
         if (
             r.get("status") == "proposed"
-            and _side(r.get("action")) == "reduce"
             and (r.get("ticker") or "").strip().upper() not in held
         ):
             r["status"] = "cancelled"
             r["status_set_at"] = now
             r["status_note"] = "auto-cancelled: position no longer held"
             n += 1
+    if n:
+        save_all(cfg, rows)
+    return n
+
+
+def auto_close_stale(cfg: Dict[str, Any], max_age_days: int = 14) -> int:
+    """Cancel proposals that have been open too long with no action.
+
+    This is a system-level operation — the PM does NOT have access to this
+    function. It should run as a cron job or during action-check cleanup.
+
+    Returns the number of proposals auto-closed.
+    """
+    from datetime import timedelta as _td
+
+    rows = load_all(cfg)
+    cutoff = datetime.now(timezone.utc) - _td(days=max_age_days)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    n = 0
+    for r in rows:
+        if r.get("status") != "proposed":
+            continue
+        ts = r.get("ts", "")
+        try:
+            rt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            if rt < cutoff:
+                r["status"] = "cancelled"
+                r["status_set_at"] = now_iso
+                r["status_note"] = f"auto-cancelled: stale >{max_age_days}d"
+                n += 1
+        except (ValueError, TypeError):
+            pass
     if n:
         save_all(cfg, rows)
     return n
