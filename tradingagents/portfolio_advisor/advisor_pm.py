@@ -2209,12 +2209,141 @@ def optional_pm_cycle_on_portfolio_change(
         logger.exception("PM cycle on portfolio change failed (trigger=%s)", trigger)
 
 
+def _resolve_pending_outcomes(cfg: Dict[str, Any]) -> None:
+    """Resolve pending memory-log entries and extract learned rules.
+
+    Runs during action_check cycles. For each pending entry where 5+ trading
+    sessions have passed, fetches current prices, computes returns, and
+    extracts learned rules via the reflection pipeline.
+
+    Rate-limited to 3 resolutions per cycle, 9 per day (3 action-checks × 3).
+    This is the primary learned-rule pipeline — it replaces the full_graph
+    path which is capped at 2/ticker/14d and rarely fires.
+    """
+    from datetime import date as _date, timedelta as _td
+    from tradingagents.agents.utils.memory import TradingMemoryLog
+    from tradingagents.agents.utils.learned_rules_log import maybe_extend_learned_rules_from_outcome
+    from tradingagents.llm_clients.corporate_llm_factory import build_corporate_hierarchy_llms
+
+    try:
+        mem = TradingMemoryLog(cfg)
+    except Exception:
+        logger.debug("outcome resolution: cannot init memory log", exc_info=True)
+        return
+
+    pending = mem.get_pending_entries()
+    if not pending:
+        return
+
+    # Get a cheap LLM for reflection (don't burn v4-pro on outcome reflection)
+    try:
+        llms = build_corporate_hierarchy_llms(cfg, callbacks=[])
+        quick_llm = llms.get("reflection") or llms.get("market_analyst")
+    except Exception:
+        quick_llm = None
+
+    resolved = 0
+    max_resolve = 3
+    today = _date.today()
+
+    for entry in pending:
+        if resolved >= max_resolve:
+            break
+
+        entry_date_str = entry.get("date", "")
+        try:
+            entry_date = _date.fromisoformat(entry_date_str)
+        except (ValueError, TypeError):
+            continue
+
+        # Count trading sessions since entry date
+        sessions = 0
+        d = entry_date
+        while d < today:
+            d = d + _td(days=1)
+            if d.weekday() < 5:
+                sessions += 1
+        if sessions < 5:
+            continue  # Not enough time has passed
+
+        ticker = entry.get("ticker", "")
+        if not ticker:
+            continue
+
+        # Fetch current price and benchmark
+        try:
+            import yfinance as yf
+            benchmark_map = cfg.get("benchmark_map", {})
+            benchmark = benchmark_map.get("", "SPY")
+            for suffix, bm in benchmark_map.items():
+                if suffix and ticker.upper().endswith(suffix.upper()):
+                    benchmark = bm
+                    break
+
+            stock = yf.Ticker(ticker).history(period="1mo", interval="1d")
+            bench = yf.Ticker(benchmark).history(period="1mo", interval="1d")
+            if len(stock) < 2 or len(bench) < 2:
+                continue
+
+            # Compute returns: entry day close → today's close
+            entry_close = stock["Close"].iloc[0]
+            current_close = stock["Close"].iloc[-1]
+            raw_return = float((current_close - entry_close) / entry_close)
+
+            bench_entry = bench["Close"].iloc[0]
+            bench_current = bench["Close"].iloc[-1]
+            bench_return = float((bench_current - bench_entry) / bench_entry)
+            alpha = raw_return - bench_return
+        except Exception:
+            logger.debug("outcome resolution: price fetch failed for %s", ticker, exc_info=True)
+            continue
+
+        # Mark as resolved in memory log
+        try:
+            mem.batch_update_with_outcomes([{
+                "ticker": ticker,
+                "trade_date": entry_date_str,
+                "raw_return": raw_return,
+                "alpha_return": alpha,
+                "holding_days": sessions,
+            }])
+        except Exception:
+            logger.debug("outcome resolution: batch update failed for %s", ticker, exc_info=True)
+            continue
+
+        # Extract learned rules if enabled
+        if cfg.get("learned_rules_enabled", True) and quick_llm is not None:
+            try:
+                outcome = {
+                    "ticker": ticker,
+                    "trade_date": entry_date_str,
+                    "raw_return": raw_return,
+                    "alpha_return": alpha,
+                    "holding_days": sessions,
+                    "decision": entry.get("decision", ""),
+                }
+                maybe_extend_learned_rules_from_outcome(cfg, quick_llm, outcome, benchmark)
+            except Exception:
+                logger.debug("outcome resolution: learned rule extraction failed for %s",
+                           ticker, exc_info=True)
+
+        resolved += 1
+        logger.info("outcome resolution: resolved %s %s raw=%.1f%% alpha=%.1f%%",
+                    ticker, entry_date_str, raw_return * 100, alpha * 100)
+
+    if resolved:
+        logger.info("outcome resolution: resolved %d entries this cycle", resolved)
+
+
 def run_action_check(cfg: Dict[str, Any]) -> "AdvisorPMCycleResult":
     """Proactive 3x/day pass: refresh price latches, then run ONE PM cycle that
     messages the human only when there's an action to take.
 
     Decisions the human already made suppress settled calls (the decisions block
     is in the prompt); action_check messaging is gated to the PM's push_note.
+
+    Also resolves pending memory-log entries (outcome measurement + learned
+    rule extraction) that have accumulated since the last full_graph run.
     """
     set_config(cfg)
     try:
@@ -2222,6 +2351,14 @@ def run_action_check(cfg: Dict[str, Any]) -> "AdvisorPMCycleResult":
         _wd.run_watchdog(cfg, ignore_market_hours=True, suppress_pm_handoff=True)
     except Exception:
         logger.debug("action_check: watchdog latch refresh failed", exc_info=True)
+
+    # Resolve pending position outcomes and extract learned rules.
+    # This replaces the full_graph-only resolution path which rarely runs.
+    try:
+        _resolve_pending_outcomes(cfg)
+    except Exception:
+        logger.debug("action_check: outcome resolution failed", exc_info=True)
+
     return run_pm_cycle(cfg, trigger="action_check")
 
 def run_ep_scan_cycle(cfg: Dict[str, Any], *, post_close: bool = False) -> "AdvisorPMCycleResult":
