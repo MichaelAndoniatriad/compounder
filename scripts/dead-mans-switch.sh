@@ -36,17 +36,13 @@ exec 200>"$LOCK"
 if ! flock -n 200; then exit 0; fi
 
 # --- Read heartbeats ---
+# Only the action-check heartbeat drives paging; it runs 6x/day regardless of
+# market activity and is the true liveness signal.
 AC_HB="$HEARTBEAT_DIR/heartbeat-action-check.ts"
-EP_HB="$HEARTBEAT_DIR/heartbeat-ep-scan.ts"
-MR_HB="$HEARTBEAT_DIR/heartbeat-macro-review.ts"
-OT_HB="$HEARTBEAT_DIR/heartbeat-outcome-tracking.ts"
 
 read_hb() { cat "$1" 2>/dev/null || echo "MISSING"; }
 
 AC_TS=$(read_hb "$AC_HB")
-EP_TS=$(read_hb "$EP_HB")
-MR_TS=$(read_hb "$MR_HB")
-OT_TS=$(read_hb "$OT_TS")
 
 # --- Check PM process ---
 PM_RUNNING=0
@@ -56,10 +52,13 @@ pgrep -f 'telegram-listen' > /dev/null 2>&1 && PM_RUNNING=1
 ALERTS=""
 STALE_SEC=$((STALE_HOURS * 3600))
 
-# Primary: action-check heartbeat — the main liveness signal
+# Primary: action-check heartbeat — the main liveness signal.
+# MISSING is a cold-start state (just deployed, first action-check hasn't run
+# yet). Don't page on it — log a soft notice and wait for the first heartbeat.
+# The PM-process check below still covers a genuinely-down system at startup.
 AC_AGE=$(_age_minutes "$AC_TS")
 if [[ "$AC_TS" == "MISSING" ]]; then
-  ALERTS="${ALERTS}  action-check heartbeat: MISSING (never written)\n"
+  echo "$(_ts) action-check heartbeat MISSING (cold start) — not paging" >>"$LOG"
 elif [[ "$AC_AGE" -gt $((STALE_HOURS * 60)) ]]; then
   ALERTS="${ALERTS}  action-check heartbeat: ${AC_AGE}min old (threshold: ${STALE_HOURS}h)\n"
 fi
