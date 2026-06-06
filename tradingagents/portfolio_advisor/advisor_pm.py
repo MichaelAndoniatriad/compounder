@@ -659,7 +659,8 @@ def _recent_full_graph_count(cfg: Dict[str, Any], ticker: str, days: int = 14) -
             if str(row.get("ticker") or "").strip().upper() == tk:
                 n += 1
         return n
-    except Exception:
+    except Exception as e:
+        logger.warning("event count failed for %s: %s", ticker, e)
         return 0
 
 
