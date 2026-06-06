@@ -569,6 +569,34 @@ def portfolio_advisor_measure_outcomes(
     except Exception as e:
         console.print(f"[red]{e}[/red]")
         raise typer.Exit(1) from e
+
+
+@portfolio_app.command("backfill-events")
+def portfolio_advisor_backfill_events(
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+    years: int = typer.Option(3, "--years", "-y", help="Years of history to backfill"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview without writing"),
+):
+    """Backfill market events from historical SPY data.
+
+    Rebuilds years of macro events instead of waiting to accumulate live.
+    Identifies days with >2% SPY moves, classifies with known event database
+    and keyword matching. Writes to market_events.jsonl with source=backfill."""
+    _configure_logging(verbose)
+    cfg = DEFAULT_CONFIG.copy()
+    try:
+        from tradingagents.portfolio_advisor.backfill_macro_events import run_backfill
+
+        created = run_backfill(cfg, years=years, dry_run=dry_run)
+        if dry_run:
+            console.print(f"[cyan]backfill-events:[/cyan] {created} events would be created (dry-run)")
+        else:
+            console.print(f"[cyan]backfill-events:[/cyan] {created} events backfilled")
+    except Exception as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1) from e
+
+
 def portfolio_advisor_action_check(
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ):

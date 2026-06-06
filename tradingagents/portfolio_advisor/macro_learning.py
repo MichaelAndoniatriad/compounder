@@ -427,3 +427,112 @@ def _fallback_risk_score(events: List[Dict[str, Any]]) -> Dict[str, Any]:
         "sizing_guidance": sizing, "ep_recommendation": ep,
         "rationale": f"{bear_count} bear event(s), {strong_count} strong event(s) in recent window",
     }
+
+
+def build_evidence_block(cfg: Dict[str, Any], days: int = 90) -> str:
+    """Build an honest evidence display for the PM prompt.
+
+    Shows raw hit rates per pattern. Flags INSUFFICIENT DATA when n<3 and
+    LOW CONFIDENCE when n<10. No probabilities, no EV, no false precision.
+    """
+    events = load_recent_market_events(cfg, days=days)
+    if not events:
+        return ""
+
+    patterns = _group_by_pattern(events)
+    if not patterns:
+        return ""
+
+    lines = ["Macro evidence (last %dd):" % days]
+    for pattern, matches in sorted(patterns.items(), key=lambda x: -len(x[1])):
+        n = len(matches)
+        if n < 3:
+            lines.append(f"  {pattern}: INSUFFICIENT DATA (n={n})")
+            continue
+
+        bounce_count = sum(1 for m in matches if _had_bounce(m, events))
+        rate = bounce_count / n
+        lines.append(f"  {pattern} events: {n}")
+        lines.append(f"    bounce within 5 sessions: {bounce_count}/{n} ({rate:.0%})")
+        lines.append(f"    continued selloff: {n - bounce_count}/{n} ({(1 - rate):.0%})")
+        if n < 10:
+            lines.append(f"    LOW CONFIDENCE (n={n}<10)")
+
+    # Add portfolio impact summary
+    lines.append("")
+    lines.append("Portfolio impact in pattern events:")
+    impact_data = _portfolio_impact_summary(events, patterns)
+    for pattern, impact in sorted(impact_data.items(), key=lambda x: -x[1].get("avg_drawdown", 0)):
+        if impact["count"] < 2:
+            continue
+        lines.append(
+            f"  {pattern}: avg drawdown {impact['avg_drawdown']:+.1f}% "
+            f"(range {impact['min_drawdown']:+.0f}% to {impact['max_drawdown']:+.0f}%), "
+            f"n={impact['count']}"
+        )
+
+    return "\n".join(lines) + "\n"
+
+
+# --- internal helpers for evidence block ---
+
+def _group_by_pattern(events: List[Dict]) -> Dict[str, List[Dict]]:
+    """Group events by their primary pattern tag."""
+    groups: Dict[str, List[Dict]] = {}
+    for e in events:
+        tags = e.get("pattern_tags", [])
+        if not tags:
+            tags = [e.get("category", "other")]
+        for tag in tags:
+            tag = str(tag).strip().lower().replace(" ", "_")
+            if not tag or tag in ("other",):
+                continue
+            groups.setdefault(tag, []).append(e)
+    return groups
+
+
+def _had_bounce(event: Dict, all_events: List[Dict]) -> bool:
+    """Check if a bounce occurred within 5 sessions after this bear event."""
+    if event.get("market_move") != "bear":
+        return False
+    event_date = event.get("date", "")
+    # Find any bull event within ~7 calendar days after this event
+    from datetime import datetime as _dt, timedelta as _td
+    try:
+        ed = _dt.strptime(event_date, "%Y-%m-%d")
+    except (ValueError, TypeError):
+        return False
+    for e in all_events:
+        if e.get("market_move") != "bull":
+            continue
+        try:
+            nd = _dt.strptime(e.get("date", ""), "%Y-%m-%d")
+        except (ValueError, TypeError):
+            continue
+        if nd > ed and (nd - ed).days <= 7:
+            return True
+    return False
+
+
+def _portfolio_impact_summary(
+    events: List[Dict], patterns: Dict[str, List[Dict]]
+) -> Dict[str, Dict]:
+    """Compute avg/min/max drawdown per pattern from portfolio_impact field."""
+    out: Dict[str, Dict] = {}
+    for pattern, matches in patterns.items():
+        drawdowns = []
+        for m in matches:
+            impact = m.get("portfolio_impact") or {}
+            for ticker, pct in impact.items():
+                try:
+                    drawdowns.append(float(pct))
+                except (TypeError, ValueError):
+                    pass
+        if drawdowns:
+            out[pattern] = {
+                "count": len(drawdowns),
+                "avg_drawdown": sum(drawdowns) / len(drawdowns),
+                "min_drawdown": min(drawdowns),
+                "max_drawdown": max(drawdowns),
+            }
+    return out
