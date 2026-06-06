@@ -1854,6 +1854,14 @@ def run_pm_cycle(
         logger.debug("portfolio risk block failed: %s", e)
         portfolio_risk_blk = ""
 
+    # Paper portfolio — simulated returns from following PM advice.
+    try:
+        from tradingagents.portfolio_advisor.paper_portfolio import build_paper_portfolio_block
+        paper_blk = build_paper_portfolio_block(cfg)
+    except Exception as e:
+        logger.debug("paper portfolio block failed: %s", e)
+        paper_blk = ""
+
     # Broad-move detection — prompts PM to log the cause when 3+ positions moved together.
     try:
         broad_move_blk = _broad_move_block(cfg, portfolio_rows)
@@ -1910,7 +1918,7 @@ Execution tiers (for append_jobs only): "full_graph" runs the full multi-agent p
 
 Trigger for this cycle: {trigger_label}
 
-{strategy_block}{rules_blk}{cash_change_blk}{rule_book_blk}{lessons_blk}{mem_blk}{ep_open_blk}{ep_stats_blk}{conv_blk}{decisions_blk}{memory_block}{market_memory_blk}{evidence_blk}{macro_risk_blk}{portfolio_risk_blk}{broad_move_blk}Portfolio snapshot:
+{strategy_block}{rules_blk}{cash_change_blk}{rule_book_blk}{lessons_blk}{mem_blk}{ep_open_blk}{ep_stats_blk}{conv_blk}{decisions_blk}{memory_block}{market_memory_blk}{evidence_blk}{macro_risk_blk}{portfolio_risk_blk}{paper_blk}{broad_move_blk}Portfolio snapshot:
 {portfolio_snapshot}
 
 {sleeve_block}

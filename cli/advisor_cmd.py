@@ -597,6 +597,56 @@ def portfolio_advisor_backfill_events(
         raise typer.Exit(1) from e
 
 
+@portfolio_app.command("paper-init")
+def portfolio_advisor_paper_init(
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+):
+    """Initialise paper portfolio from current eToro positions.
+
+    Seeds a parallel simulated portfolio that follows PM recommendations
+    exactly, starting from today's positions and cash balance."""
+    _configure_logging(verbose)
+    cfg = DEFAULT_CONFIG.copy()
+    try:
+        from tradingagents.portfolio_advisor.paper_portfolio import PaperPortfolio
+        pp = PaperPortfolio(cfg)
+        result = pp.initialise_from_etoro()
+        console.print(f"[cyan]paper-init:[/cyan] {result}")
+    except Exception as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1) from e
+
+
+@portfolio_app.command("paper-status")
+def portfolio_advisor_paper_status(
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+):
+    """Show paper portfolio returns vs actual portfolio and SPY."""
+    _configure_logging(verbose)
+    cfg = DEFAULT_CONFIG.copy()
+    try:
+        from tradingagents.portfolio_advisor.paper_portfolio import PaperPortfolio
+        pp = PaperPortfolio(cfg)
+        if not pp.start_date:
+            console.print("[yellow]paper-status:[/yellow] not initialised — run paper-init first")
+            return
+        returns = pp.compute_returns()
+        console.print(f"[cyan]Paper portfolio (since {returns['start_date']}):[/cyan]")
+        console.print(f"  Value: ${returns['paper_value']:.0f}")
+        console.print(f"  Cash: ${returns['paper_cash']:.0f}")
+        console.print(f"  Invested: ${returns['paper_invested']:.0f}")
+        console.print(f"  Fees: ${returns['paper_fees']:.2f}")
+        console.print(f"  Positions: {returns['n_positions']}")
+        console.print(f"  Trades: {returns['n_trades']}")
+        if returns["actual_value"]:
+            console.print(f"  Actual portfolio: ~${returns['actual_value']:.0f}")
+        if returns["spy_return"] is not None:
+            console.print(f"  SPY: {returns['spy_return']:+.1f}%")
+    except Exception as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1) from e
+
+
 def portfolio_advisor_action_check(
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ):
