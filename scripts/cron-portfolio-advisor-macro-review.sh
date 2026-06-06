@@ -42,6 +42,10 @@ fi
   "$PY" -m cli.main advisor portfolio macro-review
   ec=$?
   set -e
+  if [[ $ec -eq 0 ]]; then
+    mkdir -p "$HOME/.tradingagents/run/heartbeats"
+    date -u "+%Y-%m-%dT%H:%M:%SZ" > "$HOME/.tradingagents/run/heartbeats/heartbeat-macro-review.ts"
+  fi
   echo "===== $(_ts) portfolio advisor macro-review end (exit $ec) ====="
   exit "$ec"
 } >>"$LOG" 2>&1

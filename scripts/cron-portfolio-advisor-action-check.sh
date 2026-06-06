@@ -72,6 +72,10 @@ fi
   "$PY" -m cli.main advisor portfolio action-check
   ec=$?
   set -e
+  if [[ $ec -eq 0 ]]; then
+    mkdir -p "$HOME/.tradingagents/run/heartbeats"
+    date -u "+%Y-%m-%dT%H:%M:%SZ" > "$HOME/.tradingagents/run/heartbeats/heartbeat-action-check.ts"
+  fi
   echo "===== $(_ts) portfolio advisor action-check end (exit $ec) ====="
   exit "$ec"
 } >>"$LOG" 2>&1
