@@ -461,7 +461,114 @@ def portfolio_advisor_macro_review(
         raise typer.Exit(1) from e
 
 
-@portfolio_app.command("action-check")
+@portfolio_app.command("measure-outcomes")
+def portfolio_advisor_measure_outcomes(
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+):
+    """Measure outcomes for pending recommendations (weekly cron).
+
+    Loads all pending recommendations, fetches current prices, computes whether
+    each was correct, estimates P&L impact, and writes results to the log.
+    Also prints a human-override analysis comparing accepted vs rejected advice."""
+    _configure_logging(verbose)
+    cfg = DEFAULT_CONFIG.copy()
+    try:
+        from tradingagents.portfolio_advisor.recommendation_log import (
+            load_pending, update_outcome, human_override_analysis,
+        )
+        import yfinance as yf
+        from datetime import date as _date, timedelta as _td
+
+        pending = load_pending(cfg)
+        if not pending:
+            console.print("[cyan]measure-outcomes:[/cyan] no pending recommendations")
+            return
+
+        measured = 0
+        skipped = 0
+        today = _date.today()
+
+        for rec in pending:
+            # Only measure if enough time has passed
+            rec_date_str = rec.get("ts", "")[:10]
+            try:
+                rec_date = _date.fromisoformat(rec_date_str)
+            except (ValueError, TypeError):
+                skipped += 1
+                continue
+
+            # Count trading sessions
+            sessions = 0
+            d = rec_date
+            while d < today:
+                d = d + _td(days=1)
+                if d.weekday() < 5:
+                    sessions += 1
+
+            min_sessions = 10 if rec.get("type") == "ep_entry" else 5
+            if sessions < min_sessions:
+                skipped += 1
+                continue
+
+            # Measure outcome based on type
+            ticker = rec.get("ticker")
+            rec_type = rec.get("type", "")
+            rationale = (rec.get("rationale") or "").lower()
+
+            try:
+                if rec_type == "sizing" or rec_type == "macro_alert":
+                    spy = yf.Ticker("SPY").history(period="1mo", interval="1d")
+                    if len(spy) < 2:
+                        skipped += 1
+                        continue
+                    spy_change = float((spy["Close"].iloc[-1] - spy["Close"].iloc[0]) / spy["Close"].iloc[0])
+                    if "selloff" in rationale or "panic" in rationale or "bear" in rationale:
+                        was_correct = spy_change < -0.02
+                    elif "bounce" in rationale or "relief" in rationale or "rally" in rationale:
+                        was_correct = spy_change > 0.02
+                    else:
+                        was_correct = None
+                    update_outcome(cfg, rec["id"], was_correct=was_correct,
+                                  note=f"SPY change: {spy_change:+.1%} over {sessions} sessions")
+
+                elif rec_type == "ep_entry" and ticker:
+                    stock = yf.Ticker(ticker).history(period="1mo", interval="1d")
+                    if len(stock) < 2:
+                        skipped += 1
+                        continue
+                    pnl = float((stock["Close"].iloc[-1] - stock["Close"].iloc[0]) / stock["Close"].iloc[0])
+                    entry_price = rec.get("entry_price")
+                    if entry_price:
+                        pnl_est = float(stock["Close"].iloc[-1] - entry_price) * (rec.get("shares") or 1)
+                    else:
+                        pnl_est = None
+                    was_correct = pnl > 0 if pnl else None
+                    update_outcome(cfg, rec["id"], was_correct=was_correct,
+                                  pnl_impact_est=pnl_est,
+                                  note=f"P&L: {pnl:+.1%} over {sessions} sessions")
+
+                else:
+                    skipped += 1
+                    continue
+
+                measured += 1
+            except Exception as e:
+                console.print(f"[yellow]warn:[/yellow] {rec['id']} {rec.get('ticker','')}: {e}")
+                skipped += 1
+                continue
+
+        # Print override analysis
+        analysis = human_override_analysis(cfg)
+        console.print(f"[cyan]measure-outcomes:[/cyan] {measured} measured, {skipped} skipped, {analysis['total_measured']} with outcomes")
+        if analysis["followed_count"] or analysis["overrode_count"]:
+            f_avg = f"${analysis['followed_avg_pnl']:.0f}" if analysis["followed_avg_pnl"] is not None else "N/A"
+            o_avg = f"${analysis['overrode_avg_pnl']:.0f}" if analysis["overrode_avg_pnl"] is not None else "N/A"
+            console.print(f"  Followed PM advice: n={analysis['followed_count']} avg P&L={f_avg}")
+            console.print(f"  Overrode PM advice: n={analysis['overrode_count']} avg P&L={o_avg}")
+
+    except Exception as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1) from e
 def portfolio_advisor_action_check(
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ):

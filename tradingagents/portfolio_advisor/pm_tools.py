@@ -389,6 +389,11 @@ def build_pm_tools(cfg: Dict[str, Any], live_tickers: set) -> List[Any]:
                     cfg, "PM",
                     f"MACRO ALERT — {alert}",
                     urgent=True,
+                    log_as_recommendation=True,
+                    rec_trigger="action_check",
+                    rec_type="macro_alert",
+                    rec_action=alert[:80],
+                    rec_rationale=f"Pre-event alert matching macro rule. Event: [{cat_clean}] {cause_clean[:200]}",
                 )
                 result += " | pre-event alert sent"
         except Exception:
@@ -638,7 +643,15 @@ def build_pm_tools(cfg: Dict[str, Any], live_tickers: set) -> List[Any]:
             f"Reply: 'entered {tk} <shares>sh @ <price>' to log; 'skipped' to discard.\n"
             + (f"Notes: {notes}\n" if notes else "")
         )
-        messaging.send_advisor_message(cfg, "PM", body, urgent=True)
+        messaging.send_advisor_message(
+            cfg, "PM", body, urgent=True,
+            log_as_recommendation=True,
+            rec_trigger="ep_scan",
+            rec_type="ep_entry",
+            rec_action=f"buy {shares:.2f} sh {tk} @ ${entry_price:.2f}",
+            rec_ticker=tk,
+            rec_rationale=f"{catalyst} | gap={gap_pct:+.1f}% | sector={sector or 'unknown'}",
+        )
         return f"emitted EP recommendation for {tk}: entry=${entry_price} stop=${stop_price} risk=${usd_risk} shares={shares}"
 
     @tool

@@ -345,21 +345,46 @@ def send_advisor_message(
     body: str,
     *,
     urgent: bool = False,
+    log_as_recommendation: bool = False,
+    rec_trigger: str = "",
+    rec_type: str = "",
+    rec_action: str = "",
+    rec_ticker: Optional[str] = None,
+    rec_rule_ref: Optional[str] = None,
+    rec_rationale: str = "",
 ) -> bool:
     """Post to analysis webhook and/or Telegram and/or SMTP when configured.
 
     Call this whenever the portfolio advisor needs to reach the user (alerts,
     weekly heartbeat, job lifecycle, manual ``portfolio alert``, etc.).
-    Always appends a row to the JSONL message log (regardless of channel
-    success) so the UI Messages page can render notifications offline.
 
-    ``urgent=True`` bypasses the quiet-hours window. Use it for: chat replies
-    (user-initiated), system-failure alerts, watchdog price triggers, and
-    anything the PM itself flagged with ``push_note``. Routine PM cycles
-    leave urgent=False so they hold until the next morning/evening window.
+    When ``log_as_recommendation=True``, the message is also written to the
+    recommendation log BEFORE any channel delivery. If the log write fails,
+    the function returns False without sending — untracked advice is worse
+    than no advice.
 
-    Returns True if at least one channel succeeded or was attempted with 2xx.
+    ``urgent=True`` bypasses the quiet-hours window.
+    Returns True if at least one channel succeeded.
     """
+    # Phase 2: log as recommendation before sending
+    if log_as_recommendation:
+        try:
+            from tradingagents.portfolio_advisor.recommendation_log import log_recommendation
+            rec_id = log_recommendation(
+                cfg,
+                trigger=rec_trigger or "manual",
+                type=rec_type or "macro_alert",
+                action=rec_action or body[:80],
+                rationale=rec_rationale or body[:600],
+                ticker=rec_ticker,
+                rule_ref=rec_rule_ref,
+            )
+            if rec_id is None:
+                logger.error("recommendation log write failed — aborting send")
+                return False
+        except Exception as e:
+            logger.error("recommendation log failed: %s", e)
+            return False
     duplicate = _recent_duplicate_message(cfg, subject, body)
     if duplicate is not None:
         append_message_record(
