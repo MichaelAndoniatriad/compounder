@@ -120,6 +120,20 @@ class PaperPortfolio:
         if not ticker and rec_type not in ("sizing",):
             return f"skipped: no ticker for {rec_type}"
 
+        # Sizing and macro recommendations have no executable fill but are tracked
+        if rec_type == "sizing":
+            self._log_trade(rec["id"], "PORTFOLIO", "sizing_skip", 0, 0, 0,
+                           note=f"sizing: {action} — tracked for audit, no fill")
+            return f"paper sizing: {action} (tracked, no fill)"
+
+        if rec_type == "macro_alert":
+            self._log_trade(rec["id"], "PORTFOLIO", "alert_skip", 0, 0, 0,
+                           note=f"macro alert: {action} — tracked for audit, no fill")
+            return f"paper alert: {action} (tracked, no fill)"
+
+        if not ticker:
+            return f"skipped: no ticker for {rec_type}"
+
         import yfinance as yf
 
         try:
@@ -222,6 +236,10 @@ class PaperPortfolio:
         except Exception:
             pass
 
+        trades = list(self._iter_trades())
+        executable = [t for t in trades if t.get("side") not in ("sizing_skip", "alert_skip")]
+        tracked = [t for t in trades if t.get("side") in ("sizing_skip", "alert_skip")]
+
         return {
             "paper_value": round(paper_value, 2),
             "paper_cash": round(self.cash, 2),
@@ -231,7 +249,9 @@ class PaperPortfolio:
             "spy_return": round(spy_return * 100, 1) if spy_return is not None else None,
             "start_date": self.start_date,
             "n_positions": len(self.positions),
-            "n_trades": sum(1 for _ in self._iter_trades()),
+            "n_trades": len(trades),
+            "n_executable": len(executable),
+            "n_tracked_only": len(tracked),
         }
 
     def _current_price(self, ticker: str) -> float:
@@ -245,7 +265,8 @@ class PaperPortfolio:
         return 0.0
 
     def _log_trade(self, rec_id: str, ticker: str, side: str,
-                   shares: float, price: float, fee: float) -> None:
+                   shares: float, price: float, fee: float,
+                   note: str = "") -> None:
         p = _trades_path(self.cfg)
         p.parent.mkdir(parents=True, exist_ok=True)
         entry = {
@@ -258,6 +279,8 @@ class PaperPortfolio:
             "price": round(price, 2),
             "fee": round(fee, 2),
         }
+        if note:
+            entry["note"] = note
         with open(p, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry) + "\n")
 

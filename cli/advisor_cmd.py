@@ -521,13 +521,18 @@ def portfolio_advisor_measure_outcomes(
                     if len(spy) < 2:
                         skipped += 1
                         continue
-                    spy_change = float((spy["Close"].iloc[-1] - spy["Close"].iloc[0]) / spy["Close"].iloc[0])
+                    entry_price = float(spy["Close"].iloc[0])
+                    current_price = float(spy["Close"].iloc[-1])
+                    if entry_price <= 0:
+                        skipped += 1
+                        continue
+                    spy_change = (current_price - entry_price) / entry_price
                     if "selloff" in rationale or "panic" in rationale or "bear" in rationale:
                         was_correct = spy_change < -0.02
                     elif "bounce" in rationale or "relief" in rationale or "rally" in rationale:
                         was_correct = spy_change > 0.02
                     else:
-                        was_correct = None
+                        was_correct = None  # Cannot determine direction — skip scoring
                     update_outcome(cfg, rec["id"], was_correct=was_correct,
                                   note=f"SPY change: {spy_change:+.1%} over {sessions} sessions")
 
@@ -536,13 +541,18 @@ def portfolio_advisor_measure_outcomes(
                     if len(stock) < 2:
                         skipped += 1
                         continue
-                    pnl = float((stock["Close"].iloc[-1] - stock["Close"].iloc[0]) / stock["Close"].iloc[0])
+                    entry_close = float(stock["Close"].iloc[0])
+                    current_close = float(stock["Close"].iloc[-1])
+                    if entry_close <= 0:
+                        skipped += 1
+                        continue
+                    pnl = (current_close - entry_close) / entry_close
                     entry_price = rec.get("entry_price")
-                    if entry_price:
-                        pnl_est = float(stock["Close"].iloc[-1] - entry_price) * (rec.get("shares") or 1)
+                    if entry_price and entry_price > 0:
+                        pnl_est = float(current_close - entry_price) * (rec.get("shares") or 1)
                     else:
                         pnl_est = None
-                    was_correct = pnl > 0 if pnl else None
+                    was_correct = pnl > 0
                     update_outcome(cfg, rec["id"], was_correct=was_correct,
                                   pnl_impact_est=pnl_est,
                                   note=f"P&L: {pnl:+.1%} over {sessions} sessions")
