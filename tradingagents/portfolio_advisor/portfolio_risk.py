@@ -168,9 +168,9 @@ def compute_concentration_flags(
         pairs_str = ", ".join(f"{t1}/{t2}={c:.2f}" for t1, t2, c in high_corr_pairs[:5])
         flags.append(f"High correlation pairs (>0.80): {pairs_str}. These are effectively the same position.")
 
-    # 2. Overweight positions (risk contribution > 2× weight)
+    # 2. Overweight positions (risk contribution > 2× weight, min 3% weight)
     for ticker, rc in risk_contributions.items():
-        if rc["weight"] > 0 and rc["risk_contribution_pct"] > rc["weight"] * 2:
+        if rc["weight"] >= 3 and rc["risk_contribution_pct"] > rc["weight"] * 2:
             flags.append(
                 f"{ticker}: {rc['risk_contribution_pct']:.0f}% of portfolio risk "
                 f"from {rc['weight']:.0f}% allocation — consider reducing."
