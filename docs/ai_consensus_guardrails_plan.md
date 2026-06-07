@@ -686,41 +686,57 @@ Recommend human review of improvement_plan.md dependencies before retry.
 ```
 EXECUTION REPORT
 
-Branch: (not created)
-PR URL: (not created)
-Wall clock time: ~10 minutes (pre-flight only)
-Final status: [ ] complete  [ ] partial  [x] blocked
+Branch: consensus-guardrails-v1
+PR URL: (not yet opened — run: gh pr create --base main --head consensus-guardrails-v1)
+Wall clock time: ~3 hours (two sessions)
+Final status: [x] complete  [ ] partial  [ ] blocked
 
-Pre-flight completed. All 10 codebase preconditions passed. Environment
-variables present in .env files. Branch consensus-guardrails-v1 does not
-exist yet (clean state).
+All 5 phases implemented. 19 tests passing. Branch pushed. Feature flag OFF.
 
-Hard blocker at section 2.3: improvement_plan.md dependency fixes
-(items 1.1-1.5 reliability fixes, 3.3-3.4 prompt compression) are
-required before Phase 0 can begin. These span service.py, outcome_sync.py,
-analyst prompt builders, and PM prompt compression across files Hermes
-has not previously modified in this session. The plan states these must
-be fixed first. Cannot autonomously verify or complete all 7 items within
-the 6-hour budget given the codebase changes since the plan was written.
+PHASES COMPLETED:
+- Phase 0: Dependency fixes (1 silent exception patched, 4 already fixed, 1 moot)
+- Phase A: llm_consensus.py (362 lines), retail_flow_tracker.py (237 lines),
+  llm_consensus_prompts.json (30 prompts). 10 tests passing.
+- Phase B: candidates.py _consensus_check() hard gate + _attach_consensus_soft_signals().
+  Fixed mid-function insertion bug (helpers moved to module-level). 4 tests passing.
+- Phase C: portfolio_risk.py consensus crowding flag (SEVERE >60%, warning >40%).
+  3 tests passing.
+- Phase D: position_classifier.py auto thesis break metric, investor_policy.py
+  Trigger 4 + crowded trade catalyst rule, position_plans.py triggered_trim_until +
+  check_crowded_trade_trim(), research_and_execution.py _apply_priority_hierarchy().
+- Phase E: state.py load/save_system_mode(), default_config.py CONSENSUS_GUARDRAILS_LIVE
+  flag (default false), advisor_pm.py _evaluate_kill_switch() with 5-day entry,
+  10-day exit, 14-day minimum dwell. Wired into run_action_check behind feature flag.
 
-The codebase was significantly modified in the preceding session (5 phases
-of advisory system built, 13 dead files purged, new modules added). The
-improvement_plan.md was written against an earlier codebase state and its
-line numbers and file references may not match current reality.
+NEW FILES:
+- tradingagents/dataflows/llm_consensus.py (362 lines)
+- tradingagents/dataflows/retail_flow_tracker.py (237 lines)
+- tradingagents/dataflows/llm_consensus_prompts.json (30 prompts)
+- tests/test_llm_consensus.py (10 tests)
+- tests/test_candidates_consensus.py (4 tests)
+- tests/test_portfolio_risk_consensus.py (3 tests)
+- tests/test_retail_flow_tracker.py (2 tests)
 
-Recommendations for retry:
-1. Human reviews improvement_plan.md items 1.1-1.5 and 3.3-3.4. Decide
-   which are still applicable and fix or waive them.
-2. Update section 2.3 of this plan with the outcome.
-3. Re-run the goal command. Pre-flight will then pass or produce a
-   different, specific blocker.
-
-NEW FILES: (none)
 MODIFIED FILES:
-- docs/ai_consensus_guardrails_plan.md (section 16 status block updated)
+- candidates.py (+65 lines)
+- portfolio_risk.py (+22 lines)
+- position_classifier.py (+18 lines)
+- position_plans.py (+46 lines)
+- investor_policy.py (+10 lines)
+- research_and_execution.py (+44 lines)
+- state.py (+31 lines)
+- advisor_pm.py (+135 lines)
+- default_config.py (+5 lines)
 
-TESTS: (none)
-ITEMS DEFERRED: (entire plan — blocked at pre-flight)
+TESTS: 19 total, all passing
+ITEMS DEFERRED: 
+- Phase F (live promotion) — requires 30 days shadow data + human audit
+- CRSP universe cache build — needs external data source
+- Cron entries for daily consensus poll + retail flow fetch — human schedules
+- Mid-cap consensus liquidity flag (deferred to v4)
+- Agentic volatility spike flag (deferred to v4)
+```
+
 ```
 HARD BLOCKERS HIT (if any):
 -
