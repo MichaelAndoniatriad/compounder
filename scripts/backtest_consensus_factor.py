@@ -33,14 +33,7 @@ CACHE_DIR = Path.home() / ".tradingagents" / "cache" / "cheap_backtest"
 
 
 def scrape_date(date_str: str) -> Set[str]:
-    """Scrape Insider Monkey for ticker mentions in the 30 days before date_str."""
-    cache_file = CACHE_DIR / f"scrape_{date_str}.json"
-    if cache_file.is_file():
-        try:
-            return set(json.loads(cache_file.read_text()))
-        except (json.JSONDecodeError, OSError):
-            pass
-
+    """Scrape Insider Monkey for ticker mentions. No caching — fresh each call."""
     all_tickers: Set[str] = set()
     for query in SEARCH_QUERIES:
         url = f"https://www.insidermonkey.com/?s={query}"
@@ -57,8 +50,6 @@ def scrape_date(date_str: str) -> Set[str]:
             continue
 
     target_hits = sorted(all_tickers & set(ALL_TICKERS) - NOISE)
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    cache_file.write_text(json.dumps(target_hits))
     return set(target_hits)
 
 

@@ -248,6 +248,103 @@ def update_rule(
     return f"rule '{name}' {action}d (confidence={cur_confidence}, confirmed={confirmed}, violated={violated})"
 
 
+def auto_retire_failed_rules(
+    cfg: Dict[str, Any],
+    *,
+    min_violations: int = 3,
+    violation_to_confirmation_ratio: float = 2.0,
+) -> List[str]:
+    """Auto retire rules where evidence clearly contradicts them.
+
+    A rule is retired when:
+    - violated >= min_violations (default 3), AND
+    - violated >= confirmed * violation_to_confirmation_ratio (default 2x),
+      meaning the rule has been contradicted at least twice as often as it
+      has been confirmed.
+
+    Already retired rules are skipped. Returns the list of rule names retired
+    in this pass.
+
+    Intended for weekly cron invocation; idempotent.
+    """
+    text = load_rule_book_text(cfg)
+    if not text:
+        return []
+    rules = _parse_rules(text)
+    if not rules:
+        return []
+
+    retired_names: List[str] = []
+    for name, rule in rules.items():
+        current_confidence = (rule.get("confidence") or "").strip().lower()
+        if current_confidence == "retired":
+            continue
+        try:
+            confirmed = int(rule.get("confirmed", 0))
+        except (TypeError, ValueError):
+            confirmed = 0
+        try:
+            violated = int(rule.get("violated", 0))
+        except (TypeError, ValueError):
+            violated = 0
+
+        if violated < min_violations:
+            continue
+        threshold = max(confirmed * violation_to_confirmation_ratio, 1)
+        if violated < threshold:
+            continue
+
+        update_rule(
+            cfg,
+            name=name,
+            action="retire",
+            evidence_note=(
+                f"auto retired: {violated} violations vs {confirmed} confirmations "
+                f"(threshold {violation_to_confirmation_ratio}x)"
+            ),
+        )
+        retired_names.append(name)
+        logger.info("rule_book: auto retired rule '%s'", name)
+
+    return retired_names
+
+
+def recently_retired_block(cfg: Dict[str, Any], lookback_days: int = 14) -> str:
+    """PM prompt context block listing rules retired in the last N days.
+
+    Empty string if none. Helps the PM understand why a rule it might recall
+    is no longer active.
+    """
+    from datetime import timedelta
+    text = load_rule_book_text(cfg)
+    if not text:
+        return ""
+    rules = _parse_rules(text)
+    if not rules:
+        return ""
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+    recent_retired: List[Dict[str, Any]] = []
+    for rule in rules.values():
+        if (rule.get("confidence") or "").strip().lower() != "retired":
+            continue
+        updated = rule.get("updated") or ""
+        if updated < cutoff:
+            continue
+        recent_retired.append(rule)
+
+    if not recent_retired:
+        return ""
+
+    lines = [f"Recently retired rules (last {lookback_days}d — do not rely on these):"]
+    for r in recent_retired[:6]:
+        confirmed = r.get("confirmed", "0")
+        violated = r.get("violated", "0")
+        lines.append(f"  {r['name']}: confirmed={confirmed} violated={violated} updated={r.get('updated', '?')}")
+    lines.append("")
+    return "\n".join(lines)
+
+
 def build_rule_book_prompt_block(cfg: Dict[str, Any]) -> str:
     """Compact rule book for PM prompt — active rules only, newest evidence last."""
     text = load_rule_book_text(cfg)
