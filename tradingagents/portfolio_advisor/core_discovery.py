@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 from datetime import date, datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List
 
 logger = logging.getLogger(__name__)
@@ -33,7 +34,12 @@ def _build_universe() -> List[str]:
     def _extract_tickers(url: str, col_names: tuple[str, ...], label: str) -> int:
         """Scan all tables on a Wikipedia page for a ticker column. Returns count added."""
         try:
-            all_tables = pd.read_html(url)
+            # Use requests with User-Agent — Wikipedia blocks default Python
+            # user agents from some IP ranges (including Hetzner).
+            import requests
+            resp = requests.get(url, headers={"User-Agent": "TradingAgents/1.0 (portfolio research)"}, timeout=15)
+            resp.raise_for_status()
+            all_tables = pd.read_html(resp.text)
         except Exception as e:
             logger.warning("core discovery: %s fetch failed: %s", label, e)
             return 0
