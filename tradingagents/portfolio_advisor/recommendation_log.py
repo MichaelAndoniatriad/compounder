@@ -56,6 +56,14 @@ def log_recommendation(
     entry_price: Optional[float] = None,
     stop_price: Optional[float] = None,
     shares: Optional[float] = None,
+    confidence: Optional[float] = None,
+    thesis_break_metrics: Optional[List[str]] = None,
+    exit_horizon_days: Optional[int] = None,
+    peer_holdings: Optional[Dict[str, float]] = None,
+    consensus_rank: Optional[int] = None,
+    consensus_age_days: Optional[int] = None,
+    consensus_score: Optional[Dict[str, float]] = None,
+    deepseek_aligned_with_consensus: Optional[bool] = None,
 ) -> Optional[str]:
     """Write a recommendation to the append-only log. Returns the entry ID.
 
@@ -64,6 +72,31 @@ def log_recommendation(
     """
     p = _log_path(cfg)
     p.parent.mkdir(parents=True, exist_ok=True)
+
+    # Normalise confidence: must be in [0.0, 1.0]; out of range → None
+    _conf: Optional[float] = None
+    if confidence is not None:
+        try:
+            c = float(confidence)
+            if 0.0 <= c <= 1.0:
+                _conf = round(c, 4)
+        except (TypeError, ValueError):
+            pass
+
+    # Normalise thesis_break_metrics: drop blanks, trim to 200 chars, max 5
+    _tbm: Optional[List[str]] = None
+    if thesis_break_metrics:
+        cleaned = [str(m).strip()[:200] for m in thesis_break_metrics if str(m).strip()]
+        _tbm = cleaned[:5] if cleaned else None
+
+    # Normalise exit_horizon_days: must be positive int
+    _ehd: Optional[int] = None
+    if exit_horizon_days is not None:
+        try:
+            e = int(exit_horizon_days)
+            _ehd = e if e > 0 else None
+        except (TypeError, ValueError):
+            _ehd = None
 
     entry: Dict[str, Any] = {
         "id": uuid.uuid4().hex[:16],
@@ -83,6 +116,14 @@ def log_recommendation(
         "was_correct": None,
         "pnl_impact_est": None,
         "outcome_note": None,
+        "confidence": _conf,
+        "thesis_break_metrics": _tbm,
+        "exit_horizon_days": _ehd,
+        "peer_holdings": peer_holdings if peer_holdings else None,
+        "consensus_rank": int(consensus_rank) if consensus_rank is not None else None,
+        "consensus_age_days": int(consensus_age_days) if consensus_age_days is not None else None,
+        "consensus_score": consensus_score if consensus_score else None,
+        "deepseek_aligned_with_consensus": bool(deepseek_aligned_with_consensus) if deepseek_aligned_with_consensus is not None else None,
     }
 
     try:
