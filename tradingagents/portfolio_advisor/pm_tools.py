@@ -315,6 +315,28 @@ def build_pm_tools(cfg: Dict[str, Any], live_tickers: set) -> List[Any]:
                 )
             except Exception:
                 pass
+            # Bridge into recommendation_log so every proposal is tracked for
+            # outcome measurement.  Failure here must NOT break propose_trade.
+            try:
+                from tradingagents.portfolio_advisor.recommendation_log import log_recommendation
+                sleeve_clean = (sleeve or "").strip().lower()
+                rule_ref = sleeve_clean if sleeve_clean in ("core", "catalyst") else None
+                log_recommendation(
+                    cfg,
+                    trigger="action_check",
+                    type="trade_proposal",
+                    ticker=tk,
+                    action=act,
+                    shares=shares if shares else None,
+                    entry_price=float(target_price) if float(target_price) > 0 else None,
+                    rationale=reason_clean,
+                    rule_ref=rule_ref,
+                )
+            except Exception:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "recommendation log bridge failed for %s", tk, exc_info=True
+                )
             qty = f"{shares:g} sh" if shares else (f"~${approx_usd:.0f}" if approx_usd else "size TBD")
             return f"PROPOSAL recorded: {act} {tk} {qty} (advisory only; human executes)"
         except Exception as e:
