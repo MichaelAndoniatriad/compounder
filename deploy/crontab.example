@@ -16,6 +16,9 @@ PATH=/usr/local/bin:/usr/bin:/bin
 # Weekdays every 5 min: price watchdog (no-op outside US equity UTC window)
 */5 * * * 1-5 /opt/tradingagents/scripts/cron-portfolio-advisor-watchdog.sh
 
+# Sunday 06:00 UTC: measure recommendation outcomes (weekly close)
+0 6 * * 0 cd /opt/tradingagents && /opt/tradingagents/.venv/bin/python -c "from tradingagents.default_config import DEFAULT_CONFIG; from tradingagents.portfolio_advisor.outcome_tracker import compute_recommendation_outcomes; compute_recommendation_outcomes(DEFAULT_CONFIG.copy())"
+
 # Optional — only if you use the clerk feature
 # 0 7 * * 1-5 /opt/tradingagents/scripts/cron-clerk-morning.sh
 # 0 8 * * MON /opt/tradingagents/scripts/cron-clerk-weekly.sh
