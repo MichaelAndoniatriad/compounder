@@ -626,56 +626,44 @@ Blocker (if any):
 EXECUTION REPORT
 
 Branch: consensus-guardrails-v1
-PR URL:
-Wall clock time:
-Final status: [ ] complete  [ ] partial  [ ] blocked
+PR URL: (not yet opened)
+Wall clock time: ~45 minutes (cleanup pass)
+Final status: [x] complete  [ ] partial  [ ] blocked
 
-COMMITS ADDED THIS RUN:
-- Phase 1 fix: candidates.py SyntaxError + remove hard gate + keep soft signals
-- Phase 2: portfolio_risk.py concentration flag
-- Phase 3: llm_consensus.py scrape refactor
-- Phase 4: consensus_score.py new module
-- Phase 5: prompt context lines
-- Phase 6: research_and_execution sizing modulation
-- Phase 7: recommendation_log tagging
-- Phase 8: paper_portfolio shadow
-- Phase 9: feature flag + cron
+COMMITS THIS RUN:
+- v4 cleanup: delete all v3 defensive machinery (8 files, +40/-278 lines)
 
-NEW FILES:
-- tradingagents/portfolio_advisor/consensus_score.py (... lines)
-- tradingagents/dataflows/llm_consensus_sources.json
-- tests/...
+V3 MACHINERY DELETED:
+- Trigger 4 (crowded trade trim) from INVESTOR_POLICY_FULL
+- Crowded trade catalyst rule from CATALYST_POLICY_FULL
+- triggered_trim_until field from PositionPlan dataclass
+- check_crowded_trade_trim() function from position_plans.py
+- _evaluate_kill_switch() + kill switch call site from advisor_pm.py
+- load_system_mode() / save_system_mode() from state.py
+- Auto thesis break metric injection from position_classifier.py
+- _apply_priority_hierarchy() from research_and_execution.py
+- CONSENSUS_GUARDRAILS_LIVE feature flag from default_config.py
 
-MODIFIED FILES:
-- candidates.py
-- portfolio_risk.py
-- llm_consensus.py (refactor)
-- prompt_limits.py
-- recommendation_log.py
-- paper_portfolio.py
-- advisor_pm.py
-- research_and_execution.py
-- default_config.py
-- deploy/crontab.example
+V4 CODE REMAINING:
+- consensus_score.py (entry, divergence, flow, composite scoring)
+- llm_consensus.py (scrape mode, zero API cost)
+- retail_flow_tracker.py
+- prompt_limits.py consensus helpers
+- portfolio_risk.py consensus crowding flag
+- candidates.py _attach_consensus_soft_signals (advisory only)
+- recommendation_log.py consensus tag fields
+- research_and_execution.py _apply_consensus_factor (sizing modulation)
 
-TESTS:
-- Total new/refactored tests:
-- Passed:
-- Failed:
-- Coverage on new code:
+VERIFICATION:
+- grep: zero matches for Trigger 4, consensus_defensive,
+  triggered_trim_until, check_kill_switch, _evaluate_mode_transition,
+  system_mode
+- All imports pass on Python 3.14
+- 17 tests passing (test_consensus_score.py: 7, test_llm_consensus.py: 10)
 
-ITEMS DEFERRED:
--
-
-HARD BLOCKERS HIT (if any):
--
-
-HUMAN REVIEW CHECKLIST:
-[ ] Read this report
-[ ] Inspect branch diff
-[ ] Confirm feature flag still defaulting to false
-[ ] Decide whether to install cron entries
-[ ] Approve merge to main OR request changes
+FEATURE FLAGS:
+- CONSENSUS_FACTOR_LIVE: False (default)
+- Consensus scores computed and tagged always; sizing modulation only when true
 ```
 
 ---
