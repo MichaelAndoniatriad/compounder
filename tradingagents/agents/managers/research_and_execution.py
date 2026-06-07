@@ -96,6 +96,8 @@ def create_research_and_execution_agent(llm):
         if structured_llm is not None:
             try:
                 plan = structured_llm.invoke(messages)
+                # Apply consensus guardrail priority hierarchy before rendering
+                plan = _apply_priority_hierarchy(plan)
                 investment_plan = render_research_execution_plan_part(plan)
                 trader_plan = render_research_execution_trade_part(plan)
             except Exception as exc:
@@ -125,3 +127,47 @@ def create_research_and_execution_agent(llm):
         }
 
     return research_and_execution_node
+
+
+def _apply_priority_hierarchy(plan: Any) -> Any:
+    """Apply consensus guardrail priority hierarchy.
+
+    If system is in defensive mode, reject new entries into consensus top 20.
+    Lower-priority rules apply to the residual as normal.
+    """
+    try:
+        from tradingagents.portfolio_advisor.state import load_system_mode
+        mode = load_system_mode()
+    except Exception:
+        return plan
+
+    if mode != "consensus_defensive":
+        return plan
+
+    try:
+        from tradingagents.dataflows.llm_consensus import load_llm_consensus_snapshot
+        consensus = load_llm_consensus_snapshot()
+    except Exception:
+        return plan
+
+    if consensus is None:
+        return plan
+
+    top_20 = {t["ticker"] for t in consensus.get("top_20", [])}
+    ticker = getattr(plan, "ticker", "") or getattr(plan, "recommendation", "")
+
+    # If the plan recommends a BUY/OVERWEIGHT on a consensus name, reject it
+    if ticker and str(ticker).strip().upper() in top_20:
+        rating = str(getattr(plan, "rating", "") or getattr(plan, "recommendation", "") or "")
+        if rating.upper() in ("BUY", "OVERWEIGHT"):
+            try:
+                plan.rating = "Hold"
+                plan.recommendation = "Hold"
+                plan.rejection_reason = (
+                    f"Defensive mode active: new consensus entries blocked. "
+                    f"{ticker} is in LLM consensus top 20."
+                )
+            except AttributeError:
+                pass
+
+    return plan

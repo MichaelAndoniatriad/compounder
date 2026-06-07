@@ -49,6 +49,11 @@ When a position reaches 2x the entry price, sell half and let the remainder run.
 **Drawdown floor (applies to all positions)**
 If a position falls 30% from entry and the thesis is unchanged, one review window is allowed (next scheduled earnings). If a position falls 40% from entry for any reason, exit in full regardless of thesis. No exceptions. This rule exists because averaging down into losers is the most repeated mistake in this portfolio.
 
+**Trigger 4: Crowded trade trim**
+If a position is in the public LLM consensus top 10 AND has reached +30% from entry AND retail flow share of its 30 day ADV exceeds 25%, sell 25% of position regardless of conviction. Hold the remainder under existing rules. This rule exists because consensus names reverse faster than fundamentals and most of the asymmetric upside is captured by the +30% mark. Rule is binding, evaluated weekly. When the system mode is consensus_defensive, the +30% threshold drops to +15%.
+
+After a Trigger 4 trim, the affected position is tagged with a 30 day sleeve rebalancing cool down. Sleeve allocation rebalancing skips this position during the cool down window. This prevents the rebalance from undoing the trim immediately.
+
 ---
 
 # Stock Evaluation Framework — 10-Step Growth Process
@@ -158,6 +163,11 @@ Trigger 3: Time stop
 If the catalyst date passes and the expected move did not happen (position not up ~5%+),
 exit within 3 days regardless of P/L. A catalyst that fired without moving the stock is a
 dead thesis. If no catalyst date was set, close the trade after 30 days maximum.
+
+**Crowded trade catalyst rule**
+If a catalyst position is in the public LLM consensus top 20 AND the trailing stop has
+not armed (still below +10%), tighten the hard stop from -8% to -5%. Crowded catalyst
+trades fail faster.
 
 **Hard rules**
 - Never let a catalyst trade quietly become a long-term hold. If you want to keep it as a

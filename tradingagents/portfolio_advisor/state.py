@@ -291,4 +291,35 @@ def set_watchdog_trigger_status(
         row["status"] = mapping[action]
     if note:
         row["pm_note"] = str(note)[:300]
+
+
+# --- System mode state (consensus guardrails) ---
+
+def _mode_path() -> Path:
+    return Path.home() / ".tradingagents" / "state" / "system_mode.json"
+
+
+def load_system_mode() -> str:
+    """Return current system mode: 'normal' or 'consensus_defensive'."""
+    p = _mode_path()
+    if not p.is_file():
+        return "normal"
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return str(data.get("mode", "normal")).strip().lower()
+    except (json.JSONDecodeError, OSError):
+        return "normal"
+
+
+def save_system_mode(mode: str, entered_at: str = "") -> None:
+    """Persist system mode to disk."""
+    p = _mode_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    from datetime import datetime as _dt, timezone as _tz
+    data = {
+        "mode": mode,
+        "entered_at": entered_at or _dt.now(_tz.utc).isoformat(),
+        "updated_at": _dt.now(_tz.utc).isoformat(),
+    }
+    p.write_text(json.dumps(data, indent=2, ensure_ascii=False))
     return True

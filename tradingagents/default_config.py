@@ -409,4 +409,9 @@ DEFAULT_CONFIG = _apply_env_overrides({
         ".AX":  "^AXJO",    # Australia (ASX 200)
         "":     "SPY",      # default for US-listed tickers (no suffix)
     },
+    # --- Consensus Guardrails (Phase E) ---
+    # Master feature flag. Defaults to false — all consensus guardrail code is
+    # present but inert until a human flips this to true. Shadow mode logging
+    # still runs regardless of this flag.
+    "CONSENSUS_GUARDRAILS_LIVE": False,
 })
