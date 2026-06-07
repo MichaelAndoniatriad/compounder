@@ -83,6 +83,11 @@ def log_recommendation(
         "was_correct": None,
         "pnl_impact_est": None,
         "outcome_note": None,
+        # Consensus factor tags (v4)
+        "consensus_rank": None,
+        "consensus_age_days": None,
+        "consensus_score": None,
+        "deepseek_aligned_with_consensus": None,
     }
 
     try:

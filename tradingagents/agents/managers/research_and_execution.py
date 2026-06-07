@@ -96,8 +96,8 @@ def create_research_and_execution_agent(llm):
         if structured_llm is not None:
             try:
                 plan = structured_llm.invoke(messages)
-                # Apply consensus guardrail priority hierarchy before rendering
-                plan = _apply_priority_hierarchy(plan)
+                # Apply consensus factor: tag and modulate sizing (v4: advisory, not a gate)
+                plan = _apply_consensus_factor(plan)
                 investment_plan = render_research_execution_plan_part(plan)
                 trader_plan = render_research_execution_trade_part(plan)
             except Exception as exc:
@@ -129,45 +129,44 @@ def create_research_and_execution_agent(llm):
     return research_and_execution_node
 
 
-def _apply_priority_hierarchy(plan: Any) -> Any:
-    """Apply consensus guardrail priority hierarchy.
+def _apply_consensus_factor(plan: Any) -> Any:
+    """Apply consensus factor: tag and modulate sizing (v4).
 
-    If system is in defensive mode, reject new entries into consensus top 20.
-    Lower-priority rules apply to the residual as normal.
+    Tags every proposal with consensus score regardless of feature flag.
+    Modulates sizing only when CONSENSUS_FACTOR_LIVE is true.
+    Does NOT reject any proposal based on consensus.
     """
-    try:
-        from tradingagents.portfolio_advisor.state import load_system_mode
-        mode = load_system_mode()
-    except Exception:
-        return plan
+    from tradingagents.portfolio_advisor.consensus_score import compute_composite_consensus_score
 
-    if mode != "consensus_defensive":
-        return plan
-
-    try:
-        from tradingagents.dataflows.llm_consensus import load_llm_consensus_snapshot
-        consensus = load_llm_consensus_snapshot()
-    except Exception:
-        return plan
-
-    if consensus is None:
-        return plan
-
-    top_20 = {t["ticker"] for t in consensus.get("top_20", [])}
     ticker = getattr(plan, "ticker", "") or getattr(plan, "recommendation", "")
+    if not ticker:
+        return plan
 
-    # If the plan recommends a BUY/OVERWEIGHT on a consensus name, reject it
-    if ticker and str(ticker).strip().upper() in top_20:
-        rating = str(getattr(plan, "rating", "") or getattr(plan, "recommendation", "") or "")
-        if rating.upper() in ("BUY", "OVERWEIGHT"):
-            try:
-                plan.rating = "Hold"
-                plan.recommendation = "Hold"
-                plan.rejection_reason = (
-                    f"Defensive mode active: new consensus entries blocked. "
-                    f"{ticker} is in LLM consensus top 20."
-                )
-            except AttributeError:
-                pass
+    try:
+        score = compute_composite_consensus_score(str(ticker).strip().upper())
+    except Exception:
+        score = {"composite": 0.0, "entry": 0.0, "divergence": 0.0, "flow": 0.0}
+
+    # Tag always
+    try:
+        plan.consensus_score = score
+    except AttributeError:
+        pass
+
+    # Modulate sizing only when feature flag is true
+    try:
+        from tradingagents.default_config import DEFAULT_CONFIG
+        if not DEFAULT_CONFIG.get("CONSENSUS_FACTOR_LIVE", False):
+            return plan
+    except Exception:
+        return plan
+
+    # Composite +1.0 = +30% sizing. Composite -1.0 = -30% sizing.
+    multiplier = 1.0 + (score["composite"] * 0.3)
+    try:
+        current_sizing = float(getattr(plan, "sizing_usd", 0) or 0)
+        plan.sizing_usd = current_sizing * multiplier
+    except (AttributeError, TypeError, ValueError):
+        pass
 
     return plan

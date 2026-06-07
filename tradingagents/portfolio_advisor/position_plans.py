@@ -94,7 +94,6 @@ class PositionPlan:
     # Append-only log of each PM decision on this position (the WHAT + the WHY):
     #   {ts, action (buy/sell/trim/add/hold/watch/…), rationale, source, price?}
     decision_history: List[Dict[str, Any]] = field(default_factory=list)
-    triggered_trim_until: Optional[str] = None  # ISO date; sleeve rebalancing skips this position until then
     last_updated: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
     def __post_init__(self) -> None:
@@ -714,49 +713,3 @@ def build_trigger_block(
         lines.append(
             f"\nPositions with no plan on file (entry price / sleeve unknown): {', '.join(tickers_without_plans)}"
         )
-
-
-def check_crowded_trade_trim(plan: PositionPlan, current_price: float) -> Optional[dict]:
-    """Check Trigger 4 conditions for a position. Returns trim dict or None."""
-    try:
-        from tradingagents.dataflows.llm_consensus import load_llm_consensus_snapshot
-        consensus = load_llm_consensus_snapshot()
-    except Exception:
-        return None
-    if consensus is None:
-        return None
-
-    top_10 = {t["ticker"] for t in consensus.get("top_20", [])[:10]}
-    if plan.ticker not in top_10:
-        return None
-
-    gain_pct = (current_price / plan.entry_price - 1) * 100 if plan.entry_price > 0 else 0
-
-    # Check system mode for threshold
-    try:
-        from tradingagents.portfolio_advisor.state import load_system_mode
-        mode = load_system_mode()
-    except Exception:
-        mode = "normal"
-
-    threshold = 15.0 if mode == "consensus_defensive" else 30.0
-    if gain_pct < threshold:
-        return None
-
-    try:
-        from tradingagents.dataflows.retail_flow_tracker import get_retail_flow_share
-        flow = get_retail_flow_share(plan.ticker)
-    except Exception:
-        flow = None
-
-    if not flow or float(flow.get("share_30d", 0) or 0) <= 0.25:
-        return None
-
-    from datetime import date as _date, timedelta as _td
-    return {
-        "action": "trim_25_pct",
-        "reason": f"Trigger 4: +{gain_pct:.0f}% in consensus top 10 with retail flow {float(flow['share_30d'])*100:.0f}%",
-        "cool_down_until": (_date.today() + _td(days=30)).isoformat(),
-    }
-
-    return "\n".join(lines) + "\n"

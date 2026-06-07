@@ -209,23 +209,6 @@ def _apply_classification(cfg: Dict[str, Any], plan: PositionPlan, c: PositionCl
     plan.strategy = strategy
     if c.thesis_break_metrics:
         plan.thesis_break_metrics = [m.strip() for m in c.thesis_break_metrics if m.strip()][:3]
-
-    # Auto-inject consensus thesis break metric
-    try:
-        from tradingagents.dataflows.llm_consensus import load_llm_consensus_snapshot
-        consensus = load_llm_consensus_snapshot()
-        top_20_tickers = {t["ticker"] for t in consensus["top_20"]} if consensus else set()
-        if plan.ticker in top_20_tickers:
-            consensus_metric = (
-                "Consensus exit signal: drops out of LLM consensus top 20 for 14 "
-                "consecutive days, OR consensus rank falls >5 positions in 30 days, "
-                "OR realised 30 day return turns negative while still in consensus "
-                "and retail flow >25% of ADV."
-            )
-            if consensus_metric not in plan.thesis_break_metrics:
-                plan.thesis_break_metrics.append(consensus_metric)
-    except Exception:
-        pass
     if strategy == "catalyst" and c.catalyst_description:
         plan.catalyst_description = c.catalyst_description.strip()
     note = (plan.notes or "").split(" | classified")[0].strip()
