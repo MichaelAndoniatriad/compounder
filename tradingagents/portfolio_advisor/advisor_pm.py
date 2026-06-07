@@ -1870,6 +1870,14 @@ def run_pm_cycle(
         logger.debug("broad move block failed: %s", e)
         broad_move_blk = ""
 
+    # Consensus factor summary line (v4: advisory, not a gate)
+    try:
+        from tradingagents.portfolio_advisor.prompt_limits import consensus_pm_summary_line
+        consensus_blk = consensus_pm_summary_line(portfolio_rows) + "\n"
+    except Exception as e:
+        logger.debug("consensus block failed: %s", e)
+        consensus_blk = ""
+
     # PM rule book — evolved heuristics from past decisions.
     try:
         from tradingagents.portfolio_advisor.rule_book import build_rule_book_prompt_block
@@ -1919,7 +1927,7 @@ Execution tiers (for append_jobs only): "full_graph" runs the full multi-agent p
 
 Trigger for this cycle: {trigger_label}
 
-{strategy_block}{rules_blk}{cash_change_blk}{rule_book_blk}{lessons_blk}{mem_blk}{ep_open_blk}{ep_stats_blk}{conv_blk}{decisions_blk}{memory_block}{market_memory_blk}{evidence_blk}{macro_risk_blk}{portfolio_risk_blk}{paper_blk}{broad_move_blk}Portfolio snapshot:
+{strategy_block}{rules_blk}{cash_change_blk}{rule_book_blk}{lessons_blk}{mem_blk}{ep_open_blk}{ep_stats_blk}{conv_blk}{decisions_blk}{memory_block}{market_memory_blk}{evidence_blk}{macro_risk_blk}{portfolio_risk_blk}{paper_blk}{consensus_blk}{broad_move_blk}Portfolio snapshot:
 {portfolio_snapshot}
 
 {sleeve_block}
