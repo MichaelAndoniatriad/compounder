@@ -1360,6 +1360,23 @@ def executor_status():
                       f"-> {r.get('outcome')}" + (f"  err: {r.get('error')}" if r.get('error') else ""))
 
 
+@portfolio_app.command("core-scan")
+def portfolio_advisor_core_scan(
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+):
+    """Weekly core position discovery: screen S&P 500 + NASDAQ 100 for long-term growth candidates."""
+    _configure_logging(verbose)
+    cfg = DEFAULT_CONFIG.copy()
+    try:
+        from tradingagents.portfolio_advisor.core_discovery import run_core_discovery
+
+        result = run_core_discovery(cfg)
+        console.print(f"[green]{result}[/green]")
+    except Exception as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1) from e
+
+
 @portfolio_app.command("telegram-listen")
 def portfolio_advisor_telegram_listen(
     once: bool = typer.Option(False, "--once", help="Poll once and exit."),

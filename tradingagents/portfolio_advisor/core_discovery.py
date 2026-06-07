@@ -21,31 +21,54 @@ MIN_ROIC = 0.15  # 15%
 
 
 def _build_universe() -> List[str]:
-    """Pull live index constituents from Wikipedia/yfinance. No hardcoded lists."""
+    """Pull live index constituents from Wikipedia. No hardcoded lists.
+
+    Scans all tables on each page for a Symbol/Ticker column rather than
+    hardcoding table indices, which break when Wikipedia editors reorder tables.
+    """
+    import pandas as pd
+
     tickers: set[str] = set()
 
-    # S&P 500 from Wikipedia (free, always current)
-    try:
-        import pandas as pd
-        tables = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
-        sp500 = [str(t).strip().upper().replace(".", "-") for t in tables[0]["Symbol"].tolist()]
-        tickers.update(sp500)
-        logger.info("core discovery: loaded %d S&P 500 constituents", len(sp500))
-    except Exception as e:
-        logger.warning("core discovery: S&P 500 fetch failed: %s", e)
+    def _extract_tickers(url: str, col_names: tuple[str, ...], label: str) -> int:
+        """Scan all tables on a Wikipedia page for a ticker column. Returns count added."""
+        try:
+            all_tables = pd.read_html(url)
+        except Exception as e:
+            logger.warning("core discovery: %s fetch failed: %s", label, e)
+            return 0
 
-    # NASDAQ 100
-    try:
-        tables = pd.read_html("https://en.wikipedia.org/wiki/Nasdaq-100")
-        nasdaq = [str(t).strip().upper() for t in tables[2]["Ticker"].tolist()]
-        tickers.update(nasdaq)
-        logger.info("core discovery: loaded %d NASDAQ 100 constituents", len(nasdaq))
-    except Exception as e:
-        logger.warning("core discovery: NASDAQ 100 fetch failed: %s", e)
+        found = 0
+        for table in all_tables:
+            for col in col_names:
+                if col not in table.columns:
+                    continue
+                symbols = [
+                    str(t).strip().upper().replace(".", "-")
+                    for t in table[col].tolist()
+                    if str(t).strip().upper()[:1].isalpha()  # skip non-ticker rows
+                ]
+                tickers.update(symbols)
+                found += len(symbols)
+                break  # first matching column wins per table
+
+        logger.info("core discovery: loaded %d %s constituents", found, label)
+        return found
+
+    sp500_count = _extract_tickers(
+        "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
+        ("Symbol", "Ticker"),
+        "S&P 500",
+    )
+    nasdaq_count = _extract_tickers(
+        "https://en.wikipedia.org/wiki/Nasdaq-100",
+        ("Ticker", "Symbol"),
+        "NASDAQ 100",
+    )
 
     # Fallback if both fail
-    if len(tickers) < 100:
-        logger.warning("core discovery: only %d tickers from indices, adding fallback", len(tickers))
+    if sp500_count == 0 and nasdaq_count == 0:
+        logger.warning("core discovery: both Wikipedia fetches failed, using fallback")
         tickers.update([
             "NVDA", "MSFT", "GOOGL", "AMZN", "META", "AVGO", "TSM", "AAPL",
             "NOW", "CRM", "ADBE", "INTU", "SNOW", "DDOG", "MNDY", "NET",
@@ -109,6 +132,8 @@ def _llm_qualitative_rank(candidates: List[Dict], cfg: Dict[str, Any]) -> List[D
     one-line thesis. Previously recommended stocks are NOT excluded — they
     appear again if they still qualify, flagged as 'repeat' for context.
     """
+    import re
+
     if not candidates:
         return []
 
@@ -132,6 +157,24 @@ def _llm_qualitative_rank(candidates: List[Dict], cfg: Dict[str, Any]) -> List[D
         )
     cand_text = "\n".join(lines)
 
+    # Build current holdings context
+    holdings_text = ""
+    try:
+        from tradingagents.portfolio_advisor.etoro_scan import fetch_portfolio_rows
+        _payload, _text, _tickers, rows = fetch_portfolio_rows()
+        if rows:
+            hold_lines = [
+                f"  {r.get('symbolFull','')} ({r.get('instrumentDisplayName','')}) — "
+                f"entry={r.get('openRate','?')}"
+                for r in rows
+            ]
+            holdings_text = (
+                "\n\nMichael currently holds these positions. "
+                "Flag any overlap with the candidates below:\n" + "\n".join(hold_lines)
+            )
+    except Exception:
+        pass
+
     prompt = (
         "You are screening for long-term growth stocks for a concentrated portfolio. "
         "From the candidates below, identify up to 5 that best fit ALL of:\n"
@@ -140,11 +183,17 @@ def _llm_qualitative_rank(candidates: List[Dict], cfg: Dict[str, Any]) -> List[D
         "- Secular tailwind, not cyclical demand\n"
         "- No red flags: cash flow roughly tracks GAAP earnings, limited dilution, "
         "debt manageable, growth not decelerating\n\n"
-        f"Candidates:\n{cand_text}\n\n"
+        f"Candidates:\n{cand_text}\n"
+        f"{holdings_text}\n\n"
+        "Return EXACTLY one line per pick. Format each line as:\n"
+        "TICKER — CONVICTION (High/Medium) — STATUS (new/overlap) — one-sentence thesis\n\n"
+        "Example:\n"
+        "DDOG — CONVICTION High — OVERLAP (already held) — Observability platform with "
+        "durable switching costs; founder-led, profitable, no red flags.\n\n"
         "Return up to 5 tickers, ranked by conviction (highest first). "
-        "Format each as: TICKER — CONVICTION (High/Medium) — one-sentence investment thesis. "
         "If a stock was likely recommended before but still qualifies, note it as "
-        "'repeat but thesis intact'. Include only tickers from the list above."
+        "'repeat but thesis intact'. Include only tickers from the list above. "
+        "Do not number the lines or add commentary."
     )
 
     try:
@@ -154,14 +203,22 @@ def _llm_qualitative_rank(candidates: List[Dict], cfg: Dict[str, Any]) -> List[D
         logger.warning("core discovery LLM failed: %s", e)
         return _pick_top_5(candidates)
 
-    # Parse ticker lines
+    # Parse ticker lines with regex to avoid false substring matches
+    # Matches: TICKER — CONVICTION (High|Medium) — ...
+    ticker_re = re.compile(
+        r"^([A-Z]{1,5})\s*[—\-]\s*CONVICTION\s+(High|Medium)",
+        re.IGNORECASE,
+    )
+
     selected = []
     for line in str(content).split("\n"):
         line = line.strip()
-        if not line or not line[0].isalpha():
+        m = ticker_re.match(line)
+        if not m:
             continue
+        ticker = m.group(1).upper()
         for c in candidates:
-            if c["ticker"] in line and c not in selected:
+            if c["ticker"] == ticker and c not in selected:
                 c["thesis"] = line
                 selected.append(c)
                 break
@@ -178,21 +235,37 @@ def _pick_top_5(candidates: List[Dict]) -> List[Dict]:
 
 def run_core_discovery(cfg: Dict[str, Any]) -> str:
     """Run the full weekly core position discovery pipeline."""
+    import time
+
     today = date.today().isoformat()
+    t0 = time.monotonic()
 
     # Phase 1: Build dynamic universe
     logger.info("core discovery: building universe")
     universe = _build_universe()
-    logger.info("core discovery: %d tickers in universe", len(universe))
+    t1 = time.monotonic()
+    logger.info("core discovery: %d tickers in universe (%.1fs)", len(universe), t1 - t0)
+
+    # Phase 1b: Mechanical filter — fast, deterministic disqualification
+    logger.info("core discovery: running mechanical filter on %d tickers", len(universe))
+    from tradingagents.portfolio_advisor.mechanical_filter import mechanical_filter
+
+    reject_log = str(Path.home() / ".tradingagents" / "logs" / f"core_discovery_rejects_{today}.csv")
+    universe, rejections = mechanical_filter(universe, reject_log_path=reject_log)
+    total_rejected = sum(len(ts) for ts in rejections.values())
+    t2 = time.monotonic()
+    logger.info("core discovery: %d survived mechanical filter (%d rejected) (%.1fs)", len(universe), total_rejected, t2 - t1)
 
     # Phase 2: Quantitative screen
     quant_pass = _quantitative_screen(universe)
+    t3 = time.monotonic()
     if not quant_pass:
         return "Core discovery: no tickers passed quantitative filters this week."
-    logger.info("core discovery: %d passed quantitative screen", len(quant_pass))
+    logger.info("core discovery: %d passed quantitative screen (%.1fs)", len(quant_pass), t3 - t2)
 
     # Phase 3: LLM qualitative rank
     picks = _llm_qualitative_rank(quant_pass, cfg)
+    t4 = time.monotonic()
     if not picks:
         return "Core discovery: LLM filter returned no picks."
 
@@ -201,8 +274,9 @@ def run_core_discovery(cfg: Dict[str, Any]) -> str:
         "CORE POSITION DISCOVERY",
         f"Week of {today}",
         "",
-        f"Screened {len(universe)} tickers (S&P 500 + NASDAQ 100). "
-        f"{len(quant_pass)} passed quantitative filters. "
+        f"Screened {len(universe) + total_rejected} tickers (S&P 500 + NASDAQ 100). "
+        f"{total_rejected} eliminated by mechanical filters, "
+        f"{len(quant_pass)} passed quantitative screen. "
         f"Top picks after qualitative review:",
         "",
     ]
@@ -236,4 +310,5 @@ def run_core_discovery(cfg: Dict[str, Any]) -> str:
         logger.warning("core discovery send failed: %s", e)
         return f"Core discovery complete but send failed: {e}"
 
+    logger.info("core discovery: complete (%.1fs total)", time.monotonic() - t0)
     return f"Core discovery: {len(picks)} candidates sent via Telegram"
