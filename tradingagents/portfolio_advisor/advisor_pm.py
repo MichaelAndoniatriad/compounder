@@ -1748,6 +1748,7 @@ def run_pm_cycle(
         if strategies_blk else ""
     )
     recent_analysis_block = _recent_analysis_block(cfg, sorted(live_tickers))
+    _no_analysis_fallback = "(none found in the recent event log)\n\n"
     evidence_context = _pm_evidence_context(cfg, sorted(live_tickers), pend)
     evidence_block = _pm_json_for_prompt(
         cfg,
@@ -1940,7 +1941,7 @@ Pending advisor jobs preview (JSON):
 {pend_preview}
 
 Latest completed research decisions/results:
-{recent_analysis_block or "(none found in the recent event log)\n\n"}
+{recent_analysis_block or _no_analysis_fallback}
 {candidate_research_block}
 Retrieved evidence refs and known dates (JSON):
 {evidence_block}
