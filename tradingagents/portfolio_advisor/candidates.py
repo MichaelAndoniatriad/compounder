@@ -150,13 +150,7 @@ def evaluate_candidate(
     else:
         gates["catalyst"] = "pass" if catalyst_ok else "unknown"
 
-    # Consensus guardrail: hard gate (deepseek_divergence)
-    consensus_result, consensus_tags = _consensus_check(ticker)
-    gates["deepseek_divergence"] = consensus_result
-    if consensus_result == "fail_aligned":
-        failures.append("deepseek_aligned_with_public_consensus")
-
-    # Consensus soft signals
+    # Consensus soft signals (v4: advisory, not a gate)
     _attach_consensus_soft_signals(gates, ticker)
 
     full_graph_rating = str(data.get("full_graph_rating") or "").strip()
@@ -674,35 +668,6 @@ def run_promoted_candidate_pm_comparison(
 
 
 # --- Consensus guardrail helpers ---
-
-def _consensus_check(ticker: str, deepseek_aligned_threshold: float = 0.65) -> tuple:
-    """Hard gate: fail if DeepSeek recommends a ticker that's in public consensus top 20.
-
-    Returns (result, tags) where result is one of:
-    - "fail_aligned": DeepSeek pick is in public consensus → block
-    - "pass_divergent": DeepSeek pick is NOT in consensus → allow
-    - "pass": ticker not in DeepSeek picks at all → allow
-    - "unknown": consensus snapshot unavailable → allow with caveat
-    """
-    try:
-        from tradingagents.dataflows.llm_consensus import load_llm_consensus_snapshot
-        consensus = load_llm_consensus_snapshot()
-    except Exception:
-        return "unknown", []
-
-    if consensus is None:
-        return "unknown", []
-
-    deepseek = consensus.get("deepseek_alignment", {})
-    deepseek_picks = set(deepseek.get("deepseek_last_recommended", []))
-    overlap = float(deepseek.get("overlap_with_top_20", 0) or 0)
-
-    if ticker in deepseek_picks and overlap >= deepseek_aligned_threshold:
-        return "fail_aligned", ["deepseek_aligned_with_public_consensus"]
-    if ticker in deepseek_picks:
-        return "pass_divergent", []
-    return "pass", []
-
 
 def _attach_consensus_soft_signals(gates: dict, ticker: str) -> None:
     """Attach consensus and retail flow soft signals to the candidate gates dict."""
