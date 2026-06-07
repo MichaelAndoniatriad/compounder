@@ -36,10 +36,11 @@ def _build_universe() -> List[str]:
         try:
             # Use requests with User-Agent — Wikipedia blocks default Python
             # user agents from some IP ranges (including Hetzner).
+            import io as _io
             import requests
             resp = requests.get(url, headers={"User-Agent": "TradingAgents/1.0 (portfolio research)"}, timeout=15)
             resp.raise_for_status()
-            all_tables = pd.read_html(resp.text)
+            all_tables = pd.read_html(_io.StringIO(resp.text))
         except Exception as e:
             logger.warning("core discovery: %s fetch failed: %s", label, e)
             return 0
