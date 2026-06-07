@@ -206,6 +206,28 @@ def compute_concentration_flags(
                 f"consider consolidating or trimming smallest lots."
             )
 
+    # 5. Consensus crowding: what % of portfolio is in LLM consensus top 20
+    try:
+        from tradingagents.dataflows.llm_consensus import load_llm_consensus_snapshot
+        consensus = load_llm_consensus_snapshot()
+        if consensus and total > 0:
+            top_20 = {t["ticker"] for t in consensus.get("top_20", [])}
+            consensus_weight = sum(
+                val for ticker, val in ticker_positions.items() if ticker in top_20
+            ) / total * 100
+            if consensus_weight > 60:
+                flags.append(
+                    f"Consensus crowding SEVERE: {consensus_weight:.0f}% of portfolio in "
+                    f"LLM consensus top 20. Trim weakest consensus position before next entry."
+                )
+            elif consensus_weight > 40:
+                flags.append(
+                    f"Consensus crowding: {consensus_weight:.0f}% of portfolio in "
+                    f"LLM consensus top 20. Block further consensus additions until below 40%."
+                )
+    except Exception:
+        pass
+
     return flags
 
 

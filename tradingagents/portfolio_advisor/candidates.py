@@ -150,6 +150,15 @@ def evaluate_candidate(
     else:
         gates["catalyst"] = "pass" if catalyst_ok else "unknown"
 
+    # Consensus guardrail: hard gate (deepseek_divergence)
+    consensus_result, consensus_tags = _consensus_check(ticker)
+    gates["deepseek_divergence"] = consensus_result
+    if consensus_result == "fail_aligned":
+        failures.append("deepseek_aligned_with_public_consensus")
+
+    # Consensus soft signals
+    _attach_consensus_soft_signals(gates, ticker)
+
     full_graph_rating = str(data.get("full_graph_rating") or "").strip()
     priority = _priority(data.get("priority"))
     status: CandidateStatus
@@ -662,3 +671,63 @@ def run_promoted_candidate_pm_comparison(
 
     run_pm_cycle(cfg, trigger="candidate_comparison", extra_context=context)
     return len(promoted)
+
+
+# --- Consensus guardrail helpers ---
+
+def _consensus_check(ticker: str, deepseek_aligned_threshold: float = 0.65) -> tuple:
+    """Hard gate: fail if DeepSeek recommends a ticker that's in public consensus top 20.
+
+    Returns (result, tags) where result is one of:
+    - "fail_aligned": DeepSeek pick is in public consensus → block
+    - "pass_divergent": DeepSeek pick is NOT in consensus → allow
+    - "pass": ticker not in DeepSeek picks at all → allow
+    - "unknown": consensus snapshot unavailable → allow with caveat
+    """
+    try:
+        from tradingagents.dataflows.llm_consensus import load_llm_consensus_snapshot
+        consensus = load_llm_consensus_snapshot()
+    except Exception:
+        return "unknown", []
+
+    if consensus is None:
+        return "unknown", []
+
+    deepseek = consensus.get("deepseek_alignment", {})
+    deepseek_picks = set(deepseek.get("deepseek_last_recommended", []))
+    overlap = float(deepseek.get("overlap_with_top_20", 0) or 0)
+
+    if ticker in deepseek_picks and overlap >= deepseek_aligned_threshold:
+        return "fail_aligned", ["deepseek_aligned_with_public_consensus"]
+    if ticker in deepseek_picks:
+        return "pass_divergent", []
+    return "pass", []
+
+
+def _attach_consensus_soft_signals(gates: dict, ticker: str) -> None:
+    """Attach consensus and retail flow soft signals to the candidate gates dict."""
+    try:
+        from tradingagents.dataflows.llm_consensus import load_llm_consensus_snapshot
+        consensus = load_llm_consensus_snapshot()
+    except Exception:
+        consensus = None
+
+    try:
+        from tradingagents.dataflows.retail_flow_tracker import get_retail_flow_share
+        flow = get_retail_flow_share(ticker)
+    except Exception:
+        flow = None
+
+    soft: dict = {}
+    if consensus:
+        top_20 = {t["ticker"]: t for t in consensus.get("top_20", [])}
+        soft["in_consensus_top_20"] = ticker in top_20
+        if ticker in top_20:
+            soft["consensus_rank"] = top_20[ticker].get("rank")
+            soft["consensus_days_in"] = top_20[ticker].get("days_in_top_20")
+
+    if flow:
+        soft["retail_flow_share_30d"] = flow.get("share_30d")
+
+    if soft:
+        gates["consensus_soft"] = soft
