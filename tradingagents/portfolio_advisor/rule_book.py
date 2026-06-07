@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -272,6 +272,74 @@ def build_rule_book_prompt_block(cfg: Dict[str, Any]) -> str:
         rul = rl.group(1).strip().replace("\n", " ")[:160] if rl else "?"
         lines.append(f"  [{conf}|{confirmed}✓{violated}✗] {name}: when {pat} → {rul}")
     lines.append("")
+    return "\n".join(lines)
+
+
+def auto_retire_failed_rules(
+    cfg: Dict[str, Any],
+    *,
+    min_violations: int = 3,
+    violation_to_confirmation_ratio: float = 2.0,
+) -> List[str]:
+    """Retire rules where violations dominate confirmations.
+
+    A rule is retired when ALL of these hold:
+    - violations >= min_violations
+    - violations / max(confirmed, 1) >= violation_to_confirmation_ratio
+    - confidence is NOT already "retired"
+
+    Returns the list of rule names that were retired. Idempotent.
+    """
+    existing = load_rule_book_text(cfg)
+    rules = _parse_rules(existing)
+    retired: List[str] = []
+    for name, rule in rules.items():
+        if rule.get("confidence", "") == "retired":
+            continue
+        confirmed = int(rule.get("confirmed", 0)) if str(rule.get("confirmed", "0")).isdigit() else 0
+        violated = int(rule.get("violated", 0)) if str(rule.get("violated", "0")).isdigit() else 0
+        if violated < min_violations:
+            continue
+        ratio = violated / max(confirmed, 1)
+        if ratio >= violation_to_confirmation_ratio:
+            update_rule(
+                cfg, name=name, action="retire",
+                evidence_note=f"auto-retired: {violated}v vs {confirmed}c (ratio={ratio:.1f})",
+            )
+            retired.append(name)
+    return retired
+
+
+def recently_retired_block(cfg: Dict[str, Any], *, lookback_days: int = 14) -> str:
+    """Return a compact text block listing rules retired recently.
+
+    Empty string if no rules were retired within lookback_days.
+    """
+    existing = load_rule_book_text(cfg)
+    if not existing:
+        return ""
+    rules = _parse_rules(existing)
+    if not rules:
+        return ""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+    recent: List[Dict[str, Any]] = []
+    for name, rule in rules.items():
+        if rule.get("confidence", "") != "retired":
+            continue
+        raw = rule.get("_raw", "")
+        # Find the most recent retirement date from evidence notes
+        m = re.findall(r"\[retired (\d{4}-\d{2}-\d{2})\]", raw)
+        if not m:
+            continue
+        last_retired = max(m)
+        if last_retired >= cutoff:
+            recent.append({"name": name, "date": last_retired})
+    if not recent:
+        return ""
+    recent.sort(key=lambda r: r["date"], reverse=True)
+    lines = [f"Recently retired rules (last {lookback_days}d):"]
+    for r in recent:
+        lines.append(f"  [{r['date']}] {r['name']} — auto-retired due to excess violations")
     return "\n".join(lines)
 
 

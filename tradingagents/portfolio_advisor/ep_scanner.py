@@ -77,8 +77,8 @@ def _parse_av_time(ts: str) -> Optional[datetime]:
         return None
 
 
-def _pull_news(today: date, look_back_days: int = 2, limit: int = 200) -> List[Dict[str, Any]]:
-    """Pull recent global news from Alpha Vantage. Returns parsed feed list."""
+def _pull_news_alpha_vantage(today: date, look_back_days: int, limit: int) -> List[Dict[str, Any]]:
+    """Pull from Alpha Vantage. Returns parsed feed list. Empty on failure."""
     try:
         from tradingagents.dataflows.alpha_vantage_news import get_global_news
         raw = get_global_news(today.isoformat(), look_back_days=look_back_days, limit=limit)
@@ -88,6 +88,68 @@ def _pull_news(today: date, look_back_days: int = 2, limit: int = 200) -> List[D
     except Exception as e:
         logger.warning("Alpha Vantage news fetch failed: %s", e)
         return []
+
+
+def _pull_news_yahoo_rss(today: date, look_back_days: int, limit: int) -> List[Dict[str, Any]]:
+    """Pull from Yahoo Finance RSS. Returns parsed feed list. Empty on failure."""
+    try:
+        from tradingagents.dataflows.yahoo_news_rss import get_market_news
+        return get_market_news(today, look_back_days=look_back_days, limit=limit)
+    except Exception as e:
+        logger.warning("Yahoo Finance RSS fetch failed: %s", e)
+        return []
+
+
+_NEWS_SOURCE_REGISTRY = {
+    "alpha_vantage": _pull_news_alpha_vantage,
+    "yahoo_finance_rss": _pull_news_yahoo_rss,
+}
+
+
+def _pull_news(
+    today: date,
+    look_back_days: int = 2,
+    limit: int = 200,
+    sources: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Pull news from one or more configured sources and dedupe.
+
+    Sources are resolved via the _NEWS_SOURCE_REGISTRY. Unknown source names
+    are skipped with a warning. Items are deduped by URL; if URLs are missing,
+    falls back to (source, title) dedupe. Default is Alpha Vantage only,
+    preserving previous behaviour for any caller that does not pass `sources`.
+    """
+    if sources is None:
+        sources = ["alpha_vantage"]
+
+    combined: List[Dict[str, Any]] = []
+    for src in sources:
+        fetcher = _NEWS_SOURCE_REGISTRY.get(src)
+        if fetcher is None:
+            logger.warning("Unknown EP scanner news source: %s", src)
+            continue
+        feed = fetcher(today, look_back_days, limit)
+        combined.extend(feed)
+
+    # Dedupe by URL (preferred) or by (source, title) fallback.
+    seen_urls: set = set()
+    seen_keys: set = set()
+    deduped: List[Dict[str, Any]] = []
+    for item in combined:
+        url = (item.get("url") or "").strip()
+        if url:
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+            deduped.append(item)
+            continue
+        key = (item.get("source", ""), item.get("title", ""))
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        deduped.append(item)
+
+    return deduped[:limit]
 
 
 def _bucket_by_ticker(feed: List[Dict[str, Any]]) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, int]]:
@@ -223,7 +285,10 @@ def scan_for_ep_candidates(
         }
     """
     today = date.today()
-    feed = _pull_news(today, look_back_days=look_back_days, limit=news_limit)
+    news_sources = cfg.get("ep_scanner_news_sources") or ["alpha_vantage"]
+    if isinstance(news_sources, str):
+        news_sources = [news_sources]
+    feed = _pull_news(today, look_back_days=look_back_days, limit=news_limit, sources=news_sources)
     hits, hint_summary = _bucket_by_ticker(feed)
     market = _market_disqualifiers()
 
