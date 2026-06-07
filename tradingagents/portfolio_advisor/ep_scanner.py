@@ -90,27 +90,38 @@ def _pull_news(today: date, look_back_days: int = 2, limit: int = 200) -> List[D
         return []
 
 
-def _bucket_by_ticker(feed: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    """Surface one record per ticker: best hint tier + most-relevant headline."""
+def _bucket_by_ticker(feed: List[Dict[str, Any]]) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, int]]:
+    """Surface one record per ticker: best hint tier + most-relevant headline.
+
+    Returns (bucketed, hint_summary) where hint_summary counts news items by
+    classification: disq, no_hint, foreign_ticker_skip, low_relevance_skip, bucketed.
+    """
     out: Dict[str, Dict[str, Any]] = {}
     tier_rank = {"tier1": 3, "tier2": 2, None: 1, "disq": 0}
+    hint_summary: Dict[str, int] = {"disq": 0, "no_hint": 0, "foreign": 0, "low_rel": 0, "bucketed_events": 0}
     for item in feed:
         title = str(item.get("title") or "")
         summary = str(item.get("summary") or "")
         blob = f"{title} {summary}"
         hint = _classify_hint(blob)
-        if hint == "disq" or hint is None:
+        if hint == "disq":
+            hint_summary["disq"] += 1
+            continue
+        if hint is None:
+            hint_summary["no_hint"] += 1
             continue
         tickers = item.get("ticker_sentiment") or []
         for ts in tickers:
             tk = str(ts.get("ticker") or "").strip().upper()
             if not tk or "." in tk or ":" in tk:  # skip foreign listings
+                hint_summary["foreign"] += 1
                 continue
             try:
                 rel = float(ts.get("relevance_score") or 0.0)
             except (ValueError, TypeError):
                 rel = 0.0
             if rel < 0.3:
+                hint_summary["low_rel"] += 1
                 continue
             prev = out.get(tk)
             if (
@@ -129,7 +140,8 @@ def _bucket_by_ticker(feed: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
                     "url": str(item.get("url") or ""),
                     "time_published": str(item.get("time_published") or ""),
                 }
-    return out
+                hint_summary["bucketed_events"] += 1
+    return out, hint_summary
 
 
 def _yf_quote(ticker: str) -> Optional[Dict[str, Any]]:
@@ -212,11 +224,13 @@ def scan_for_ep_candidates(
     """
     today = date.today()
     feed = _pull_news(today, look_back_days=look_back_days, limit=news_limit)
-    hits = _bucket_by_ticker(feed)
+    hits, hint_summary = _bucket_by_ticker(feed)
     market = _market_disqualifiers()
 
     candidates: List[Dict[str, Any]] = []
     skipped: List[Dict[str, Any]] = []
+    # Per-candidate gate audit trail for diagnostic use.
+    gate_log: List[Dict[str, Any]] = []
     holdings: set = set()
     try:
         from tradingagents.portfolio_advisor import etoro_scan
@@ -234,42 +248,74 @@ def scan_for_ep_candidates(
 
     for h in ranked[: max_candidates * 3]:  # over-pull for filter rejections
         tk = h["ticker"]
+        gate = {"t": tk, "hint": h["hint"], "title": h["title"][:120],
+                "relevance": h["relevance"]}
+        # Gate 1: already holding
         if tk in holdings:
+            gate["failed_at"] = "holding"
+            gate_log.append(gate)
             skipped.append({"ticker": tk, "reason": "already a current holding"})
             continue
+        # Gate 2: price data
         q = _yf_quote(tk)
         if not q:
+            gate["failed_at"] = "no_price_data"
+            gate_log.append(gate)
             skipped.append({"ticker": tk, "reason": "no price data"})
             continue
+        gate["close"] = round(q["close"], 2)
+        gate["open"] = round(q["open"], 2)
+        gate["prev_close"] = round(q["prev_close"], 2)
+        # Gate 3: min price
         if q["close"] < _MIN_PRICE:
+            gate["failed_at"] = "min_price"
+            gate["threshold"] = _MIN_PRICE
+            gate_log.append(gate)
             skipped.append({"ticker": tk, "reason": f"price ${q['close']:.2f} < ${_MIN_PRICE}"})
             continue
         gap_pct = (q["open"] / q["prev_close"] - 1.0) * 100.0 if q["prev_close"] else 0.0
         # Catalyst-day gap OR a recent strong move that may have started yesterday.
         recent_move_pct = (q["close"] / q["prev_close"] - 1.0) * 100.0 if q["prev_close"] else 0.0
         effective_gap = max(gap_pct, recent_move_pct)
+        gate["gap_pct"] = round(gap_pct, 2)
+        gate["move_pct"] = round(recent_move_pct, 2)
+        # Gate 4: gap threshold
         if effective_gap < _MIN_GAP_PCT:
+            gate["failed_at"] = "gap"
+            gate["threshold"] = _MIN_GAP_PCT
+            gate["effective_gap"] = round(effective_gap, 2)
+            gate_log.append(gate)
             skipped.append({
                 "ticker": tk,
                 "reason": f"gap {gap_pct:.1f}% / move {recent_move_pct:.1f}% < {_MIN_GAP_PCT}% (Section 4.1)",
             })
             continue
-        # Section 10 extended-run check.
+        # Gate 5: extended-run check (Section 10).
         if q.get("close_10d_ago"):
             run10 = (q["close"] / q["close_10d_ago"] - 1.0) * 100.0
+            gate["run10d_pct"] = round(run10, 2)
             if run10 > _EXTENDED_THRESHOLD_PCT:
+                gate["failed_at"] = "extended_run"
+                gate["threshold"] = _EXTENDED_THRESHOLD_PCT
+                gate_log.append(gate)
                 skipped.append({
                     "ticker": tk,
                     "reason": f"up {run10:.0f}% in 10 sessions > {_EXTENDED_THRESHOLD_PCT}% (Section 10 extended)",
                 })
                 continue
-        # Post-close gate: close must hold above the 10% gap level (Section 5.2).
+        # Gate 6: post-close hold (Section 5.2).
         if post_close and recent_move_pct < _MIN_GAP_PCT:
+            gate["failed_at"] = "post_close_hold"
+            gate["threshold"] = _MIN_GAP_PCT
+            gate_log.append(gate)
             skipped.append({
                 "ticker": tk,
                 "reason": f"close {recent_move_pct:.1f}% < {_MIN_GAP_PCT}% gap — gap did not hold through close (Section 5.2)",
             })
             continue
+        # Passed all gates.
+        gate["passed"] = True
+        gate_log.append(gate)
         candidates.append({
             "ticker": tk,
             "hint": h["hint"],
@@ -293,9 +339,11 @@ def scan_for_ep_candidates(
         "scan_mode": "post_close" if post_close else "pre_market",
         "news_items": len(feed),
         "ticker_hits": len(hits),
+        "hint_summary": hint_summary,
         "market": market,
         "candidates": candidates,
         "skipped": skipped,
+        "gate_log": gate_log,
     }
 
 

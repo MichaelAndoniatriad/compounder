@@ -2414,11 +2414,14 @@ def run_ep_scan_cycle(cfg: Dict[str, Any], *, post_close: bool = False) -> "Advi
         with path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps({
                 "scanned_at": scan.get("scanned_at"),
+                "scan_mode": scan.get("scan_mode", "pre_market"),
                 "news_items": scan.get("news_items"),
                 "ticker_hits": scan.get("ticker_hits"),
+                "hint_summary": scan.get("hint_summary", {}),
                 "market": scan.get("market"),
                 "candidates": [c.get("ticker") for c in scan.get("candidates") or []],
                 "skipped": [{"t": s["ticker"], "r": s["reason"]} for s in (scan.get("skipped") or [])[:30]],
+                "gate_log": scan.get("gate_log", []),
             }, ensure_ascii=False) + "\n")
     except Exception:
         logger.debug("ep_scan: failed to append run log", exc_info=True)
