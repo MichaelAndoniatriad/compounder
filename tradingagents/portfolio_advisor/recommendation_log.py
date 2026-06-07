@@ -31,7 +31,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -104,6 +104,47 @@ def load_measured(cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Return all recommendations with measured outcomes."""
     rows = _load_all(cfg)
     return [r for r in rows if r.get("was_correct") is not None]
+
+
+def load_due_for_measurement(
+    cfg: Dict[str, Any],
+    *,
+    default_horizon_days: int = 30,
+) -> List[Dict[str, Any]]:
+    """Return recommendations past their exit horizon that still need measurement.
+
+    An entry is due when:
+    - Its outcome has not been measured yet (outcome_measured_at is None)
+    - Its timestamp is at least its exit_horizon_days (or the default) in the past
+    - It has a ticker (outcomes need price data)
+
+    Idempotent: already-measured entries are excluded, so re-running the weekly
+    job does not double-count.
+    """
+    rows = _load_all(cfg)
+    now = datetime.now(timezone.utc)
+    due: List[Dict[str, Any]] = []
+    for r in rows:
+        if r.get("outcome_measured_at") is not None:
+            continue
+        if r.get("was_correct") is not None:
+            continue
+        ticker = r.get("ticker")
+        if not ticker:
+            continue
+        ts_str = r.get("ts", "")
+        try:
+            ts = datetime.fromisoformat(ts_str)
+        except (TypeError, ValueError):
+            continue
+        horizon = r.get("exit_horizon_days") or default_horizon_days
+        try:
+            horizon = int(horizon)
+        except (TypeError, ValueError):
+            horizon = default_horizon_days
+        if (now - ts) >= timedelta(days=horizon):
+            due.append(r)
+    return due
 
 
 def update_outcome(
