@@ -310,5 +310,35 @@ def run_core_discovery(cfg: Dict[str, Any]) -> str:
         logger.warning("core discovery send failed: %s", e)
         return f"Core discovery complete but send failed: {e}"
 
+    # Phase 5: Push picks into PM watchlist so the PM can factor them into
+    # sleeve allocation and queue research without manual relay.
+    try:
+        from tradingagents.portfolio_advisor.watchlist import load_watchlist, save_watchlist
+
+        wl = load_watchlist(cfg)
+        existing = {
+            (e if isinstance(e, str) else e.get("ticker", "")).strip().upper()
+            for e in wl
+        }
+        added = 0
+        for pick in picks:
+            ticker = pick["ticker"]
+            if ticker in existing:
+                continue
+            thesis = pick.get("thesis", "")
+            wl.append({
+                "ticker": ticker,
+                "thesis": thesis,
+                "strategy": "core",
+                "source": "core_discovery",
+                "added": today,
+            })
+            added += 1
+        if added:
+            save_watchlist(cfg, wl)
+            logger.info("core discovery: added %d candidates to PM watchlist", added)
+    except Exception as e:
+        logger.warning("core discovery: watchlist update failed: %s", e)
+
     logger.info("core discovery: complete (%.1fs total)", time.monotonic() - t0)
     return f"Core discovery: {len(picks)} candidates sent via Telegram"
