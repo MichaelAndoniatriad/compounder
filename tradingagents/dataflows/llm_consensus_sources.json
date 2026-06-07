@@ -1,0 +1,8 @@
+{
+  "sources": [
+    {"name": "insider_monkey", "url": "https://www.insidermonkey.com/?s=AI+stock+portfolio", "parser": "insider_monkey"},
+    {"name": "yahoo_ai", "url": "https://finance.yahoo.com/topic/ai-stocks/", "parser": "yahoo"},
+    {"name": "us_news", "url": "https://money.usnews.com/investing/articles/ai-stocks-to-buy", "parser": "us_news"},
+    {"name": "barchart", "url": "https://www.barchart.com/stocks/signals/hot-stocks", "parser": "barchart"}
+  ]
+}
