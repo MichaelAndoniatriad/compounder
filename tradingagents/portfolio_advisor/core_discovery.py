@@ -189,6 +189,7 @@ def _quantitative_screen(tickers: List[str]) -> List[Dict[str, Any]]:
                 "price": info.get("currentPrice", 0),
                 "fwd_pe": info.get("forwardPE", 0),
                 "debt_equity": info.get("debtToEquity", 0) or 0,
+                "summary": (info.get("longBusinessSummary") or "")[:400],
             })
         except Exception:
             continue
@@ -224,12 +225,17 @@ def _llm_qualitative_rank(candidates: List[Dict], cfg: Dict[str, Any]) -> List[D
     for c in candidates[:30]:
         peg_str = str(c["peg"]) if c.get("peg") is not None else "n/a"
         lines.append(
-            f"{c['ticker']} | score={c.get('score', 0)} | "
+            f"{c['ticker']} ({c.get('name','')}) — "
             f"{c['sector']}/{c.get('industry','')} | "
             f"rev_growth={c['rev_growth']}% | PEG={peg_str} | "
             f"ROIC={c['roic']}% | gross_margin={c.get('gross_margin', 0)}% | "
-            f"fwd_PE={c['fwd_pe']} | D/E={c.get('debt_equity', 0)}"
+            f"fwd_PE={c['fwd_pe']} | D/E={c.get('debt_equity', 0)} | "
+            f"score={c.get('score', 0)}"
         )
+        summary = c.get("summary", "")
+        if summary:
+            lines.append(f"  {summary}")
+        lines.append("")
     cand_text = "\n".join(lines)
 
     # Build current holdings context
