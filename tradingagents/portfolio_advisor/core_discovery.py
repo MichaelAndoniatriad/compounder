@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -348,6 +348,42 @@ def _llm_qualitative_rank(candidates: List[Dict], cfg: Dict[str, Any]) -> List[D
     return [] if selected else _pick_top_5(candidates)
 
 
+def _load_weekly_cache(week_key: str) -> Optional[List[Dict]]:
+    """Return cached picks if they exist for this week and quant results match."""
+    from pathlib import Path as _Path
+    from datetime import datetime as _dt
+    cache_path = _Path.home() / ".tradingagents" / "cache" / f"core_discovery_picks_{_dt.now(timezone.utc).strftime('%Y-W%W')}.json"
+    if not cache_path.is_file():
+        return None
+    try:
+        cached = json.loads(cache_path.read_text(encoding="utf-8"))
+        if cached.get("week_key") == week_key:
+            logger.info("core discovery: using cached picks from earlier this week (%d picks)", len(cached.get("picks", [])))
+            return cached["picks"]
+    except (OSError, json.JSONDecodeError, KeyError):
+        pass
+    return None
+
+
+def _save_weekly_cache(week_key: str, picks: List[Dict]) -> None:
+    """Cache picks for the rest of the week so repeated runs return same results."""
+    from pathlib import Path as _Path
+    from datetime import datetime as _dt
+    cache_path = _Path.home() / ".tradingagents" / "cache" / f"core_discovery_picks_{_dt.now(timezone.utc).strftime('%Y-W%W')}.json"
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    slim = [{
+        "ticker": p["ticker"], "name": p.get("name", ""), "sector": p.get("sector", ""),
+        "rev_growth": p.get("rev_growth"), "roic": p.get("roic"), "peg": p.get("peg"),
+        "score": p.get("score"), "conviction": p.get("conviction"), "deep_dive": p.get("deep_dive"),
+        "thesis": p.get("thesis", ""), "gross_margin": p.get("gross_margin"),
+        "fwd_pe": p.get("fwd_pe"), "debt_equity": p.get("debt_equity"),
+    } for p in picks]
+    tmp = cache_path.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"week_key": week_key, "picks": slim}, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(cache_path)
+    logger.info("core discovery: cached %d picks for the week", len(picks))
+
+
 def _pick_top_5(candidates: List[Dict]) -> List[Dict]:
     """Fallback: pick top 5 by composite score when LLM unavailable."""
     return sorted(candidates, key=lambda c: c.get("score", 0), reverse=True)[:5]
@@ -383,8 +419,13 @@ def run_core_discovery(cfg: Dict[str, Any]) -> str:
         return "Core discovery: no tickers passed quantitative filters this week."
     logger.info("core discovery: %d passed quantitative screen (%.1fs)", len(quant_pass), t3 - t2)
 
-    # Phase 3: LLM qualitative rank
-    picks = _llm_qualitative_rank(quant_pass, cfg)
+    # Phase 3: LLM qualitative rank (cache makes it deterministic within a week)
+    week_key = f"{today}_{len(quant_pass)}"
+    picks = _load_weekly_cache(week_key)
+    if picks is None:
+        picks = _llm_qualitative_rank(quant_pass, cfg)
+        if picks:
+            _save_weekly_cache(week_key, picks)
     t4 = time.monotonic()
 
     # Phase 4: Build Telegram message
