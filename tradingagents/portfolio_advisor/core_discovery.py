@@ -374,7 +374,7 @@ def run_core_discovery(cfg: Dict[str, Any]) -> str:
     try:
         from tradingagents.portfolio_advisor.messaging import send_advisor_message
         send_advisor_message(
-            cfg, "Core Discovery", body, urgent=False,
+            cfg, "Core Discovery", body, urgent=True,
             log_as_recommendation=True,
             rec_trigger="core_discovery",
             rec_type="core_candidate",
