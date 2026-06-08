@@ -251,24 +251,20 @@ def _llm_qualitative_rank(candidates: List[Dict], cfg: Dict[str, Any]) -> List[D
         pass
 
     prompt = (
-        "You are screening for long-term growth stocks for a concentrated portfolio. "
-        "From the candidates below, identify up to 5 that best fit ALL of:\n"
-        "- Durable competitive moat (network effects, switching costs, scale economies)\n"
-        "- Strong operator with skin in the game\n"
-        "- Secular tailwind, not cyclical demand\n"
-        "- No red flags: cash flow roughly tracks GAAP earnings, limited dilution, "
-        "debt manageable, growth not decelerating\n\n"
+        "You are screening stocks for a concentrated growth portfolio. "
+        "From the candidates below, pick up to 5 that have the best long-term compounding potential. "
+        "Prioritise: durable competitive moat, founder-led or strong operator, secular tailwind, "
+        "and clean financials (cash flow tracks earnings, limited dilution, manageable debt, "
+        "growth not decelerating).\n\n"
         f"Candidates:\n{cand_text}\n"
         f"{holdings_text}\n\n"
         "Return EXACTLY one line per pick. Format each line as:\n"
-        "TICKER — CONVICTION (High/Medium) — STATUS (new/overlap) — one-sentence thesis\n\n"
-        "Example:\n"
-        "DDOG — CONVICTION High — OVERLAP (already held) — Observability platform with "
-        "durable switching costs; founder-led, profitable, no red flags.\n\n"
-        "Return up to 5 tickers, ranked by conviction (highest first). "
-        "If a stock was likely recommended before but still qualifies, note it as "
-        "'repeat but thesis intact'. Include only tickers from the list above. "
-        "Do not number the lines or add commentary."
+        "TICKER — CONVICTION (High/Medium) — STATUS (new/overlap/repeat) — punchy one-line thesis\n\n"
+        "The thesis should be direct and specific. Bad: 'Software company with strong growth.' "
+        "Good: 'Observability platform with sticky enterprise contracts; founder-led, 30%+ FCF margins, "
+        "no debt.'\n\n"
+        "Return up to 5 tickers, highest conviction first. Only include tickers from the list above. "
+        "No numbering, no commentary outside the format.\n"
     )
 
     try:
@@ -345,28 +341,51 @@ def run_core_discovery(cfg: Dict[str, Any]) -> str:
         return "Core discovery: LLM filter returned no picks."
 
     # Phase 4: Build Telegram message
+    top_pick = picks[0]
+    top_thesis = top_pick.get("thesis", "").split("—")[-1].strip() if "—" in top_pick.get("thesis", "") else ""
+
     lines = [
-        "CORE POSITION DISCOVERY",
-        f"Week of {today}",
-        "",
-        f"Screened {len(universe) + total_rejected} tickers (S&P 500 + NASDAQ 100). "
-        f"{total_rejected} eliminated by mechanical filters, "
-        f"{len(quant_pass)} passed quantitative screen. "
-        f"Top picks after qualitative review:",
+        f"Screened {len(universe) + total_rejected} names this week — {len(quant_pass)} made it past the numbers, and these {len(picks)} came out on top after qualitative review.",
         "",
     ]
 
     for i, pick in enumerate(picks, 1):
+        thesis_line = pick.get("thesis", "")
+        # Parse the LLM output format: TICKER — CONVICTION X — STATUS — thesis
+        parts = thesis_line.split("—") if "—" in thesis_line else [thesis_line]
+        conviction = ""
+        status = ""
+        thesis = ""
+        if len(parts) >= 2:
+            conviction = parts[1].strip()
+        if len(parts) >= 3:
+            status = parts[2].strip()
+        if len(parts) >= 4:
+            thesis = "—".join(parts[3:]).strip()
+        else:
+            thesis = thesis_line
+
+        label = ""
+        if "overlap" in status.lower():
+            label = " (already held)"
+        elif "repeat" in status.lower():
+            label = " (repeat, thesis intact)"
+
+        lines.append(f"{i}. {pick['ticker']}{label} — {thesis}")
         lines.append(
-            f"{i}. {pick['ticker']} ({pick['name']}) — "
-            f"{pick['sector']} | rev_growth={pick['rev_growth']}% | "
-            f"ROIC={pick['roic']}% | PEG={pick['peg']}"
+            f"   {pick['sector']} | rev_growth {pick['rev_growth']}% | "
+            f"ROIC {pick['roic']}% | PEG {pick['peg']} | score {pick.get('score', 0):.2f}"
         )
-        if "thesis" in pick:
-            lines.append(f"   {pick['thesis']}")
         lines.append("")
 
-    lines.append("Reply with a ticker to deep-dive. Say 'skip' to pass.")
+    # Lead recommendation based on top pick
+    top_ticker = top_pick["ticker"]
+    lines.append(
+        f"Top pick is {top_ticker}. I am adding all {len(picks)} to the PM watchlist "
+        f"so they factor into the next sleeve allocation. Research queued on the top two. "
+        f"If any of these overlap with current holdings, the PM already knows and will "
+        f"flag sizing or thesis updates in the next cycle."
+    )
 
     body = "\n".join(lines)
 
