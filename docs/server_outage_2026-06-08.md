@@ -55,3 +55,9 @@ Same as 7 June:
 5. Verify fail2ban status, re-enable if needed
 6. Reboot into normal mode
 7. Run AV migration verification
+
+## Polling results
+
+30 attempts at 60-second intervals from 17:49 to 18:18 UTC (BST 18:49–19:18).
+Zero successful pings. Server confirmed hard-down as of 8 June 18:18 UTC.
+Outage duration: at least 21.5 hours (from ~20:45 UTC 7 June).
