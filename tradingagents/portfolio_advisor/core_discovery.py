@@ -15,10 +15,19 @@ from typing import Any, Dict, List
 logger = logging.getLogger(__name__)
 
 # Quantitative pre-buy filters
-MIN_MARKET_CAP = 1_000_000_000  # $1B
-MIN_REVENUE_GROWTH = 0.20  # 20% YoY
-MAX_PEG = 1.5
-MIN_ROIC = 0.15  # 15%
+# Only market cap is a hard gate. The rest contribute to a composite score so
+# strong-on-most / weak-on-one names survive the funnel into LLM ranking.
+# The 4-hard-filter version produced zero candidates in the 7 Jun 2026 run.
+MIN_MARKET_CAP = 1_000_000_000  # $1B — the only hard gate
+SURVIVOR_SCORE = 0.55  # composite threshold to graduate to LLM ranking
+
+# Tier breakpoints (each contributes points to the composite)
+_GROWTH_TIERS = [(0.20, 0.35), (0.15, 0.25), (0.10, 0.15), (0.05, 0.07)]
+_PEG_TIERS = [(1.5, 0.25), (2.0, 0.18), (3.0, 0.10), (5.0, 0.04)]
+_ROIC_TIERS = [(0.20, 0.25), (0.15, 0.20), (0.10, 0.12), (0.07, 0.06)]
+_GROSS_MARGIN_TIERS = [(0.50, 0.15), (0.35, 0.10), (0.25, 0.05)]
+_COMBO_BONUS_THRESHOLD = (0.20, 0.15, 1.5)  # rev_growth, roic, peg
+_COMBO_BONUS_POINTS = 0.15
 
 
 def _build_universe() -> List[str]:
@@ -85,8 +94,65 @@ def _build_universe() -> List[str]:
     return sorted(tickers)
 
 
+def _score_quantitative(info: Dict[str, Any]) -> float:
+    """Composite quality score [0.0, 1.0] from yfinance info dict.
+
+    Each criterion contributes points by tier. Names that are strong on most
+    criteria but weak on one still survive. Names below the minimum cap are
+    returned as 0 (hard gate handled by caller).
+    """
+    market_cap = info.get("marketCap", 0) or 0
+    if market_cap < MIN_MARKET_CAP:
+        return 0.0
+
+    rev_growth = info.get("revenueGrowth", 0) or 0
+    peg = info.get("pegRatio", 999) or 999
+    # yfinance does not expose returnOnCapital reliably; fall back to ROE.
+    # ROE is not identical to ROIC but is close enough for first pass screening
+    # and is consistently populated by yfinance.
+    roic = info.get("returnOnCapital") or info.get("returnOnEquity") or 0
+    gross_margin = info.get("grossMargins", 0) or 0
+
+    score = 0.0
+    # Revenue growth tier
+    for threshold, points in _GROWTH_TIERS:
+        if rev_growth >= threshold:
+            score += points
+            break
+    # PEG tier (lower is better; we step down)
+    for threshold, points in _PEG_TIERS:
+        if peg <= threshold:
+            score += points
+            break
+    # ROIC tier
+    for threshold, points in _ROIC_TIERS:
+        if roic >= threshold:
+            score += points
+            break
+    # Gross margin tier (quality proxy)
+    for threshold, points in _GROSS_MARGIN_TIERS:
+        if gross_margin >= threshold:
+            score += points
+            break
+    # Rare-combination bonus: strong growth AND capital efficient AND not richly valued
+    if (
+        rev_growth >= _COMBO_BONUS_THRESHOLD[0]
+        and roic >= _COMBO_BONUS_THRESHOLD[1]
+        and peg <= _COMBO_BONUS_THRESHOLD[2]
+    ):
+        score += _COMBO_BONUS_POINTS
+
+    return min(score, 1.0)
+
+
 def _quantitative_screen(tickers: List[str]) -> List[Dict[str, Any]]:
-    """Filter tickers by quantitative pre-buy criteria. Returns passing records."""
+    """Score every ticker and return those above SURVIVOR_SCORE.
+
+    Hard gate: market cap >= MIN_MARKET_CAP. Everything else is tiered into
+    the composite score. Threshold is SURVIVOR_SCORE. A name with strong
+    growth + decent ROIC + acceptable PEG will clear it even if one metric
+    is missing or weak; a name that is merely large will not.
+    """
     import yfinance as yf
 
     passing = []
@@ -101,25 +167,23 @@ def _quantitative_screen(tickers: List[str]) -> List[Dict[str, Any]]:
             if market_cap < MIN_MARKET_CAP:
                 continue
 
+            score = _score_quantitative(info)
+            if score < SURVIVOR_SCORE:
+                continue
+
             rev_growth = info.get("revenueGrowth", 0) or 0
-            if rev_growth < MIN_REVENUE_GROWTH:
-                continue
-
             peg = info.get("pegRatio", 999) or 999
-            if peg > MAX_PEG:
-                continue
-
-            roic = info.get("returnOnCapital", 0) or 0
-            if roic < MIN_ROIC:
-                continue
+            roic = info.get("returnOnCapital") or info.get("returnOnEquity") or 0
 
             passing.append({
                 "ticker": ticker,
                 "name": info.get("shortName", ticker),
                 "market_cap_b": round(market_cap / 1e9, 1),
                 "rev_growth": round(rev_growth * 100, 1),
-                "peg": round(peg, 1),
+                "peg": round(peg, 1) if peg < 999 else None,
                 "roic": round(roic * 100, 1),
+                "gross_margin": round(float(info.get("grossMargins", 0) or 0) * 100, 1),
+                "score": round(score, 3),
                 "sector": info.get("sector", ""),
                 "industry": info.get("industry", ""),
                 "price": info.get("currentPrice", 0),
@@ -129,6 +193,8 @@ def _quantitative_screen(tickers: List[str]) -> List[Dict[str, Any]]:
         except Exception:
             continue
 
+    # Rank by score descending so the LLM sees the best candidates first
+    passing.sort(key=lambda c: c["score"], reverse=True)
     return passing
 
 
@@ -156,11 +222,13 @@ def _llm_qualitative_rank(candidates: List[Dict], cfg: Dict[str, Any]) -> List[D
     # Build compact candidate table for the LLM
     lines = []
     for c in candidates[:30]:
+        peg_str = str(c["peg"]) if c.get("peg") is not None else "n/a"
         lines.append(
-            f"{c['ticker']} | {c['sector']}/{c.get('industry','')} | "
-            f"rev_growth={c['rev_growth']}% | PEG={c['peg']} | "
-            f"ROIC={c['roic']}% | fwd_PE={c['fwd_pe']} | "
-            f"D/E={c.get('debt_equity',0)}"
+            f"{c['ticker']} | score={c.get('score', 0)} | "
+            f"{c['sector']}/{c.get('industry','')} | "
+            f"rev_growth={c['rev_growth']}% | PEG={peg_str} | "
+            f"ROIC={c['roic']}% | gross_margin={c.get('gross_margin', 0)}% | "
+            f"fwd_PE={c['fwd_pe']} | D/E={c.get('debt_equity', 0)}"
         )
     cand_text = "\n".join(lines)
 
@@ -236,8 +304,8 @@ def _llm_qualitative_rank(candidates: List[Dict], cfg: Dict[str, Any]) -> List[D
 
 
 def _pick_top_5(candidates: List[Dict]) -> List[Dict]:
-    """Fallback: pick top 5 by ROIC when LLM unavailable."""
-    return sorted(candidates, key=lambda c: c["roic"], reverse=True)[:5]
+    """Fallback: pick top 5 by composite score when LLM unavailable."""
+    return sorted(candidates, key=lambda c: c.get("score", 0), reverse=True)[:5]
 
 
 def run_core_discovery(cfg: Dict[str, Any]) -> str:

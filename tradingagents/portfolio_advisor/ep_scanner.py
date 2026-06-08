@@ -26,19 +26,41 @@ logger = logging.getLogger(__name__)
 # Section 3 catalyst-keyword hints. The LLM does final classification; these
 # only decide which news items are worth fetching ticker-level data for.
 _TIER1_HINTS = re.compile(
-    r"\b(fda approval|fda approves|phase 3|positive (top-?line|topline)|"
-    r"raises (full[- ]year )?guidance|guidance raise|guidance hike|"
+    # Strict catalyst phrasing (the original wire-service vocabulary)
+    r"\b(fda approval|fda approves|fda grants|fda clears|"
+    r"phase 3|phase 2/3|positive (top-?line|topline)|trial (success|met endpoint)|"
+    r"raises (full[- ]year )?guidance|guidance raise|guidance hike|guidance lift|"
+    r"raises (outlook|forecast)|upbeat (outlook|forecast)|"
     r"beats (eps|revenue|earnings)|tops estimates|exceeds estimates|"
-    r"contract (win|award)|landmark deal|strategic partnership|anchor partner|"
+    r"record (revenue|quarter|earnings)|blowout (quarter|results)|"
+    r"contract (win|award)|wins (major|big|landmark) (contract|deal)|"
+    r"secures (major|big)? ?contract|secures (deal|partnership)|"
+    r"landmark deal|strategic partnership|anchor partner|"
     r"activist (stake|campaign)|13d filed|tender offer|to acquire|acquisition of|"
-    r"announces acquisition|buyout offer|deal to buy|all[- ]cash deal)\b",
+    r"announces acquisition|buyout offer|deal to buy|all[- ]cash deal|"
+    # Looser phrasings that wire services and aggregators actually use.
+    # Patterns tightened to avoid common false positives like
+    # "reports profit warning" (would have matched a bare "reports profit").
+    r"reports strong quarter(ly)?|delivers? strong quarter(ly)?|"
+    r"surges? on (results|earnings|beat)|jumps? on (earnings|guidance|beat)|"
+    r"reports (strong|record|stronger[- ]than[- ]expected) (results|revenue|earnings|quarter)|"
+    r"approval (granted|received)|regulatory approval|"
+    r"reports record profit|profit (surges?|jumps?)|swings? to profit)\b",
     re.IGNORECASE,
 )
 _TIER2_HINTS = re.compile(
     r"\b(beats earnings|earnings beat|tops estimates|"
-    r"raised to (overweight|buy)|upgraded to (overweight|buy)|"
-    r"price target (raised|hiked|increased)|insider buying|insiders bought|"
-    r"sector tailwind|cluster buy)\b",
+    r"raised to (overweight|buy|outperform)|upgraded to (overweight|buy|outperform)|"
+    r"price target (raised|hiked|increased|lifted)|target (raised|hiked|lifted)|"
+    r"insider buying|insiders bought|"
+    r"sector tailwind|cluster buy|"
+    # Broader Tier 2 phrasings
+    r"better[- ]than[- ]expected (results|revenue|earnings)|"
+    r"narrow(er|s) loss|reduces? loss|"
+    r"raises (price target|estimate)|estimates (raised|hiked)|"
+    r"reports (q[1-4]|first|second|third|fourth) quarter|"
+    r"announces? (record|strong) (results|growth)|"
+    r"orders surge|demand (jumps?|surges?|accelerates?))\b",
     re.IGNORECASE,
 )
 _DISQ_HINTS = re.compile(
