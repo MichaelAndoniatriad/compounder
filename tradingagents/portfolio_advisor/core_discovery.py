@@ -148,19 +148,21 @@ def _score_quantitative(info: Dict[str, Any]) -> float:
 def _quantitative_screen(tickers: List[str]) -> List[Dict[str, Any]]:
     """Score every ticker and return those above SURVIVOR_SCORE.
 
-    Hard gate: market cap >= MIN_MARKET_CAP. Everything else is tiered into
-    the composite score. Threshold is SURVIVOR_SCORE. A name with strong
-    growth + decent ROIC + acceptable PEG will clear it even if one metric
-    is missing or weak; a name that is merely large will not.
+    Uses Alpha Vantage OVERVIEW with 7-day disk cache. No yfinance dependency.
     """
-    import yfinance as yf
+    import time as _time
 
     passing = []
-    for ticker in tickers:
+    for i, ticker in enumerate(tickers):
+        # Respect Alpha Vantage rate limit (75/min premium, 5/min free).
+        # 0.3s per call = ~200/min, safe for premium tier.
+        if i > 0 and i % 10 == 0:
+            _time.sleep(0.3)
         try:
-            t = yf.Ticker(ticker)
-            info = t.info
-            if not info or info.get("quoteType") not in ("EQUITY", None):
+            from tradingagents.dataflows.alpha_vantage_fundamentals_cached import get_ticker_fundamentals
+
+            info = get_ticker_fundamentals(ticker)
+            if not info:
                 continue
 
             market_cap = info.get("marketCap", 0) or 0
