@@ -456,27 +456,43 @@ def run_core_discovery(cfg: Dict[str, Any]) -> str:
         from tradingagents.portfolio_advisor.watchlist import load_watchlist, save_watchlist
 
         wl = load_watchlist(cfg)
-        existing = {
-            (e if isinstance(e, str) else e.get("ticker", "")).strip().upper()
-            for e in wl
-        }
         added = 0
+        updated = 0
         for pick in picks:
             ticker = pick["ticker"]
-            if ticker in existing:
-                continue
-            thesis = pick.get("thesis", "")
-            wl.append({
-                "ticker": ticker,
-                "thesis": thesis,
-                "strategy": "core",
-                "source": "core_discovery",
-                "added": today,
-            })
-            added += 1
-        if added:
+            # Parse thesis from the LLM line: TICKER — CONVICTION — STATUS — DEEP_DIVE — thesis
+            raw = pick.get("thesis", "")
+            parts = raw.split("—") if "—" in raw else [raw]
+            thesis_text = parts[-1].strip() if len(parts) >= 5 else raw
+
+            # Check if ticker already exists
+            found = None
+            for e in wl:
+                et = (e if isinstance(e, str) else e.get("ticker", "")).strip().upper()
+                if et == ticker:
+                    found = e
+                    break
+
+            if found and isinstance(found, dict):
+                if found.get("thesis", ""):
+                    continue  # already has a thesis, skip
+                # Update empty-thesis entry
+                found["thesis"] = thesis_text
+                found["source"] = "core_discovery"
+                found["added"] = today
+                updated += 1
+            elif not found:
+                wl.append({
+                    "ticker": ticker,
+                    "thesis": thesis_text,
+                    "strategy": "core",
+                    "source": "core_discovery",
+                    "added": today,
+                })
+                added += 1
+        if added or updated:
             save_watchlist(cfg, wl)
-            logger.info("core discovery: added %d candidates to PM watchlist", added)
+            logger.info("core discovery: added %d, updated %d in PM watchlist", added, updated)
     except Exception as e:
         logger.warning("core discovery: watchlist update failed: %s", e)
 
