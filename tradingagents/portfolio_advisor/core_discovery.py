@@ -238,8 +238,9 @@ def _llm_qualitative_rank(candidates: List[Dict], cfg: Dict[str, Any]) -> List[D
         lines.append("")
     cand_text = "\n".join(lines)
 
-    # Build current holdings context
+    # Build current holdings + existing research context
     holdings_text = ""
+    researched_text = ""
     try:
         from tradingagents.portfolio_advisor.etoro_scan import fetch_portfolio_rows
         _payload, _text, _tickers, rows = fetch_portfolio_rows()
@@ -256,6 +257,27 @@ def _llm_qualitative_rank(candidates: List[Dict], cfg: Dict[str, Any]) -> List[D
     except Exception:
         pass
 
+    # Check which candidates already have deep research
+    try:
+        from pathlib import Path as _Path
+        research_dir = _Path.home() / ".tradingagents" / "portfolio_advisor" / "clerk_deep"
+        researched = set()
+        if research_dir.is_dir():
+            for d in research_dir.iterdir():
+                if d.is_dir():
+                    researched.add(d.name.upper())
+        if researched:
+            overlap = [t for t in [c["ticker"] for c in candidates] if t in researched]
+            if overlap:
+                researched_text = (
+                    "\n\nThese tickers ALREADY have deep research on file. "
+                    "Do NOT recommend them for deep dive. Note them if they qualify, "
+                    "but mark DEEP_DIVE NO with reason 'existing research': "
+                    + ", ".join(sorted(overlap))
+                )
+    except Exception:
+        pass
+
     prompt = (
         "You are screening stocks for a concentrated growth portfolio. "
         "From the candidates below, identify up to 5 that have the best long-term compounding potential. "
@@ -263,7 +285,8 @@ def _llm_qualitative_rank(candidates: List[Dict], cfg: Dict[str, Any]) -> List[D
         "and clean financials (cash flow tracks earnings, limited dilution, manageable debt, "
         "growth not decelerating).\n\n"
         f"Candidates:\n{cand_text}\n"
-        f"{holdings_text}\n\n"
+        f"{holdings_text}\n"
+        f"{researched_text}\n"
         "Return EXACTLY one line per pick. Format each line as:\n"
         "TICKER — CONVICTION (High/Medium/Low) — STATUS (new/overlap/repeat) — DEEP_DIVE (YES/NO) — punchy one-line thesis\n\n"
         "DEEP_DIVE rules:\n"
