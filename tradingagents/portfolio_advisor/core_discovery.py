@@ -286,11 +286,11 @@ def _llm_qualitative_rank(candidates: List[Dict], cfg: Dict[str, Any]) -> List[D
         logger.warning("core discovery LLM failed: %s", e)
         return _pick_top_5(candidates)
 
-    # Parse ticker lines with regex.
-    # Format: TICKER — CONVICTION (High|Medium|Low) — STATUS (...) — DEEP_DIVE (YES|NO) — thesis
+    # Parse ticker lines.
+    # LLM format: TICKER — High — new — YES — thesis (or with labels)
     ticker_re = _re.compile(
-        r"^([A-Z]{1,5})\s*[—\-]\s*CONVICTION\s+(High|Medium|Low)\s*[—\-]\s*STATUS\s+\(?(\w+)\)?"
-        r"\s*[—\-]\s*DEEP_DIVE\s+\(?(YES|NO)\)?",
+        r"^([A-Z]{1,5})\s*[—\-]\s*(High|Medium|Low)\s*[—\-]\s*(new|overlap|repeat|\w+)"
+        r"\s*[—\-]\s*(YES|NO)",
         _re.IGNORECASE,
     )
 
