@@ -205,7 +205,7 @@ def _llm_qualitative_rank(candidates: List[Dict], cfg: Dict[str, Any]) -> List[D
     one-line thesis. Previously recommended stocks are NOT excluded — they
     appear again if they still qualify, flagged as 'repeat' for context.
     """
-    import re
+    import re as _re
 
     if not candidates:
         return []
@@ -252,18 +252,24 @@ def _llm_qualitative_rank(candidates: List[Dict], cfg: Dict[str, Any]) -> List[D
 
     prompt = (
         "You are screening stocks for a concentrated growth portfolio. "
-        "From the candidates below, pick up to 5 that have the best long-term compounding potential. "
+        "From the candidates below, identify up to 5 that have the best long-term compounding potential. "
         "Prioritise: durable competitive moat, founder-led or strong operator, secular tailwind, "
         "and clean financials (cash flow tracks earnings, limited dilution, manageable debt, "
         "growth not decelerating).\n\n"
         f"Candidates:\n{cand_text}\n"
         f"{holdings_text}\n\n"
         "Return EXACTLY one line per pick. Format each line as:\n"
-        "TICKER — CONVICTION (High/Medium) — STATUS (new/overlap/repeat) — punchy one-line thesis\n\n"
-        "The thesis should be direct and specific. Bad: 'Software company with strong growth.' "
-        "Good: 'Observability platform with sticky enterprise contracts; founder-led, 30%+ FCF margins, "
-        "no debt.'\n\n"
-        "Return up to 5 tickers, highest conviction first. Only include tickers from the list above. "
+        "TICKER — CONVICTION (High/Medium/Low) — STATUS (new/overlap/repeat) — DEEP_DIVE (YES/NO) — punchy one-line thesis\n\n"
+        "DEEP_DIVE rules:\n"
+        "- YES = genuinely worth Michael spending 2+ hours researching. Must have BOTH High conviction "
+        "AND at least two of: clear moat, founder-led, secular tailwind, exceptional numbers.\n"
+        "- NO = decent company, passes the screens, but not compelling enough to prioritise over "
+        "existing holdings or other opportunities. Still note it — just flag it as not deep-dive-worthy.\n"
+        "- It is COMPLETELY FINE to return 5 NOs if nothing stands out. A quiet week is better "
+        "than a forced pick.\n\n"
+        "Thesis: direct and specific. Bad: 'Software company with strong growth.' "
+        "Good: 'Observability platform with sticky enterprise contracts; founder-led, 30%+ FCF margins, no debt.'\n\n"
+        "Return 0-5 tickers, highest conviction first. Only include tickers from the list above. "
         "No numbering, no commentary outside the format.\n"
     )
 
@@ -274,29 +280,41 @@ def _llm_qualitative_rank(candidates: List[Dict], cfg: Dict[str, Any]) -> List[D
         logger.warning("core discovery LLM failed: %s", e)
         return _pick_top_5(candidates)
 
-    # Parse ticker lines with regex to avoid false substring matches
-    # Matches: TICKER — CONVICTION (High|Medium) — ...
-    ticker_re = re.compile(
-        r"^([A-Z]{1,5})\s*[—\-]\s*CONVICTION\s+(High|Medium)",
-        re.IGNORECASE,
+    # Parse ticker lines with regex.
+    # Format: TICKER — CONVICTION (High|Medium|Low) — STATUS (...) — DEEP_DIVE (YES|NO) — thesis
+    ticker_re = _re.compile(
+        r"^([A-Z]{1,5})\s*[—\-]\s*CONVICTION\s+(High|Medium|Low)\s*[—\-]\s*STATUS\s+\(?(\w+)\)?"
+        r"\s*[—\-]\s*DEEP_DIVE\s+\(?(YES|NO)\)?",
+        _re.IGNORECASE,
     )
 
     selected = []
     for line in str(content).split("\n"):
         line = line.strip()
-        m = ticker_re.match(line)
+        m = ticker_re.search(line)
         if not m:
             continue
         ticker = m.group(1).upper()
+        conviction = m.group(2)
+        deep_dive = m.group(4).upper()
         for c in candidates:
             if c["ticker"] == ticker and c not in selected:
                 c["thesis"] = line
+                c["conviction"] = conviction
+                c["deep_dive"] = deep_dive
                 selected.append(c)
                 break
         if len(selected) >= 5:
             break
 
-    return selected if selected else _pick_top_5(candidates)
+    # Only deliver picks marked DEEP_DIVE YES
+    deep_dive_picks = [s for s in selected if s.get("deep_dive") == "YES"]
+    if deep_dive_picks:
+        return deep_dive_picks
+
+    # If LLM returned picks but none are deep-dive-worthy, return empty
+    # so the caller can message "nothing compelling this week"
+    return [] if selected else _pick_top_5(candidates)
 
 
 def _pick_top_5(candidates: List[Dict]) -> List[Dict]:
@@ -337,10 +355,32 @@ def run_core_discovery(cfg: Dict[str, Any]) -> str:
     # Phase 3: LLM qualitative rank
     picks = _llm_qualitative_rank(quant_pass, cfg)
     t4 = time.monotonic()
-    if not picks:
-        return "Core discovery: LLM filter returned no picks."
 
     # Phase 4: Build Telegram message
+    if not picks:
+        lines = [
+            f"Screened {len(universe) + total_rejected} names this week — {len(quant_pass)} passed the numbers, "
+            f"but nothing cleared the deep-dive bar after qualitative review.",
+            "",
+            "No deep-dive candidates this week. Sometimes the best move is no move.",
+        ]
+        body = "\n".join(lines)
+        try:
+            from tradingagents.portfolio_advisor.messaging import send_advisor_message
+            send_advisor_message(
+                cfg, "Core Discovery", body, urgent=False,
+                log_as_recommendation=True,
+                rec_trigger="core_discovery",
+                rec_type="core_candidate",
+                rec_action="weekly_screen_no_candidates",
+                rec_rationale=f"Screened {len(universe)} tickers. {len(quant_pass)} passed quant. 0 deep-dive worthy.",
+            )
+        except Exception as e:
+            logger.warning("core discovery send failed: %s", e)
+            return f"Core discovery complete but send failed: {e}"
+
+        logger.info("core discovery: complete — no deep-dive candidates (%.1fs total)", time.monotonic() - t0)
+        return "Core discovery: no deep-dive candidates this week."
     top_pick = picks[0]
     top_thesis = top_pick.get("thesis", "").split("—")[-1].strip() if "—" in top_pick.get("thesis", "") else ""
 
