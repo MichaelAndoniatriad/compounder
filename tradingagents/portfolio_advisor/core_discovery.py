@@ -703,6 +703,44 @@ def run_core_discovery(cfg: Dict[str, Any]) -> str:
     except Exception as e:
         logger.warning("core discovery: watchlist update failed: %s", e)
 
+    # Phase 6: Promote deep-dive picks (high-conviction only) into a PM portfolio
+    # evaluation. One batched PM cycle weighs them against the live book and decides
+    # replace / add / watch / reject per name. Radar picks stay on the watchlist and
+    # are picked up by routine cycles — they don't trigger a dedicated PM pass.
+    if deep_dive_picks and bool(cfg.get("portfolio_advisor_core_promote_to_pm", True)):
+        try:
+            from tradingagents.portfolio_advisor.advisor_pm import run_pm_cycle
+
+            promo = [
+                "Promoted CORE candidates — these cleared the deep-dive bar this month. "
+                "Evaluate EACH against the current book and decide replace / add / watch / reject "
+                "with a concrete plan: when 'replace', name the exact replace_ticker (a live "
+                "holding) whose sale funds the buy; set proposed_size_usd within the sizing rule, "
+                "target_sleeve=core, and conviction. These are long-term compounders, not catalyst "
+                "trades — judge them on portfolio fit and opportunity cost vs the weakest holding.",
+                "",
+            ]
+            for i, p in enumerate(deep_dive_picks, 1):
+                promo.append(
+                    f"{i}. {p['ticker']} — score {p.get('score', 0):.2f} — "
+                    f"{p.get('herd', '')} — {p.get('thesis', '')}"
+                )
+                promo.append(
+                    f"   {p.get('sector', '')} | rev_growth {p.get('rev_growth')}% | "
+                    f"ROIC {p.get('roic')}% | PEG {p.get('peg')}"
+                )
+            run_pm_cycle(
+                cfg,
+                trigger="core_candidate_promoted",
+                extra_context="\n".join(promo),
+            )
+            logger.info(
+                "core discovery: promoted %d deep-dive candidate(s) to PM portfolio evaluation",
+                len(deep_dive_picks),
+            )
+        except Exception as e:
+            logger.warning("core discovery: PM promotion failed: %s", e)
+
     logger.info("core discovery: complete — %d deep-dive, %d on-radar (%.1fs total)",
                 len(deep_dive_picks), len(radar_picks), time.monotonic() - t0)
     return f"Core discovery: {len(deep_dive_picks)} deep-dive, {len(radar_picks)} on-radar"

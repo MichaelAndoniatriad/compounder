@@ -128,6 +128,32 @@ class AdvisorPMCandidateComparison(BaseModel):
         default_factory=list,
         description="Live portfolio tickers the candidate was compared against.",
     )
+    replace_ticker: str = Field(
+        default="",
+        description=(
+            "When replace_or_add='replace', the SINGLE live holding this candidate should "
+            "replace (and whose sale funds the buy). Must be a ticker in the live portfolio "
+            "snapshot. Leave empty for add/watch/reject."
+        ),
+    )
+    proposed_size_usd: float = Field(
+        default=0.0,
+        description=(
+            "Dollar size for the candidate buy, within the position-sizing rule in context "
+            "(e.g. max 5% of invested per new name). 0 = let the system pick a starter size."
+        ),
+    )
+    target_sleeve: Literal["core", "catalyst", "cash", ""] = Field(
+        default="",
+        description="Sleeve the candidate buy belongs to: core (compounder) or catalyst (event-driven).",
+    )
+    conviction: Literal["high", "medium", "low", "unknown"] = Field(
+        default="unknown",
+        description=(
+            "Decision conviction. Only 'high' candidate decisions are auto-recorded as proposed "
+            "trades; medium/low are surfaced as advisory text only."
+        ),
+    )
     rationale: str = Field(default="", description="Short comparison rationale grounded in evidence.")
     evidence_refs: List[str] = Field(
         default_factory=list,

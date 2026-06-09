@@ -161,6 +161,12 @@ The graph rates names in isolation. Your job is relative:
 - Which candidate best diversifies or fills that gap — even at a Hold long-term rating?
 - Use `compare_candidates(a, b)` when you have multiple researched names to rank them.
 - Use `get_sleeve_mix()` before any deploy decision to confirm the current state.
+- For each promoted candidate, emit a candidate_comparison carrying the FULL plan, not just a label:
+  set replace_or_add; when it is `replace`, name the exact `replace_ticker` (a live holding,
+  whose sale funds the buy) and confirm the candidate is genuinely better; set `proposed_size_usd`
+  within the position-sizing rule in context, `target_sleeve` (core/catalyst), and `conviction`.
+  Only `conviction: high` replace/add decisions are auto-recorded as proposed trades for the human —
+  reserve it for real, evidence-backed calls; use medium/low/watch/reject otherwise.
 
 ## Tools — these are REAL functions, call them, don't narrate
 You have callable tools wired in via the API. When you decide to do something,
@@ -1204,6 +1210,87 @@ def cancel_last_action(cfg: Dict[str, Any]) -> str:
     return "Jobs already ran or were not found in queue."
 
 
+def _apply_candidate_comparisons(
+    cfg: Dict[str, Any],
+    result: AdvisorPMCycleResult,
+    live_tickers: set,
+    portfolio_text: str = "",
+) -> List[Dict[str, Any]]:
+    """Turn high-conviction replace/add candidate decisions into proposed trades + a nudge.
+
+    Portfolio-level execution of the PM's candidate_comparisons: when the PM decides a
+    promoted candidate should REPLACE a holding or be ADDED at high conviction, record
+    the proposal(s) to proposed_trades.jsonl (a replace = SELL the named holding + BUY the
+    candidate) and push a concise plan to Telegram. Advisory only — the human executes on
+    eToro. watch/reject and medium/low conviction are left as advisory text. Never raises.
+    """
+    applied: List[Dict[str, Any]] = []
+    if not bool(cfg.get("portfolio_advisor_pm_apply_candidate_actions", True)):
+        return applied
+    comps = list(getattr(result, "candidate_comparisons", None) or [])
+    if not comps:
+        return applied
+
+    from tradingagents.portfolio_advisor import proposals as _proposals
+    from tradingagents.portfolio_advisor import messaging
+
+    starter = float(cfg.get("portfolio_advisor_pm_candidate_starter_usd", 400) or 400)
+    for c in comps:
+        cand = str(getattr(c, "candidate_ticker", "") or "").strip().upper()
+        decision = str(getattr(c, "replace_or_add", "") or "").strip().lower()
+        conviction = str(getattr(c, "conviction", "") or "").strip().lower()
+        if not cand or decision not in ("replace", "add") or conviction != "high":
+            continue
+        size = float(getattr(c, "proposed_size_usd", 0) or 0)
+        if size <= 0:
+            size = starter
+        sleeve = str(getattr(c, "target_sleeve", "") or "").strip().lower()
+        reason = (getattr(c, "rationale", "") or "PM portfolio-fit decision").strip()[:500]
+        repl = str(getattr(c, "replace_ticker", "") or "").strip().upper()
+
+        effective = decision
+        if decision == "replace" and repl and repl in live_tickers:
+            try:
+                _proposals.add(
+                    cfg, ticker=repl, action="sell",
+                    reason=f"Replace with {cand}: {reason}"[:500],
+                )
+            except Exception:
+                logger.exception("candidate replace: sell proposal for %s failed", repl)
+        elif decision == "replace":
+            # Named holding not in the live book — fund the buy from cash instead.
+            effective = "add"
+
+        try:
+            _proposals.add(
+                cfg, ticker=cand, action="buy",
+                approx_usd=size, sleeve=sleeve, reason=reason,
+            )
+        except Exception:
+            logger.exception("candidate buy proposal for %s failed", cand)
+            continue
+
+        sl = f" [{sleeve}]" if sleeve else ""
+        if effective == "replace":
+            head = f"🔁 REPLACE: sell {repl} → buy {cand} (~${size:.0f}{sl})"
+        else:
+            head = f"➕ ADD: buy {cand} (~${size:.0f}{sl})"
+        body = f"{head}\nWhy: {reason}\n(advisory — you execute on eToro)"
+        try:
+            messaging.send_advisor_message(cfg, "PM", body, urgent=True)
+        except Exception:
+            logger.debug("candidate nudge send failed", exc_info=True)
+
+        applied.append({
+            "candidate": cand,
+            "decision": effective,
+            "replace_ticker": repl if effective == "replace" else "",
+            "size_usd": round(size, 2),
+            "sleeve": sleeve,
+        })
+    return applied
+
+
 def apply_pm_cycle_followups(cfg: Dict[str, Any], result: AdvisorPMCycleResult) -> Dict[str, Any]:
     """Execute PM-structured replan / extra job requests (Phase 3). Never raises."""
     actions: Dict[str, Any] = {
@@ -1247,15 +1334,24 @@ def apply_pm_cycle_followups(cfg: Dict[str, Any], result: AdvisorPMCycleResult) 
             actions["replan_error"] = str(e)
 
     specs = list(result.append_jobs or [])[:5]
-    if not specs:
+    comparisons = list(getattr(result, "candidate_comparisons", None) or [])
+    if not specs and not comparisons:
         return actions
 
     try:
-        _payload, _pt, tickers, _rows = etoro_scan.fetch_portfolio_rows()
+        _payload, portfolio_text, tickers, _rows = etoro_scan.fetch_portfolio_rows()
         live = etoro_scan.current_ticker_set(tickers)
     except Exception as e:
-        logger.warning("PM append_jobs: portfolio fetch failed: %s", e)
+        logger.warning("PM followups: portfolio fetch failed: %s", e)
         actions["jobs_fetch_error"] = str(e)
+        return actions
+
+    # Candidate comparisons: high-conviction replace/add -> proposed trades + Telegram nudge.
+    actions["candidate_actions"] = _apply_candidate_comparisons(
+        cfg, result, live, portfolio_text=portfolio_text
+    )
+
+    if not specs:
         return actions
 
     st = state.load_state(cfg)
