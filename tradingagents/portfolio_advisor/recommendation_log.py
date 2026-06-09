@@ -8,7 +8,7 @@ Schema (one JSON object per line):
 {
   "id": "uuid hex",
   "ts": "ISO8601",
-  "trigger": "action_check | ep_scan | watchdog | human_query | full_graph | weekly_summary | single_model_analysis",
+  "trigger": "action_check | ep_scan | watchdog | human_query",
   "type": "sizing | ep_entry | ep_exit | stop_adjust | macro_alert",
   "ticker": "AAPL or null for portfolio-level",
   "action": "reduce_entries_50pct | buy_100_shares | raise_stop_to_50 | hold | exit",
@@ -17,30 +17,13 @@ Schema (one JSON object per line):
   "entry_price": null or float,
   "stop_price": null or float,
   "shares": null or float,
-
-  // Attribution fields (Phase 2 outcome tracking, plan section 6)
-  "confidence": null or float in [0.0, 1.0],
-  "thesis_break_metrics": null or list[str] (2 to 3 measurable conditions),
-  "exit_horizon_days": null or int (expected holding period for outcome measurement),
-  "peer_holdings": null or {"ticker": pct_weight, ...} (portfolio snapshot at decision time),
-
-  // Consensus factor tagging (v4 plan, written when consensus snapshot available)
-  "consensus_rank": null or int,
-  "consensus_age_days": null or int,
-  "consensus_score": null or {"composite": float, "entry": float, "divergence": float, "flow": float},
-  "deepseek_aligned_with_consensus": null or bool,
-
-  // Outcome (filled in by weekly outcome tracker)
-  "status": "pending | accepted | rejected | expired | acknowledged",
+  "status": "pending | accepted | rejected | expired",
   "human_response": null or "accepted: reduced EP size",
   "outcome_measured_at": null,
   "was_correct": null or true/false,
   "pnl_impact_est": null or float,
   "outcome_note": null
 }
-
-Backward compatibility: any field added after initial deployment is optional with
-None default. Old entries without new fields still parse.
 """
 
 from __future__ import annotations
@@ -48,7 +31,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -73,12 +56,10 @@ def log_recommendation(
     entry_price: Optional[float] = None,
     stop_price: Optional[float] = None,
     shares: Optional[float] = None,
-    # Attribution fields (plan section 6)
     confidence: Optional[float] = None,
     thesis_break_metrics: Optional[List[str]] = None,
     exit_horizon_days: Optional[int] = None,
     peer_holdings: Optional[Dict[str, float]] = None,
-    # Consensus factor tagging (v4)
     consensus_rank: Optional[int] = None,
     consensus_age_days: Optional[int] = None,
     consensus_score: Optional[Dict[str, float]] = None,
@@ -88,51 +69,34 @@ def log_recommendation(
 
     Call this BEFORE sending the Telegram message. If this returns None,
     the log write failed — do not send the message.
-
-    New caller fields are all optional; existing callers continue to work
-    unchanged. The outcome tracker (plan section 7) uses exit_horizon_days
-    and entry_price to decide when to measure realised returns.
     """
     p = _log_path(cfg)
     p.parent.mkdir(parents=True, exist_ok=True)
 
-    # Normalise confidence to [0.0, 1.0] if provided.
-    conf: Optional[float] = None
+    # Normalise confidence: must be in [0.0, 1.0]; out of range → None
+    _conf: Optional[float] = None
     if confidence is not None:
         try:
             c = float(confidence)
             if 0.0 <= c <= 1.0:
-                conf = round(c, 3)
+                _conf = round(c, 4)
         except (TypeError, ValueError):
-            conf = None
+            pass
 
-    # Normalise thesis_break_metrics to a clean list of short strings.
-    tbm: Optional[List[str]] = None
+    # Normalise thesis_break_metrics: drop blanks, trim to 200 chars, max 5
+    _tbm: Optional[List[str]] = None
     if thesis_break_metrics:
         cleaned = [str(m).strip()[:200] for m in thesis_break_metrics if str(m).strip()]
-        tbm = cleaned[:5] if cleaned else None
+        _tbm = cleaned[:5] if cleaned else None
 
-    # Normalise exit horizon to a positive int.
-    horizon: Optional[int] = None
+    # Normalise exit_horizon_days: must be positive int
+    _ehd: Optional[int] = None
     if exit_horizon_days is not None:
         try:
-            h = int(exit_horizon_days)
-            if h > 0:
-                horizon = h
+            e = int(exit_horizon_days)
+            _ehd = e if e > 0 else None
         except (TypeError, ValueError):
-            horizon = None
-
-    # Normalise peer holdings to {ticker_upper: float}.
-    peers: Optional[Dict[str, float]] = None
-    if peer_holdings:
-        try:
-            peers = {
-                str(t).strip().upper(): round(float(w), 4)
-                for t, w in peer_holdings.items()
-                if str(t).strip()
-            } or None
-        except (TypeError, ValueError, AttributeError):
-            peers = None
+            _ehd = None
 
     entry: Dict[str, Any] = {
         "id": uuid.uuid4().hex[:16],
@@ -146,27 +110,20 @@ def log_recommendation(
         "entry_price": round(float(entry_price), 2) if entry_price is not None else None,
         "stop_price": round(float(stop_price), 2) if stop_price is not None else None,
         "shares": round(float(shares), 4) if shares is not None else None,
-        # Attribution fields
-        "confidence": conf,
-        "thesis_break_metrics": tbm,
-        "exit_horizon_days": horizon,
-        "peer_holdings": peers,
-        # Consensus factor tagging
-        "consensus_rank": consensus_rank if isinstance(consensus_rank, int) else None,
-        "consensus_age_days": consensus_age_days if isinstance(consensus_age_days, int) else None,
-        "consensus_score": consensus_score if isinstance(consensus_score, dict) else None,
-        "deepseek_aligned_with_consensus": (
-            deepseek_aligned_with_consensus
-            if isinstance(deepseek_aligned_with_consensus, bool)
-            else None
-        ),
-        # Outcome (filled later)
         "status": "pending",
         "human_response": None,
         "outcome_measured_at": None,
         "was_correct": None,
         "pnl_impact_est": None,
         "outcome_note": None,
+        "confidence": _conf,
+        "thesis_break_metrics": _tbm,
+        "exit_horizon_days": _ehd,
+        "peer_holdings": peer_holdings if peer_holdings else None,
+        "consensus_rank": int(consensus_rank) if consensus_rank is not None else None,
+        "consensus_age_days": int(consensus_age_days) if consensus_age_days is not None else None,
+        "consensus_score": consensus_score if consensus_score else None,
+        "deepseek_aligned_with_consensus": bool(deepseek_aligned_with_consensus) if deepseek_aligned_with_consensus is not None else None,
     }
 
     try:
@@ -184,26 +141,41 @@ def load_pending(cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
     return _load_all(cfg, status_filter="pending")
 
 
+def load_measured(cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Return all recommendations with measured outcomes."""
+    rows = _load_all(cfg)
+    return [r for r in rows if r.get("was_correct") is not None]
+
+
 def load_due_for_measurement(
     cfg: Dict[str, Any],
     *,
     default_horizon_days: int = 30,
 ) -> List[Dict[str, Any]]:
-    """Return pending recommendations whose exit horizon has elapsed.
+    """Return recommendations past their exit horizon that still need measurement.
 
-    Used by the outcome tracker (plan section 7). A recommendation is "due"
-    when (now - ts) >= exit_horizon_days. Entries without exit_horizon_days
-    fall back to default_horizon_days.
+    An entry is due when:
+    - Its outcome has not been measured yet (outcome_measured_at is None)
+    - Its timestamp is at least its exit_horizon_days (or the default) in the past
+    - It has a ticker (outcomes need price data)
+
+    Idempotent: already-measured entries are excluded, so re-running the weekly
+    job does not double-count.
     """
-    now = datetime.now(timezone.utc)
     rows = _load_all(cfg)
+    now = datetime.now(timezone.utc)
     due: List[Dict[str, Any]] = []
     for r in rows:
+        if r.get("outcome_measured_at") is not None:
+            continue
         if r.get("was_correct") is not None:
             continue
-        ts_str = r.get("ts") or ""
+        ticker = r.get("ticker")
+        if not ticker:
+            continue
+        ts_str = r.get("ts", "")
         try:
-            rec_ts = datetime.fromisoformat(ts_str)
+            ts = datetime.fromisoformat(ts_str)
         except (TypeError, ValueError):
             continue
         horizon = r.get("exit_horizon_days") or default_horizon_days
@@ -211,16 +183,9 @@ def load_due_for_measurement(
             horizon = int(horizon)
         except (TypeError, ValueError):
             horizon = default_horizon_days
-        age_days = (now - rec_ts).total_seconds() / 86400.0
-        if age_days >= horizon:
+        if (now - ts) >= timedelta(days=horizon):
             due.append(r)
     return due
-
-
-def load_measured(cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Return all recommendations with measured outcomes."""
-    rows = _load_all(cfg)
-    return [r for r in rows if r.get("was_correct") is not None]
 
 
 def update_outcome(

@@ -657,6 +657,26 @@ def portfolio_advisor_paper_status(
         raise typer.Exit(1) from e
 
 
+@portfolio_app.command("core-scan")
+def portfolio_advisor_core_scan(
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+):
+    """Weekly core position discovery. Screens for long-term growth candidates.
+
+    Runs quantitative filters (market cap >$1B, revenue growth >20%,
+    PEG <1.5, ROIC >15%) then LLM qualitative review for moat, founder,
+    and red flags. Sends top 5 picks via Telegram."""
+    _configure_logging(verbose)
+    cfg = DEFAULT_CONFIG.copy()
+    try:
+        from tradingagents.portfolio_advisor.core_discovery import run_core_discovery
+        result = run_core_discovery(cfg)
+        console.print(f"[cyan]core-scan:[/cyan] {result}")
+    except Exception as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1) from e
+
+
 def portfolio_advisor_action_check(
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ):

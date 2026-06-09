@@ -418,4 +418,10 @@ DEFAULT_CONFIG = _apply_env_overrides({
         ".AX":  "^AXJO",    # Australia (ASX 200)
         "":     "SPY",      # default for US-listed tickers (no suffix)
     },
+    # EP scanner news sources. Default: Alpha Vantage only (current behaviour).
+    # Per docs/ep_gate_audit.md the structural fix is to add a second feed; once
+    # a Yahoo Finance RSS adapter exists, set this to ["alpha_vantage", "yahoo_finance_rss"]
+    # so the scanner deduplicates by title hash and unions the two feeds.
+    # Keep as a list so future sources can be added without breaking existing config.
+    "ep_scanner_news_sources": ["alpha_vantage"],
 })
