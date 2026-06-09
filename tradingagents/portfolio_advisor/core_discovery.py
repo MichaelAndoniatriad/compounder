@@ -448,6 +448,48 @@ def _load_consensus_top_list() -> List[str]:
     return []
 
 
+def _apply_consensus_tilt(candidates: List[Dict], cfg: Dict[str, Any]) -> List[Dict]:
+    """Apply discovery consensus tilt to re-rank survivors by crowding.
+
+    Uses only consensus_entry_score + consensus_divergence_score (averaged).
+    Retail flow is reserved for the PM sizing layer.
+    Gated behind CONSENSUS_FACTOR_LIVE — returns candidates unchanged if off
+    or if snapshot is empty (fail-safe: never errors, never blocks a pick).
+    """
+    if not cfg.get("CONSENSUS_FACTOR_LIVE", False):
+        return candidates
+
+    tilt_weight = float(cfg.get("consensus_tilt_weight", 0.10))
+    if tilt_weight <= 0:
+        return candidates
+
+    try:
+        from tradingagents.portfolio_advisor.consensus_score import (
+            consensus_entry_score,
+            consensus_divergence_score,
+        )
+
+        for c in candidates:
+            ticker = c["ticker"]
+            entry = consensus_entry_score(ticker)
+            divergence = consensus_divergence_score(ticker)
+            tilt = tilt_weight * (entry + divergence) / 2.0
+            # Store tilt for audit; adjust effective score for ranking
+            c["consensus_tilt"] = round(tilt, 3)
+            c["effective_score"] = round(c.get("score", 0) + tilt, 3)
+
+        # Re-sort by effective score descending
+        candidates.sort(key=lambda c: c.get("effective_score", c.get("score", 0)), reverse=True)
+        logger.info(
+            "core discovery: applied consensus tilt to %d candidates (weight=%.2f)",
+            len(candidates), tilt_weight,
+        )
+    except Exception as e:
+        logger.warning("core discovery: consensus tilt failed, returning unscored: %s", e)
+
+    return candidates
+
+
 def run_core_discovery(cfg: Dict[str, Any]) -> str:
     """Run the full weekly core position discovery pipeline."""
     import time
@@ -477,6 +519,11 @@ def run_core_discovery(cfg: Dict[str, Any]) -> str:
     if not quant_pass:
         return "Core discovery: no tickers passed quantitative filters this month."
     logger.info("core discovery: %d passed quantitative screen (%.1fs)", len(quant_pass), t3 - t2)
+
+    # Phase 2b: Apply consensus tilt (post-gate, ranking only).
+    # Re-orders survivors by crowding; never changes who passes the gate.
+    # Gated behind CONSENSUS_FACTOR_LIVE — no-ops to neutral until snapshot is populated.
+    quant_pass = _apply_consensus_tilt(quant_pass, cfg)
 
     # Phase 3: LLM qualitative rank (monthly cache makes it deterministic within a month)
     # TODO earnings-season refresh: run an extra discovery pass during earnings season.
