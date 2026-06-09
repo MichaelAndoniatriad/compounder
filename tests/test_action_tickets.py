@@ -33,14 +33,15 @@ def test_catalyst_buy_with_date_prints_concrete_exit_day():
 def test_core_buy_scales_in_with_concrete_levels():
     t = pr.format_action_ticket({}, _p(ticker="VEEV", action="buy", approx_usd=600,
                                        target_price=200, sleeve="core"))
-    assert "scale in over 2–4 wks" in t and "1/3 now" in t
+    assert "~$200" in t and "~1/3 of a ~$600 target" in t   # first buy = a third of the total
+    assert "2–4 wks" in t and "not all at once" in t        # cadence is explicit, not a fixed calendar
     assert "+100% ($400.00" in t and "−40% ($120.00" in t   # 200*2 and 200*0.6
     assert "thesis-break" in t
 
 
 def test_core_buy_without_price_shows_pct_rules():
     t = pr.format_action_ticket({}, _p(ticker="VEEV", action="buy", approx_usd=600, sleeve="core"))
-    assert "1/3 now" in t and "+100% trim half" in t and "−40% exit" in t
+    assert "~1/3 of a ~$600 target" in t and "+100% trim half" in t and "−40% exit" in t
     assert "$" not in t.split("Sell:")[1].split("\n")[0]    # no fabricated price levels
 
 

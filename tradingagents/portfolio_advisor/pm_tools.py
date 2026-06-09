@@ -295,6 +295,21 @@ def build_pm_tools(cfg: Dict[str, Any], live_tickers: set) -> List[Any]:
                 "(what changed, the catalyst, the rule that fired, or the thesis read). "
                 "Don't just propose buy/sell/trim with no rationale."
             )
+        # Guard: a CATALYST buy must name a dated event. No catalyst_date means the
+        # thesis is secular/compounder (e.g. "the AI buildout"), NOT a dated trade —
+        # and the catalyst sleeve's -8% hard stop would knock it out on ordinary
+        # volatility, often at the very price the thesis says to add. Force it to
+        # core so it gets the -30/-40% floors and a multi-year hold instead.
+        if (sleeve or "").strip().lower() == "catalyst" and act in ("buy", "add") \
+                and not (catalyst_date or "").strip():
+            return (
+                "error: a catalyst buy requires catalyst_date (the dated event, ISO "
+                "YYYY-MM-DD — earnings, a launch, a ruling). No dated event means this "
+                "is a secular/compounder thesis, not a catalyst trade: re-propose with "
+                "sleeve='core' so it gets the -30/-40% drawdown floors and a 3-5yr hold, "
+                "NOT the -8% catalyst stop. Don't file a name in 'catalyst' just to fill "
+                "the sleeve."
+            )
         try:
             from tradingagents.portfolio_advisor import proposals as _proposals
             # add() supersedes any existing open proposal for the same ticker+side,

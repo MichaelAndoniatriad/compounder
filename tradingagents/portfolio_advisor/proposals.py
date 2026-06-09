@@ -220,8 +220,11 @@ def format_action_ticket(cfg: Dict[str, Any], p: Dict[str, Any]) -> str:
             else:
                 lines.append(f"Sell: −8% stop{stop} or {cap}-day cap (set a catalyst date for an exact exit day)")
         else:
-            third = f" (~${usd / 3:,.0f} each)" if usd else ""
-            lines.append(f"Buy: scale in over 2–4 wks — 1/3 now, then 2 tranches{third}")
+            if usd:
+                lines.append(f"Buy now: ~${usd / 3:,.0f} — that's ~1/3 of a ~${usd:,.0f} target position")
+            else:
+                lines.append("Buy now: ~1/3 of the target position")
+            lines.append("Then 2 more thirds over the next 2–4 wks — add on dips or confirmation, not all at once")
             if px:
                 lines.append(
                     f"Sell: +100% (${px * 2:.2f}, trim half) · −40% (${px * 0.60:.2f}) exit · "
