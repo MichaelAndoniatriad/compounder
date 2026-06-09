@@ -98,7 +98,8 @@ def test_reconcile_cancels_sells_for_unheld_but_never_buys(monkeypatch):
     """A BUY is FOR a name you don't hold yet — reconcile must not kill it.
 
     Regression: every catalyst entry (CRDO, DKNG) was auto-cancelled 16s after
-    proposal because the name wasn't in the book.
+    proposal because the name wasn't in the book. Also verifies stand-down fires
+    only for the cancelled sell, not for surviving proposals.
     """
     store = [
         {"ticker": "CRDO", "action": "buy", "status": "proposed"},   # new position
@@ -108,6 +109,8 @@ def test_reconcile_cancels_sells_for_unheld_but_never_buys(monkeypatch):
     ]
     monkeypatch.setattr(pr, "load_all", lambda cfg: list(store))
     monkeypatch.setattr(pr, "save_all", lambda cfg, rows: (store.clear(), store.extend(rows)))
+    stood_down: list = []
+    monkeypatch.setattr(pr, "_send_stand_down", lambda cfg, e, reason: stood_down.append(e["ticker"]))
 
     n = pr.reconcile_with_portfolio({}, held_tickers=["NFLX", "AAPL"])
 
@@ -117,6 +120,7 @@ def test_reconcile_cancels_sells_for_unheld_but_never_buys(monkeypatch):
     assert by_t["NFLX"] == "proposed"   # sell of a held name survives
     assert by_t["GONE"] == "cancelled"  # sell of a closed name is cleared
     assert n == 1
+    assert stood_down == ["GONE"]       # stand-down fires exactly once, for the cancelled sell
 
 
 def test_kill_switch_silences_tickets(monkeypatch):

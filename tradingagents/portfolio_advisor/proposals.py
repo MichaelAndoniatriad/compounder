@@ -260,6 +260,20 @@ def _send_action_ticket(cfg: Dict[str, Any], entry: Dict[str, Any]) -> None:
         pass
 
 
+def _send_stand_down(cfg: Dict[str, Any], entry: Dict[str, Any], reason: str) -> None:
+    """Notify the user that a previously sent ticket is now void. Never raises."""
+    try:
+        from tradingagents.portfolio_advisor import messaging
+
+        tk = (entry.get("ticker") or "").upper()
+        act = (entry.get("action") or "").upper()
+        subject = f"Stand down on {tk} {act}"
+        body = f"⏹ Stand down on {tk} {act}\n{reason} — ignore the earlier ticket."
+        messaging.send_advisor_message(cfg, subject, body, urgent=False)
+    except Exception:
+        pass
+
+
 def reconcile_with_portfolio(cfg: Dict[str, Any], held_tickers: Iterable[str]) -> int:
     """Cancel OPEN reduce-side (sell/trim) proposals for names no longer held.
 
@@ -291,6 +305,7 @@ def reconcile_with_portfolio(cfg: Dict[str, Any], held_tickers: Iterable[str]) -
             r["status"] = "cancelled"
             r["status_set_at"] = now
             r["status_note"] = "auto-cancelled: position no longer held"
+            _send_stand_down(cfg, r, "Position no longer held")
             n += 1
     if n:
         save_all(cfg, rows)
