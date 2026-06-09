@@ -25,6 +25,9 @@ SURVIVOR_SCORE = 0.55  # composite threshold to graduate to LLM ranking
 # Tier breakpoints (each contributes points to the composite)
 _GROWTH_TIERS = [(0.20, 0.35), (0.15, 0.25), (0.10, 0.15), (0.05, 0.07)]
 _PEG_TIERS = [(1.5, 0.25), (2.0, 0.18), (3.0, 0.10), (5.0, 0.04)]
+# EV/Sales-to-Growth tiers for loss-makers (lower = cheaper for the growth).
+# Used as fallback when PEG is garbage (peg >= 999 or peg <= 0).
+_EVS_GROWTH_TIERS = [(0.40, 0.25), (0.70, 0.18), (1.20, 0.10), (2.00, 0.04)]
 _ROIC_TIERS = [(0.20, 0.25), (0.15, 0.20), (0.10, 0.12), (0.07, 0.06)]
 _GROSS_MARGIN_TIERS = [(0.50, 0.15), (0.35, 0.10), (0.25, 0.05)]
 _COMBO_BONUS_THRESHOLD = (0.20, 0.15, 1.5)  # rev_growth, roic, peg
@@ -120,11 +123,22 @@ def _score_quantitative(info: Dict[str, Any]) -> float:
         if rev_growth >= threshold:
             score += points
             break
-    # PEG tier (lower is better; we step down)
-    for threshold, points in _PEG_TIERS:
-        if peg <= threshold:
-            score += points
-            break
+    # PEG tier (lower is better; we step down). When PEG is garbage,
+    # fall back to EV/Sales÷growth for loss-makers.
+    if 0 < peg < 999:
+        for threshold, points in _PEG_TIERS:
+            if peg <= threshold:
+                score += points
+                break
+    else:
+        ev_sales = info.get("evToRevenue") or info.get("priceToSales") or 0
+        growth_pct = (rev_growth or 0) * 100      # rev_growth is a fraction
+        evs_to_growth = ev_sales / growth_pct if (ev_sales > 0 and growth_pct > 0) else None
+        if evs_to_growth is not None:
+            for threshold, points in _EVS_GROWTH_TIERS:
+                if evs_to_growth <= threshold:
+                    score += points
+                    break
     # ROIC tier
     for threshold, points in _ROIC_TIERS:
         if roic >= threshold:
