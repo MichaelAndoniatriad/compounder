@@ -20,7 +20,8 @@ MIN_PRICE = 5.0  # Below $5: manipulation risk, liquidity issues
 MIN_MARKET_CAP = 500_000_000  # $500M (wider than quant screen's $1B)
 MIN_AVG_VOLUME = 500_000  # 500K shares/day minimum liquidity
 MAX_DEBT_EQUITY = 5.0  # Debt/equity above 5x: balance sheet risk
-MIN_EPS = 0.01  # Must be profitable (PEG requires positive earnings)
+# EPS is no longer a hard gate — replaced by fragility gate (Phase 1a):
+# unprofitable names survive if they show ≥20% revenue growth + ≥40% gross margins.
 
 
 def mechanical_filter(tickers: List[str], reject_log_path: str = "") -> Tuple[List[str], Dict[str, List[str]]]:
@@ -96,10 +97,17 @@ def _check_one(ticker: str) -> str:
         if avg_vol and avg_vol < MIN_AVG_VOLUME:
             return "low_volume"
 
-        # EPS check — must be profitable
-        eps = info.get("trailingEps", None) or info.get("epsTrailingTwelveMonths", None)
+        # EPS check — fragility gate: unprofitable names survive only if they show
+        # credible growth-investment characteristics (high growth + high margins).
+        eps = info.get("trailingEps") or info.get("epsTrailingTwelveMonths")
         if eps is not None and eps <= 0:
-            return "negative_eps"
+            rev_growth   = info.get("revenueGrowth")      # yfinance fraction, may be None
+            gross_margin = info.get("grossMargins")       # yfinance fraction, may be None
+            # Only reject if we HAVE the data AND it fails the growth-investment bar.
+            if rev_growth is not None and gross_margin is not None:
+                if not (rev_growth >= 0.20 and gross_margin >= 0.40):
+                    return "unprofitable_no_growth"
+            # else: data missing → pass through to the AV quant screen (lenient)
 
         # Debt check
         de = info.get("debtToEquity", None)
