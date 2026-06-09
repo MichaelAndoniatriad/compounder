@@ -123,7 +123,7 @@ def _format_dip_handoff(rows: List[Dict[str, Any]]) -> str:
         line = (
             f"- {r['ticker']}: now ~${float(r.get('price') or 0):.2f}, "
             f"{float(r.get('below_ma_pct') or 0):.0f}% below its MA, "
-            f"{float(r.get('off_high_pct') or 0):.0f}% off the 52-wk high"
+            f"{float(r.get('off_high_pct') or 0):.0f}% off its recent high"
             + (f", RSI {float(rsi):.0f}" if rsi is not None else "")
         )
         if r.get("thesis"):
@@ -179,7 +179,11 @@ def run_dip_watch(
         if tk in held:
             latch.pop(tk, None)  # we own it now; stop watching for an entry
             continue
-        sig = price_util.dip_signal_yfinance(tk, ma_window=ma_window)
+        sig = price_util.dip_signal_yfinance(
+            tk,
+            ma_window=ma_window,
+            high_window_days=int(_f(cfg, "portfolio_advisor_dip_watch_high_window_days", 30)),
+        )
         if not sig:
             continue
         verdict, reason = classify_dip(sig, cfg)

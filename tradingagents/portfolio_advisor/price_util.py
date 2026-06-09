@@ -78,13 +78,16 @@ def _rsi_wilder(close: Any, period: int = 14) -> Optional[float]:
         return None
 
 
-def dip_signal_yfinance(ticker: str, *, ma_window: int = 50) -> Optional[Dict[str, Optional[float]]]:
+def dip_signal_yfinance(
+    ticker: str, *, ma_window: int = 50, high_window_days: int = 30
+) -> Optional[Dict[str, Optional[float]]]:
     """One-shot technical dip read from a single yfinance history fetch.
 
     Returns ``{price, ma, below_ma_pct, off_high_pct, rsi}`` or None. ``below_ma_pct``
     is POSITIVE when price sits below the moving average (a dip), negative when above;
-    ``off_high_pct`` is the percent below the trailing ~1yr high; ``rsi`` is Wilder(14).
-    The classification of these into "buy zone" vs "falling knife" lives in dip_watch.
+    ``off_high_pct`` is the percent below the trailing ``high_window_days`` high (recent
+    high, not the 52-wk high); ``rsi`` is Wilder(14). The classification of these into
+    "buy zone" vs "falling knife" lives in dip_watch.
     """
     sym = (ticker or "").strip().upper()
     if not sym:
@@ -103,7 +106,8 @@ def dip_signal_yfinance(ticker: str, *, ma_window: int = 50) -> Optional[Dict[st
         if price <= 0:
             return None
         ma = float(close.tail(int(ma_window)).mean())
-        high = float(close.max())
+        hi_n = int(high_window_days) if high_window_days and high_window_days > 0 else len(close)
+        high = float(close.tail(hi_n).max())
         return {
             "price": price,
             "ma": ma,

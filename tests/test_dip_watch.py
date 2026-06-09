@@ -51,7 +51,7 @@ def test_classify_thresholds_are_config_driven():
     # widen the knife threshold so a 30%-below name now reads as buy zone
     cfg = {"portfolio_advisor_dip_watch_falling_knife_below_ma_pct": 40.0,
            "portfolio_advisor_dip_watch_max_below_ma_pct": 35.0}
-    v, _ = dw.classify_dip(_sig(below=30, off_high=20), cfg)
+    v, _ = dw.classify_dip(_sig(below=30, off_high=15), cfg)
     assert v == "buy_zone"
 
 
@@ -64,7 +64,7 @@ class _Env:
         self.store = {}          # in-memory advisor state
         monkeypatch.setattr(dw.watchlist_mod, "load_watchlist", lambda cfg: list(watchlist))
         monkeypatch.setattr(dw.price_util, "dip_signal_yfinance",
-                            lambda tk, ma_window=50: self.signals.get(tk))
+                            lambda tk, **kw: self.signals.get(tk))
         monkeypatch.setattr(dw, "_held_tickers", lambda cfg: set(held))
         monkeypatch.setattr(dw.pa_state, "load_state", lambda cfg: self.store)
         monkeypatch.setattr(dw.pa_state, "save_state", lambda cfg, st: None)
