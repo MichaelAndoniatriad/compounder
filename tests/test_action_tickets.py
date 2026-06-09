@@ -14,21 +14,41 @@ def _p(**kw):
 
 # --- format_action_ticket ---------------------------------------------------
 
-def test_catalyst_buy_ticket_has_size_entry_and_stop():
+def test_catalyst_buy_full_size_with_stop_and_cap():
     t = pr.format_action_ticket({}, _p(ticker="DKNG", action="buy", shares=10, approx_usd=275,
                                        target_price=27.46, sleeve="catalyst", reason="World Cup"))
-    assert "🟢 BUY DKNG" in t
-    assert "10 sh" in t and "$275" in t and "$27.46" in t and "catalyst" in t
-    assert "Buy: today" in t                          # entry timing
-    assert "Sell: short hold" in t and "$25.26" in t  # exit timing + -8% stop (27.46*0.92)
+    assert "🟢 BUY DKNG" in t and "catalyst" in t
+    assert "Buy: full size today" in t                 # full size for catalyst
+    assert "$25.26" in t                               # -8% stop (27.46*0.92)
+    assert "30-day" in t                               # max-hold cap, no catalyst date
     assert "Why: World Cup" in t
 
 
-def test_core_buy_ticket_shows_horizon_not_a_stop():
-    t = pr.format_action_ticket({}, _p(ticker="VEEV", action="buy", approx_usd=500, sleeve="core"))
-    assert "Buy: this week" in t
-    assert "Sell: 3–5 yr hold" in t and "thesis-break" in t
-    assert "−8% stop" not in t
+def test_catalyst_buy_with_date_prints_concrete_exit_day():
+    t = pr.format_action_ticket({}, _p(ticker="DKNG", action="buy", target_price=27.46,
+                                       sleeve="catalyst", catalyst_date="2026-06-11", reason="WC"))
+    assert "Sell by Jun 14" in t                        # 06-11 + 3-day time-stop
+
+
+def test_core_buy_scales_in_with_concrete_levels():
+    t = pr.format_action_ticket({}, _p(ticker="VEEV", action="buy", approx_usd=600,
+                                       target_price=200, sleeve="core"))
+    assert "scale in over 2–4 wks" in t and "1/3 now" in t
+    assert "+100% ($400.00" in t and "−40% ($120.00" in t   # 200*2 and 200*0.6
+    assert "thesis-break" in t
+
+
+def test_core_buy_without_price_shows_pct_rules():
+    t = pr.format_action_ticket({}, _p(ticker="VEEV", action="buy", approx_usd=600, sleeve="core"))
+    assert "1/3 now" in t and "+100% trim half" in t and "−40% exit" in t
+    assert "$" not in t.split("Sell:")[1].split("\n")[0]    # no fabricated price levels
+
+
+def test_catalyst_exit_by_helper():
+    assert pr._catalyst_exit_by({}, "2026-06-11") == "Jun 14"            # +3 default
+    assert pr._catalyst_exit_by({"portfolio_advisor_catalyst_time_stop_days": 5}, "2026-06-11") == "Jun 16"
+    assert pr._catalyst_exit_by({}, "") == ""
+    assert pr._catalyst_exit_by({}, "not-a-date") == ""
 
 
 def test_sell_ticket_says_act_today_with_reason():

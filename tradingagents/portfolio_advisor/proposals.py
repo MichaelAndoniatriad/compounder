@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -116,9 +116,13 @@ def add(
     target_price: float = 0.0,
     sleeve: Optional[str] = None,
     reason: str = "",
+    catalyst_date: str = "",
 ) -> Dict[str, Any]:
     """Record a proposal, superseding any existing OPEN proposal for the same
     ticker+side.
+
+    catalyst_date (ISO, catalyst trades only) drives the concrete exit date on
+    the ticket: exit time_stop_days after it, or the 30-day cap if absent.
 
     This is the single writer for the ledger. Without the supersede step a rule
     that keeps firing (e.g. DOUBLE_FROM_ENTRY on a name that's still held) writes
@@ -148,6 +152,7 @@ def add(
         "approx_usd": float(approx_usd or 0),
         "target_price": float(target_price or 0),
         "sleeve": (str(sleeve).strip().lower() or None) if sleeve else None,
+        "catalyst_date": (catalyst_date or "").strip() or None,
         "reason": (reason or "").strip()[:500],
         "status": "proposed",
     }
@@ -201,21 +206,47 @@ def format_action_ticket(cfg: Dict[str, Any], p: Dict[str, Any]) -> str:
     at = f" @ ${px:.2f}" if px else ""
     sl = f" · {sleeve}" if sleeve else ""
     lines = [f"{emoji} {act.upper()} {tk} — {size}{at}{sl}".rstrip()]
-    # Explicit timing: when to act now, and the expected exit window.
+    # Explicit timing, straight from the rulebook (entry + concrete exit).
     if act in ("sell", "trim"):
         lines.append("When: today — act on this now")
     elif act in ("buy", "add"):
         if sleeve == "catalyst":
+            lines.append("Buy: full size today — time-sensitive catalyst")
             stop = f" (${px * 0.92:.2f})" if px else ""
-            lines.append("Buy: today — time-sensitive catalyst")
-            lines.append(f"Sell: short hold (days) — on the −8% stop{stop} or once the catalyst resolves")
+            exit_by = _catalyst_exit_by(cfg, p.get("catalyst_date"))
+            cap = int(cfg.get("portfolio_advisor_catalyst_max_hold_days", 30) or 30)
+            if exit_by:
+                lines.append(f"Sell by {exit_by} — or the −8% stop{stop}; {cap}-day hard cap")
+            else:
+                lines.append(f"Sell: −8% stop{stop} or {cap}-day cap (set a catalyst date for an exact exit day)")
         else:
-            lines.append("Buy: this week — scale in, no rush")
-            lines.append("Sell: 3–5 yr hold — only on thesis-break, a real sell-signal, or to reallocate")
+            third = f" (~${usd / 3:,.0f} each)" if usd else ""
+            lines.append(f"Buy: scale in over 2–4 wks — 1/3 now, then 2 tranches{third}")
+            if px:
+                lines.append(
+                    f"Sell: +100% (${px * 2:.2f}, trim half) · −40% (${px * 0.60:.2f}) exit · "
+                    "thesis-break · else 3–5 yr hold"
+                )
+            else:
+                lines.append("Sell: +100% trim half · −40% exit · thesis-break · else 3–5 yr hold")
     if reason:
         lines.append(f"Why: {reason[:220]}")
     lines.append("advisory — you execute on eToro")
     return "\n".join(lines)
+
+
+def _catalyst_exit_by(cfg: Dict[str, Any], catalyst_date: Any) -> str:
+    """Concrete exit day = catalyst_date + time_stop_days. '' if no usable date."""
+    raw = str(catalyst_date or "").strip()
+    if not raw:
+        return ""
+    try:
+        d = datetime.fromisoformat(raw[:10])
+    except ValueError:
+        return ""
+    days = int(cfg.get("portfolio_advisor_catalyst_time_stop_days", 3) or 3)
+    out = d + timedelta(days=days)
+    return f"{out:%b} {out.day}"
 
 
 def _send_action_ticket(cfg: Dict[str, Any], entry: Dict[str, Any]) -> None:

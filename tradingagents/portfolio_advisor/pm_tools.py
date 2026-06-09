@@ -265,6 +265,7 @@ def build_pm_tools(cfg: Dict[str, Any], live_tickers: set) -> List[Any]:
         target_price: float = 0.0,
         sleeve: str = "",
         reason: str = "",
+        catalyst_date: str = "",
     ) -> str:
         """Log a PROPOSED trade for the human to review and execute manually on eToro.
 
@@ -272,6 +273,11 @@ def build_pm_tools(cfg: Dict[str, Any], live_tickers: set) -> List[Any]:
         the exact proposal (ticker, action buy/sell/trim, shares, dollar size,
         sleeve, and your reason) to ~/.tradingagents/portfolio_advisor/proposed_trades.jsonl
         so the human sees a precise actionable list. action ∈ {buy, sell, trim, add}.
+
+        For a CATALYST buy, pass catalyst_date (ISO YYYY-MM-DD, e.g. the earnings
+        or event date) — it drives the concrete exit day on the ticket (exit
+        time_stop_days after it). Omit it for core names. target_price = your
+        intended entry; it lets the ticket print exact stop / +100% / -40% levels.
 
         reason is REQUIRED — explain WHY (what changed, the catalyst, the rule that
         fired, the thesis read). A proposal with no reason is rejected. For a held
@@ -302,6 +308,7 @@ def build_pm_tools(cfg: Dict[str, Any], live_tickers: set) -> List[Any]:
                 target_price=target_price,
                 sleeve=sleeve,
                 reason=reason_clean,
+                catalyst_date=catalyst_date,
             )
             # Mirror the decision + WHY into the position plan's history so the
             # rationale travels with the holding (held names; new buys stay in

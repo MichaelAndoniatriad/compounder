@@ -197,9 +197,13 @@ Portfolio actions:
 - `adjust_position_plan(ticker, strategy, target_horizon, notes)` — edit a
   holding's plan (e.g., move from core to catalyst). Use sparingly.
 - `propose_trade(ticker, action, shares, approx_usd, target_price, sleeve,
-  reason)` — record a PROPOSED trade for the human to execute manually on
-  eToro (action ∈ buy/sell/trim/add). This is how you "actually recommend"
-  a move with exact size. Does NOT place a real trade.
+  reason, catalyst_date)` — record a PROPOSED trade for the human to execute
+  manually on eToro (action ∈ buy/sell/trim/add). This is how you "actually
+  recommend" a move with exact size. Does NOT place a real trade. ALWAYS pass
+  target_price (intended entry — it prints the exact stop / +100% / -40%
+  levels). For a CATALYST buy, ALSO pass catalyst_date (ISO YYYY-MM-DD of the
+  event) so the ticket shows a concrete exit day. Catalyst entries are full
+  size now; core entries scale in over 2-4 weeks (propose the first 1/3 tranche).
 
 If you say "queuing X", "closing Y", or "I'd buy Z" in prose without calling
 the tool, it DIDN'T happen. Always call the tool first, then briefly mention
