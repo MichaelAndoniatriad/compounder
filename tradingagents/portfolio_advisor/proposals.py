@@ -201,12 +201,17 @@ def format_action_ticket(cfg: Dict[str, Any], p: Dict[str, Any]) -> str:
     at = f" @ ${px:.2f}" if px else ""
     sl = f" · {sleeve}" if sleeve else ""
     lines = [f"{emoji} {act.upper()} {tk} — {size}{at}{sl}".rstrip()]
-    if act in ("buy", "add"):
+    # Explicit timing: when to act now, and the expected exit window.
+    if act in ("sell", "trim"):
+        lines.append("When: today — act on this now")
+    elif act in ("buy", "add"):
         if sleeve == "catalyst":
             stop = f" (${px * 0.92:.2f})" if px else ""
-            lines.append(f"Stop −8%{stop} · exit on the stop or once the catalyst plays out")
+            lines.append("Buy: today — time-sensitive catalyst")
+            lines.append(f"Sell: short hold (days) — on the −8% stop{stop} or once the catalyst resolves")
         else:
-            lines.append("Core hold · exit on thesis-break, a real sell-signal, or to reallocate")
+            lines.append("Buy: this week — scale in, no rush")
+            lines.append("Sell: 3–5 yr hold — only on thesis-break, a real sell-signal, or to reallocate")
     if reason:
         lines.append(f"Why: {reason[:220]}")
     lines.append("advisory — you execute on eToro")

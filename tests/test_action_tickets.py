@@ -19,20 +19,23 @@ def test_catalyst_buy_ticket_has_size_entry_and_stop():
                                        target_price=27.46, sleeve="catalyst", reason="World Cup"))
     assert "🟢 BUY DKNG" in t
     assert "10 sh" in t and "$275" in t and "$27.46" in t and "catalyst" in t
-    assert "Stop −8%" in t and "$25.26" in t          # 27.46 * 0.92
+    assert "Buy: today" in t                          # entry timing
+    assert "Sell: short hold" in t and "$25.26" in t  # exit timing + -8% stop (27.46*0.92)
     assert "Why: World Cup" in t
 
 
-def test_core_buy_ticket_shows_qualitative_exit_not_a_stop():
+def test_core_buy_ticket_shows_horizon_not_a_stop():
     t = pr.format_action_ticket({}, _p(ticker="VEEV", action="buy", approx_usd=500, sleeve="core"))
-    assert "Core hold" in t and "thesis-break" in t
-    assert "Stop −8%" not in t
+    assert "Buy: this week" in t
+    assert "Sell: 3–5 yr hold" in t and "thesis-break" in t
+    assert "−8% stop" not in t
 
 
-def test_sell_ticket_is_size_plus_reason():
+def test_sell_ticket_says_act_today_with_reason():
     t = pr.format_action_ticket({}, _p(ticker="NFLX", action="sell", shares=2.14, approx_usd=177,
                                        reason="thesis broken"))
     assert "🔴 SELL NFLX" in t and "2.14 sh" in t and "$177" in t
+    assert "When: today" in t
     assert "Why: thesis broken" in t
 
 
