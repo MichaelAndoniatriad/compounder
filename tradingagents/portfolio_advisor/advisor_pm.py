@@ -1289,7 +1289,6 @@ def _apply_candidate_comparisons(
         return applied
 
     from tradingagents.portfolio_advisor import proposals as _proposals
-    from tradingagents.portfolio_advisor import messaging
 
     starter = float(cfg.get("portfolio_advisor_pm_candidate_starter_usd", 400) or 400)
     for c in comps:
@@ -1327,17 +1326,9 @@ def _apply_candidate_comparisons(
             logger.exception("candidate buy proposal for %s failed", cand)
             continue
 
-        sl = f" [{sleeve}]" if sleeve else ""
-        if effective == "replace":
-            head = f"🔁 REPLACE: sell {repl} → buy {cand} (~${size:.0f}{sl})"
-        else:
-            head = f"➕ ADD: buy {cand} (~${size:.0f}{sl})"
-        body = f"{head}\nWhy: {reason}\n(advisory — you execute on eToro)"
-        try:
-            messaging.send_advisor_message(cfg, "PM", body, urgent=True)
-        except Exception:
-            logger.debug("candidate nudge send failed", exc_info=True)
-
+        # proposals.add() above delivers a clean order ticket for the sell and
+        # the buy; a replace simply shows as a SELL ticket (reason "Replace with
+        # <cand>") plus a BUY ticket. No separate summary message needed.
         applied.append({
             "candidate": cand,
             "decision": effective,

@@ -63,7 +63,10 @@ def test_high_conviction_replace_records_sell_and_buy(captured):
     assert ("VEEV", "buy") in sides
     buy = next(p for p in captured["proposals"] if p["action"] == "buy")
     assert buy["approx_usd"] == 500 and buy["sleeve"] == "core"
-    assert len(captured["messages"]) == 1 and "REPLACE" in captured["messages"][0]
+    # The sell ticket carries the replace linkage; proposals.add() emits the
+    # order tickets now, so the handler itself no longer sends a message.
+    sell = next(p for p in captured["proposals"] if p["action"] == "sell")
+    assert "Replace with VEEV" in sell["reason"]
     assert applied[0]["decision"] == "replace" and applied[0]["replace_ticker"] == "ADBE"
 
 
@@ -83,7 +86,6 @@ def test_replace_with_non_live_holding_downgrades_to_add(captured):
     actions = [(p["ticker"], p["action"]) for p in captured["proposals"]]
     assert actions == [("INCY", "buy")]  # no sell for a non-live holding
     assert applied[0]["decision"] == "add"
-    assert "ADD" in captured["messages"][0]
 
 
 def test_zero_size_falls_back_to_starter(captured):

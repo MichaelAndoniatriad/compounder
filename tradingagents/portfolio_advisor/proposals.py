@@ -129,12 +129,14 @@ def add(
     side = _side(act)
     rows = load_all(cfg)
     now = datetime.now(timezone.utc).isoformat()
+    prior = None  # the open proposal this one replaces, if any
     for r in rows:
         if (
             r.get("status") == "proposed"
             and (r.get("ticker") or "").strip().upper() == tk
             and _side(r.get("action")) == side
         ):
+            prior = dict(r)
             r["status"] = "cancelled"
             r["status_set_at"] = now
             r["status_note"] = "superseded by a newer proposal"
@@ -151,7 +153,75 @@ def add(
     }
     rows.append(entry)
     save_all(cfg, rows)
+    # Push a clean, executable ticket to the human ONLY when this is genuinely
+    # new or materially changed — so a rule that re-fires every cycle (same side,
+    # same size) doesn't re-spam. Action-only: no proposal, no message.
+    if _proposal_is_new_or_changed(prior, entry) and bool(
+        cfg.get("portfolio_advisor_action_tickets", True)
+    ):
+        _send_action_ticket(cfg, entry)
     return entry
+
+
+def _proposal_is_new_or_changed(prior: Optional[Dict[str, Any]], entry: Dict[str, Any]) -> bool:
+    """True if this proposal is new, flips action, or changes size by >15%.
+
+    Small price/size drift on a standing proposal is not worth re-pinging.
+    """
+    if not prior:
+        return True
+    if str(prior.get("action", "")).lower() != str(entry.get("action", "")).lower():
+        return True
+    pu = float(prior.get("approx_usd") or 0)
+    eu = float(entry.get("approx_usd") or 0)
+    if pu <= 0:
+        return eu > 0
+    return abs(eu - pu) / pu > 0.15
+
+
+def format_action_ticket(cfg: Dict[str, Any], p: Dict[str, Any]) -> str:
+    """Render a proposal as a clean, executable order ticket for Telegram.
+
+    Answers the three questions every alert must: what + how much, at what price,
+    and when to get out. Catalyst names carry the -8% stop; core names exit on
+    thesis-break, a real sell-signal, or reallocation (no mechanical price target).
+    """
+    act = str(p.get("action", "")).lower()
+    tk = p.get("ticker", "")
+    sleeve = (p.get("sleeve") or "").lower()
+    shares = float(p.get("shares") or 0)
+    usd = float(p.get("approx_usd") or 0)
+    px = float(p.get("target_price") or 0)
+    reason = (p.get("reason") or "").strip()
+
+    emoji = {"buy": "🟢", "add": "🟢", "sell": "🔴", "trim": "🟠"}.get(act, "•")
+    size = f"{shares:g} sh" if shares else ""
+    if usd:
+        size = f"{size} (~${usd:,.0f})" if size else f"~${usd:,.0f}"
+    at = f" @ ${px:.2f}" if px else ""
+    sl = f" · {sleeve}" if sleeve else ""
+    lines = [f"{emoji} {act.upper()} {tk} — {size}{at}{sl}".rstrip()]
+    if act in ("buy", "add"):
+        if sleeve == "catalyst":
+            stop = f" (${px * 0.92:.2f})" if px else ""
+            lines.append(f"Stop −8%{stop} · exit on the stop or once the catalyst plays out")
+        else:
+            lines.append("Core hold · exit on thesis-break, a real sell-signal, or to reallocate")
+    if reason:
+        lines.append(f"Why: {reason[:220]}")
+    lines.append("advisory — you execute on eToro")
+    return "\n".join(lines)
+
+
+def _send_action_ticket(cfg: Dict[str, Any], entry: Dict[str, Any]) -> None:
+    """Deliver one order ticket. Never raises."""
+    try:
+        from tradingagents.portfolio_advisor import messaging
+
+        subject = f"{str(entry.get('action','')).upper()} {entry.get('ticker','')}".strip()
+        messaging.send_advisor_message(cfg, subject, format_action_ticket(cfg, entry), urgent=True)
+    except Exception:
+        pass
 
 
 def reconcile_with_portfolio(cfg: Dict[str, Any], held_tickers: Iterable[str]) -> int:
