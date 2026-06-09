@@ -4,7 +4,6 @@ Runs first Saturday of each month. Pulls live index constituents, screens
 quantitatively via Alpha Vantage, runs LLM qualitative pass on survivors.
 No hardcoded universes. No artificial dedup. Merit-only: if a stock
 qualifies, it qualifies."""
-"""
 
 from __future__ import annotations
 
