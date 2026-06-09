@@ -1150,6 +1150,63 @@ def _coerce_pm_result_from_text(text: str) -> AdvisorPMCycleResult:
         )
 
 
+_PM_JSON_OUTPUT_INSTRUCTION = (
+    "Now convert everything above into a SINGLE JSON object and output ONLY that object — "
+    "no prose, no commentary, no markdown fences. Use exactly these keys:\n"
+    '{\n'
+    '  "executive_summary": "<portfolio memo, plain text>",\n'
+    '  "stances": [{"ticker":"NVDA","stance":"hold|buy|sell|trim|add|watch",'
+    '"rationale":"...","evidence_refs":[]}],\n'
+    '  "candidate_comparisons": [{"candidate_ticker":"VEEV",'
+    '"better_than_current_holding":"yes|no|unknown",'
+    '"replace_or_add":"replace|add|watch|reject",'
+    '"replace_ticker":"<live holding to swap out, or empty>",'
+    '"proposed_size_usd":0,"target_sleeve":"core|catalyst",'
+    '"conviction":"high|medium|low","compared_against":[],'
+    '"rationale":"...","evidence_refs":[]}],\n'
+    '  "forward_tasks": ["..."],\n'
+    '  "push_note": "<=280-char urgent note for the human, or empty",\n'
+    '  "memory_note": "<one tight paragraph for your next cycle>",\n'
+    '  "request_replan": false\n'
+    '}\n'
+    "Include a stance for every material holding you discussed, and a candidate_comparison "
+    "for every promoted candidate you evaluated (set conviction='high' only for genuine "
+    "high-conviction replace/add calls — those get recorded as proposed trades). This must "
+    "match the actions you already took with tools; do not contradict them."
+)
+
+
+def _request_structured_result(llm: Any, messages: List[Any]) -> Optional[AdvisorPMCycleResult]:
+    """Second, non-tool pass: ask the model to emit the cycle result as JSON, then coerce it.
+
+    The tool loop already performed any actions; this pass recovers the STRUCTURED result
+    (stances, candidate_comparisons, ...) that deepseek-v4-pro omits when it answers in
+    prose. Returns None if the model still won't produce a JSON object, so the caller falls
+    back to the prose-only result rather than discarding it.
+    """
+    from langchain_core.messages import HumanMessage
+
+    try:
+        resp = llm.invoke(list(messages) + [HumanMessage(content=_PM_JSON_OUTPUT_INSTRUCTION)])
+        text = _content_from_llm_message(resp)
+    except Exception as e:
+        logger.warning("PM structured JSON pass failed: %s", e)
+        return None
+
+    # Accept only if the model actually returned a parseable JSON object.
+    fence = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, re.DOTALL)
+    s, e = text.find("{"), text.rfind("}")
+    for cand in ((fence.group(1) if fence else None), (text[s:e + 1] if s != -1 and e > s else None)):
+        if not cand:
+            continue
+        try:
+            if isinstance(json.loads(cand), dict):
+                return _coerce_pm_result_from_text(text)
+        except Exception:
+            continue
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Last-action log — lets the user CANCEL the most recent PM-queued jobs
 # ---------------------------------------------------------------------------
@@ -2133,14 +2190,31 @@ the trigger, say that plainly and use append_jobs to send a new research layer t
                     tresult = f"error: {te}"
                 messages.append(ToolMessage(content=str(tresult)[:1000], tool_call_id=tid))
         if last_resp is not None:
-            result = _coerce_pm_result_from_text(_content_from_llm_message(last_resp))
+            # The tool loop did the ACTIONS; deepseek-v4-pro's final message in thinking
+            # mode is prose, not JSON, so coercing it yields empty stances/comparisons.
+            # Ask once more (no tools) for the structured result so the whole structured
+            # layer — stances, candidate_comparisons, push_note — actually populates.
+            prose = _coerce_pm_result_from_text(_content_from_llm_message(last_resp))
+            structured = _request_structured_result(llm, messages)
+            if structured is not None:
+                result = structured
+                if not (result.executive_summary or "").strip():
+                    result.executive_summary = prose.executive_summary
+            else:
+                result = prose
     except Exception as e:
         logger.warning("PM tool-using cycle failed (%s); falling back to plain invoke.", e)
 
     if result is None:
-        # Fallback: plain text invoke (no tools, no structured output).
-        raw = llm.invoke([HumanMessage(content=prompt)])
-        result = _coerce_pm_result_from_text(_content_from_llm_message(raw))
+        # Fallback: plain invoke, then the same structured JSON pass on top.
+        msgs: List[Any] = [HumanMessage(content=prompt)]
+        raw = llm.invoke(msgs)
+        msgs.append(raw)
+        prose = _coerce_pm_result_from_text(_content_from_llm_message(raw))
+        structured = _request_structured_result(llm, msgs)
+        result = structured if structured is not None else prose
+        if structured is not None and not (result.executive_summary or "").strip():
+            result.executive_summary = prose.executive_summary
 
     validation_overrides = _validate_pm_cycle_result(
         cfg,
