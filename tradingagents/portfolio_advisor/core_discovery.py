@@ -381,14 +381,11 @@ def _llm_qualitative_rank(candidates: List[Dict], cfg: Dict[str, Any]) -> List[D
         if len(selected) >= 5:
             break
 
-    # Only deliver picks marked DEEP_DIVE YES
-    deep_dive_picks = [s for s in selected if s.get("deep_dive") == "YES"]
-    if deep_dive_picks:
-        return deep_dive_picks
-
-    # If LLM returned picks but none are deep-dive-worthy, return empty
-    # so the caller can message "nothing compelling this week"
-    return [] if selected else _pick_top_5(candidates)
+    # Return all selected picks — caller splits deep-dive vs on-the-radar.
+    # If LLM returned no picks at all, fall back to top-5 by score.
+    if selected:
+        return selected
+    return _pick_top_5(candidates)
 
 
 def _load_monthly_cache(month_key: str) -> Optional[List[Dict]]:
@@ -535,15 +532,79 @@ def run_core_discovery(cfg: Dict[str, Any]) -> str:
             _save_monthly_cache(month_key, picks)
     t4 = time.monotonic()
 
-    # Phase 4: Build Telegram message
-    if not picks:
+    # Phase 4: Split into deep-dive and on-the-radar tiers
+    deep_dive_picks = [p for p in picks if p.get("deep_dive") == "YES"]
+    radar_picks = [p for p in picks if p.get("deep_dive") != "YES"]
+
+    # Phase 4a: Build Telegram message for deep-dive picks only
+    if deep_dive_picks:
+        top_pick = deep_dive_picks[0]
         lines = [
-            f"Screened {len(universe) + total_rejected} names this month — {len(quant_pass)} passed the numbers, "
-            f"but nothing cleared the deep-dive bar after qualitative review.",
+            f"Screened {len(universe) + total_rejected} names this month — {len(quant_pass)} made it past the numbers, "
+            f"and these {len(deep_dive_picks)} came out on top after qualitative review.",
             "",
-            "No deep-dive candidates this month. Sometimes the best move is no move.",
         ]
+
+        for i, pick in enumerate(deep_dive_picks, 1):
+            thesis_line = pick.get("thesis", "")
+            parts = thesis_line.split("—") if "—" in thesis_line else [thesis_line]
+            conviction = parts[1].strip() if len(parts) >= 2 else ""
+            status = parts[2].strip() if len(parts) >= 3 else ""
+            thesis = "—".join(parts[3:]).strip() if len(parts) >= 4 else thesis_line
+
+            label = ""
+            herd_label = f" [{pick.get('herd', '')}]" if pick.get("herd") and pick.get("herd") != "UNKNOWN" else ""
+            if "overlap" in status.lower():
+                label = " (already held)"
+            elif "repeat" in status.lower():
+                label = " (repeat, thesis intact)"
+
+            lines.append(f"{i}. {pick['ticker']}{label}{herd_label} — {thesis}")
+            lines.append(
+                f"   {pick['sector']} | rev_growth {pick['rev_growth']}% | "
+                f"ROIC {pick['roic']}% | PEG {pick['peg']} | score {pick.get('score', 0):.2f}"
+            )
+            lines.append("")
+
+        top_ticker = top_pick["ticker"]
+        radar_note = ""
+        if radar_picks:
+            radar_names = ", ".join(p["ticker"] for p in radar_picks[:5])
+            radar_note = f" {len(radar_picks)} more on the radar: {radar_names}."
+        lines.append(
+            f"Top pick is {top_ticker}. Adding all {len(deep_dive_picks)} to the PM watchlist "
+            f"for the next sleeve allocation.{radar_note} Research queued on the top two."
+        )
+
         body = "\n".join(lines)
+
+        try:
+            from tradingagents.portfolio_advisor.messaging import send_advisor_message
+            send_advisor_message(
+                cfg, "Core Discovery", body, urgent=True,
+                log_as_recommendation=True,
+                rec_trigger="core_discovery",
+                rec_type="core_candidate",
+                rec_action=f"monthly_screen_{len(deep_dive_picks)}_deep_dive",
+                rec_rationale=(
+                    f"Screened {len(universe)} tickers. {len(quant_pass)} passed quant. "
+                    f"{len(deep_dive_picks)} deep-dive, {len(radar_picks)} on-radar. "
+                    f"Herd tags: {', '.join(p['ticker'] + ':' + p.get('herd', 'UNKNOWN') for p in deep_dive_picks)}"
+                ),
+            )
+        except Exception as e:
+            logger.warning("core discovery send failed: %s", e)
+            return f"Core discovery complete but send failed: {e}"
+    else:
+        # No deep-dive picks — send quiet summary if there are radar picks
+        body = (
+            f"Screened {len(universe) + total_rejected} names this month — {len(quant_pass)} passed the numbers, "
+            f"but nothing cleared the deep-dive bar after qualitative review."
+        )
+        if radar_picks:
+            radar_names = ", ".join(p["ticker"] for p in radar_picks[:5])
+            body += f" {len(radar_picks)} on the radar (watchlist only): {radar_names}."
+
         try:
             from tradingagents.portfolio_advisor.messaging import send_advisor_message
             send_advisor_message(
@@ -551,96 +612,31 @@ def run_core_discovery(cfg: Dict[str, Any]) -> str:
                 log_as_recommendation=True,
                 rec_trigger="core_discovery",
                 rec_type="core_candidate",
-                rec_action="monthly_screen_no_candidates",
-                rec_rationale=f"Screened {len(universe)} tickers. {len(quant_pass)} passed quant. 0 deep-dive worthy.",
+                rec_action="monthly_screen_no_deep_dive",
+                rec_rationale=(
+                    f"Screened {len(universe)} tickers. {len(quant_pass)} passed quant. "
+                    f"0 deep-dive, {len(radar_picks)} on-radar."
+                ),
             )
         except Exception as e:
             logger.warning("core discovery send failed: %s", e)
             return f"Core discovery complete but send failed: {e}"
 
-        logger.info("core discovery: complete — no deep-dive candidates (%.1fs total)", time.monotonic() - t0)
-        return "Core discovery: no deep-dive candidates this week."
-    top_pick = picks[0]
-    top_thesis = top_pick.get("thesis", "").split("—")[-1].strip() if "—" in top_pick.get("thesis", "") else ""
-
-    lines = [
-        f"Screened {len(universe) + total_rejected} names this month — {len(quant_pass)} made it past the numbers, and these {len(picks)} came out on top after qualitative review.",
-        "",
-    ]
-
-    for i, pick in enumerate(picks, 1):
-        thesis_line = pick.get("thesis", "")
-        # Parse the LLM output format: TICKER — CONVICTION X — STATUS — thesis
-        parts = thesis_line.split("—") if "—" in thesis_line else [thesis_line]
-        conviction = ""
-        status = ""
-        thesis = ""
-        if len(parts) >= 2:
-            conviction = parts[1].strip()
-        if len(parts) >= 3:
-            status = parts[2].strip()
-        if len(parts) >= 4:
-            thesis = "—".join(parts[3:]).strip()
-        else:
-            thesis = thesis_line
-
-        label = ""
-        herd_label = f" [{pick.get('herd', '')}]" if pick.get("herd") and pick.get("herd") != "UNKNOWN" else ""
-        if "overlap" in status.lower():
-            label = " (already held)"
-        elif "repeat" in status.lower():
-            label = " (repeat, thesis intact)"
-
-        lines.append(f"{i}. {pick['ticker']}{label}{herd_label} — {thesis}")
-        lines.append(
-            f"   {pick['sector']} | rev_growth {pick['rev_growth']}% | "
-            f"ROIC {pick['roic']}% | PEG {pick['peg']} | score {pick.get('score', 0):.2f}"
-        )
-        lines.append("")
-
-    # Lead recommendation based on top pick
-    top_ticker = top_pick["ticker"]
-    lines.append(
-        f"Top pick is {top_ticker}. I am adding all {len(picks)} to the PM watchlist "
-        f"so they factor into the next sleeve allocation. Research queued on the top two. "
-        f"If any of these overlap with current holdings, the PM already knows and will "
-        f"flag sizing or thesis updates in the next cycle."
-    )
-
-    body = "\n".join(lines)
-
-    # Send via Telegram
-    try:
-        from tradingagents.portfolio_advisor.messaging import send_advisor_message
-        send_advisor_message(
-            cfg, "Core Discovery", body, urgent=True,
-            log_as_recommendation=True,
-            rec_trigger="core_discovery",
-            rec_type="core_candidate",
-            rec_action=f"monthly_screen_{len(picks)}_candidates",
-            rec_rationale=f"Screened {len(universe)} tickers. {len(quant_pass)} passed quant. {len(picks)} selected. "
-                          f"Herd tags: {', '.join(p['ticker'] + ':' + p.get('herd', 'UNKNOWN') for p in picks)}",
-        )
-    except Exception as e:
-        logger.warning("core discovery send failed: %s", e)
-        return f"Core discovery complete but send failed: {e}"
-
-    # Phase 5: Push picks into PM watchlist so the PM can factor them into
-    # sleeve allocation and queue research without manual relay.
+    # Phase 5: Push picks into PM watchlist (both tiers)
     try:
         from tradingagents.portfolio_advisor.watchlist import load_watchlist, save_watchlist
 
         wl = load_watchlist(cfg)
-        added = 0
+        added_deep = 0
+        added_radar = 0
         updated = 0
-        for pick in picks:
+
+        for pick in deep_dive_picks:
             ticker = pick["ticker"]
-            # Parse thesis from the LLM line: TICKER — CONVICTION — STATUS — DEEP_DIVE — thesis
             raw = pick.get("thesis", "")
             parts = raw.split("—") if "—" in raw else [raw]
             thesis_text = parts[-1].strip() if len(parts) >= 5 else raw
 
-            # Check if ticker already exists
             found = None
             for e in wl:
                 et = (e if isinstance(e, str) else e.get("ticker", "")).strip().upper()
@@ -650,26 +646,52 @@ def run_core_discovery(cfg: Dict[str, Any]) -> str:
 
             if found and isinstance(found, dict):
                 if found.get("thesis", ""):
-                    continue  # already has a thesis, skip
-                # Update empty-thesis entry
+                    continue
                 found["thesis"] = thesis_text
                 found["source"] = "core_discovery"
                 found["added"] = today
                 updated += 1
             elif not found:
                 wl.append({
-                    "ticker": ticker,
-                    "thesis": thesis_text,
-                    "strategy": "core",
-                    "source": "core_discovery",
+                    "ticker": ticker, "thesis": thesis_text,
+                    "strategy": "core", "source": "core_discovery",
                     "added": today,
                 })
-                added += 1
-        if added or updated:
+                added_deep += 1
+
+        # On-the-radar picks: source="core_discovery_watch", low priority
+        for pick in radar_picks:
+            ticker = pick["ticker"]
+            raw = pick.get("thesis", "")
+            parts = raw.split("—") if "—" in raw else [raw]
+            thesis_text = parts[-1].strip() if len(parts) >= 5 else raw
+
+            found = None
+            for e in wl:
+                et = (e if isinstance(e, str) else e.get("ticker", "")).strip().upper()
+                if et == ticker:
+                    found = e
+                    break
+
+            if found and isinstance(found, dict):
+                continue  # already exists, don't downgrade source
+            elif not found:
+                wl.append({
+                    "ticker": ticker, "thesis": thesis_text,
+                    "strategy": "core", "source": "core_discovery_watch",
+                    "added": today,
+                })
+                added_radar += 1
+
+        if added_deep or added_radar or updated:
             save_watchlist(cfg, wl)
-            logger.info("core discovery: added %d, updated %d in PM watchlist", added, updated)
+            logger.info(
+                "core discovery: deep-dive +%d, radar +%d, updated %d in PM watchlist",
+                added_deep, added_radar, updated,
+            )
     except Exception as e:
         logger.warning("core discovery: watchlist update failed: %s", e)
 
-    logger.info("core discovery: complete (%.1fs total)", time.monotonic() - t0)
-    return f"Core discovery: {len(picks)} candidates sent via Telegram"
+    logger.info("core discovery: complete — %d deep-dive, %d on-radar (%.1fs total)",
+                len(deep_dive_picks), len(radar_picks), time.monotonic() - t0)
+    return f"Core discovery: {len(deep_dive_picks)} deep-dive, {len(radar_picks)} on-radar"
