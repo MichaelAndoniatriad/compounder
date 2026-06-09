@@ -207,6 +207,15 @@ DEFAULT_CONFIG = _apply_env_overrides({
     # Memory review: last N events as compact JSON in the reasoning prompt.
     "portfolio_advisor_memory_review_sample_events": 24,
     "portfolio_advisor_memory_review_json_chars": 6000,
+    # core_discovery_cadence: monthly (runs first Saturday of each month).
+    # Core names change on quarterly fundamentals cadence; monthly is enough.
+    # Cron: 0 10 1-7 * 6 (first Saturday, 10:00 UTC).
+    "core_discovery_cadence": "monthly",
+    # Consensus factor tilt for core discovery ranking (post-gate, ±0.10 max).
+    # Uses only crowding components (entry + divergence), NOT retail flow.
+    # Gated behind CONSENSUS_FACTOR_LIVE — keep False until snapshot is populated.
+    "consensus_tilt_weight": 0.10,
+    "CONSENSUS_FACTOR_LIVE": False,
     # Single-model advisor jobs: memory + JSONL tail injected into the reasoning prompt.
     "portfolio_advisor_single_model_memory_chars": 3500,
     "portfolio_advisor_single_model_events_chars": 2500,

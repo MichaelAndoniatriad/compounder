@@ -1,9 +1,9 @@
-"""Core position discovery — weekly screen for long-term growth candidates.
+"""Core position discovery — monthly screen for long-term growth candidates.
 
-Runs Saturday morning. Pulls live index constituents, screens quantitatively
-via yfinance, runs LLM qualitative pass on survivors. No hardcoded universes.
-No artificial dedup. Merit-only: if a stock qualifies, it qualifies.
-"""
+Runs first Saturday of each month. Pulls live index constituents, screens
+quantitatively via Alpha Vantage, runs LLM qualitative pass on survivors.
+No hardcoded universes. No artificial dedup. Merit-only: if a stock
+qualifies, it qualifies."""
 
 from __future__ import annotations
 
@@ -24,6 +24,9 @@ SURVIVOR_SCORE = 0.55  # composite threshold to graduate to LLM ranking
 # Tier breakpoints (each contributes points to the composite)
 _GROWTH_TIERS = [(0.20, 0.35), (0.15, 0.25), (0.10, 0.15), (0.05, 0.07)]
 _PEG_TIERS = [(1.5, 0.25), (2.0, 0.18), (3.0, 0.10), (5.0, 0.04)]
+# EV/Sales-to-Growth tiers for loss-makers (lower = cheaper for the growth).
+# Used as fallback when PEG is garbage (peg >= 999 or peg <= 0).
+_EVS_GROWTH_TIERS = [(0.40, 0.25), (0.70, 0.18), (1.20, 0.10), (2.00, 0.04)]
 _ROIC_TIERS = [(0.20, 0.25), (0.15, 0.20), (0.10, 0.12), (0.07, 0.06)]
 _GROSS_MARGIN_TIERS = [(0.50, 0.15), (0.35, 0.10), (0.25, 0.05)]
 _COMBO_BONUS_THRESHOLD = (0.20, 0.15, 1.5)  # rev_growth, roic, peg
@@ -35,6 +38,10 @@ def _build_universe() -> List[str]:
 
     Scans all tables on each page for a Symbol/Ticker column rather than
     hardcoding table indices, which break when Wikipedia editors reorder tables.
+
+    UNIVERSE = S&P 500 + NASDAQ 100. Down-cap widening is DELIBERATELY DEFERRED:
+    a separate decision after de-biasing is proven (see core_discovery_v2_plan.md section 9).
+    Widening the universe raises risk and must be assessed independently.
     """
     import pandas as pd
 
@@ -95,11 +102,18 @@ def _build_universe() -> List[str]:
 
 
 def _score_quantitative(info: Dict[str, Any]) -> float:
-    """Composite quality score [0.0, 1.0] from yfinance info dict.
+    """Composite quality score [0.0, 1.0] from fundamentals dict.
 
     Each criterion contributes points by tier. Names that are strong on most
     criteria but weak on one still survive. Names below the minimum cap are
     returned as 0 (hard gate handled by caller).
+
+    VALUATION POLICY (per core_discovery_v2_plan.md section 6):
+    Valuation enters only as GROWTH-ADJUSTED (PEG or EV/Sales / growth for
+    loss-makers), as one weighted input among moat/growth/ROIC/margins.
+    No deep-value / "buy cheap" bias: that excludes the best compounders
+    and walks into value traps. Entry timing lives in the PM layer. DO NOT
+    add any "undervalued" or "cheap" filter here.
     """
     market_cap = info.get("marketCap", 0) or 0
     if market_cap < MIN_MARKET_CAP:
@@ -119,11 +133,22 @@ def _score_quantitative(info: Dict[str, Any]) -> float:
         if rev_growth >= threshold:
             score += points
             break
-    # PEG tier (lower is better; we step down)
-    for threshold, points in _PEG_TIERS:
-        if peg <= threshold:
-            score += points
-            break
+    # PEG tier (lower is better; we step down). When PEG is garbage,
+    # fall back to EV/Sales÷growth for loss-makers.
+    if 0 < peg < 999:
+        for threshold, points in _PEG_TIERS:
+            if peg <= threshold:
+                score += points
+                break
+    else:
+        ev_sales = info.get("evToRevenue") or info.get("priceToSales") or 0
+        growth_pct = (rev_growth or 0) * 100      # rev_growth is a fraction
+        evs_to_growth = ev_sales / growth_pct if (ev_sales > 0 and growth_pct > 0) else None
+        if evs_to_growth is not None:
+            for threshold, points in _EVS_GROWTH_TIERS:
+                if evs_to_growth <= threshold:
+                    score += points
+                    break
     # ROIC tier
     for threshold, points in _ROIC_TIERS:
         if roic >= threshold:
@@ -280,17 +305,33 @@ def _llm_qualitative_rank(candidates: List[Dict], cfg: Dict[str, Any]) -> List[D
     except Exception:
         pass
 
+    # Build anti-herd context: load consensus top_20 if available
+    consensus_top = _load_consensus_top_list()
+    consensus_text = ""
+    if consensus_top:
+        consensus_text = (
+            "\n\nCONSENSUS HERD LIST (names the AI/financial-media herd is currently pushing):\n"
+            + ", ".join(consensus_top[:20])
+            + "\nDo NOT default to these names. Treat a consensus presence as a mild negative "
+            "unless the setup is genuinely exceptional."
+        )
+
     prompt = (
         "You are screening stocks for a concentrated growth portfolio. "
         "From the candidates below, identify up to 5 that have the best long-term compounding potential. "
         "Prioritise: durable competitive moat, founder-led or strong operator, secular tailwind, "
         "and clean financials (cash flow tracks earnings, limited dilution, manageable debt, "
-        "growth not decelerating).\n\n"
-        f"Candidates:\n{cand_text}\n"
-        f"{holdings_text}\n"
-        f"{researched_text}\n"
-        "Return EXACTLY one line per pick. Format each line as:\n"
-        "TICKER — CONVICTION (High/Medium/Low) — STATUS (new/overlap/repeat) — DEEP_DIVE (YES/NO) — punchy one-line thesis\n\n"
+        "growth not decelerating).\\n\\n"
+        "IMPORTANT: Do not default to the obvious mega-caps that every AI screen surfaces. "
+        "Prefer under-followed, differentiated businesses that clear the same quality bar. "
+        "If a candidate is in the consensus/herd list above, treat that as a mild negative "
+        "unless its setup is exceptional.\\n\\n"
+        f"Candidates:\\n{cand_text}\\n"
+        f"{consensus_text}\\n"
+        f"{holdings_text}\\n"
+        f"{researched_text}\\n"
+        "Return EXACTLY one line per pick. Format each line as:\\n"
+        "TICKER — CONVICTION (High/Medium/Low) — STATUS (new/overlap/repeat) — DEEP_DIVE (YES/NO) — HERD (CONSENSUS/DIFFERENTIATED) — punchy one-line thesis\\n\\n"
         "DEEP_DIVE rules:\n"
         "- YES = genuinely worth Michael spending 2+ hours researching. Must have BOTH High conviction "
         "AND at least two of: clear moat, founder-led, secular tailwind, exceptional numbers.\n"
@@ -312,10 +353,10 @@ def _llm_qualitative_rank(candidates: List[Dict], cfg: Dict[str, Any]) -> List[D
         return _pick_top_5(candidates)
 
     # Parse ticker lines.
-    # LLM format: TICKER — High — new — YES — thesis (or with labels)
+    # LLM format: TICKER — CONVICTION — STATUS — DEEP_DIVE — HERD — thesis
     ticker_re = _re.compile(
         r"^([A-Z]{1,5})\s*[—\-]\s*(High|Medium|Low)\s*[—\-]\s*(new|overlap|repeat|\w+)"
-        r"\s*[—\-]\s*(YES|NO)",
+        r"\s*[—\-]\s*(YES|NO)\s*[—\-]\s*(CONSENSUS|DIFFERENTIATED|\w+)",
         _re.IGNORECASE,
     )
 
@@ -323,6 +364,17 @@ def _llm_qualitative_rank(candidates: List[Dict], cfg: Dict[str, Any]) -> List[D
     for line in str(content).split("\n"):
         line = line.strip()
         m = ticker_re.search(line)
+        if not m:
+            # Fall back to old format without HERD tag for backward compatibility
+            fallback_re = _re.compile(
+                r"^([A-Z]{1,5})\s*[—\-]\s*(High|Medium|Low)\s*[—\-]\s*(new|overlap|repeat|\w+)"
+                r"\s*[—\-]\s*(YES|NO)",
+                _re.IGNORECASE,
+            )
+            m = fallback_re.search(line)
+            herd_tag = "UNKNOWN"
+        else:
+            herd_tag = m.group(5).upper()
         if not m:
             continue
         ticker = m.group(1).upper()
@@ -333,60 +385,116 @@ def _llm_qualitative_rank(candidates: List[Dict], cfg: Dict[str, Any]) -> List[D
                 c["thesis"] = line
                 c["conviction"] = conviction
                 c["deep_dive"] = deep_dive
+                c["herd"] = herd_tag
                 selected.append(c)
                 break
         if len(selected) >= 5:
             break
 
-    # Only deliver picks marked DEEP_DIVE YES
-    deep_dive_picks = [s for s in selected if s.get("deep_dive") == "YES"]
-    if deep_dive_picks:
-        return deep_dive_picks
-
-    # If LLM returned picks but none are deep-dive-worthy, return empty
-    # so the caller can message "nothing compelling this week"
-    return [] if selected else _pick_top_5(candidates)
+    # Return all selected picks — caller splits deep-dive vs on-the-radar.
+    # If LLM returned no picks at all, fall back to top-5 by score.
+    if selected:
+        return selected
+    return _pick_top_5(candidates)
 
 
-def _load_weekly_cache(week_key: str) -> Optional[List[Dict]]:
-    """Return cached picks if they exist for this week and quant results match."""
+def _load_monthly_cache(month_key: str) -> Optional[List[Dict]]:
+    """Return cached picks if they exist for this month and quant results match."""
     from pathlib import Path as _Path
     from datetime import datetime as _dt
-    cache_path = _Path.home() / ".tradingagents" / "cache" / f"core_discovery_picks_{_dt.now(timezone.utc).strftime('%Y-W%W')}.json"
+    cache_path = _Path.home() / ".tradingagents" / "cache" / f"core_discovery_picks_{_dt.now(timezone.utc).strftime('%Y-%m')}.json"
     if not cache_path.is_file():
         return None
     try:
         cached = json.loads(cache_path.read_text(encoding="utf-8"))
-        if cached.get("week_key") == week_key:
-            logger.info("core discovery: using cached picks from earlier this week (%d picks)", len(cached.get("picks", [])))
+        if cached.get("month_key") == month_key:
+            logger.info("core discovery: using cached picks from earlier this month (%d picks)", len(cached.get("picks", [])))
             return cached["picks"]
     except (OSError, json.JSONDecodeError, KeyError):
         pass
     return None
 
 
-def _save_weekly_cache(week_key: str, picks: List[Dict]) -> None:
-    """Cache picks for the rest of the week so repeated runs return same results."""
+def _save_monthly_cache(month_key: str, picks: List[Dict]) -> None:
+    """Cache picks for the rest of the month so repeated runs return same results."""
     from pathlib import Path as _Path
     from datetime import datetime as _dt
-    cache_path = _Path.home() / ".tradingagents" / "cache" / f"core_discovery_picks_{_dt.now(timezone.utc).strftime('%Y-W%W')}.json"
+    cache_path = _Path.home() / ".tradingagents" / "cache" / f"core_discovery_picks_{_dt.now(timezone.utc).strftime('%Y-%m')}.json"
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     slim = [{
         "ticker": p["ticker"], "name": p.get("name", ""), "sector": p.get("sector", ""),
         "rev_growth": p.get("rev_growth"), "roic": p.get("roic"), "peg": p.get("peg"),
         "score": p.get("score"), "conviction": p.get("conviction"), "deep_dive": p.get("deep_dive"),
-        "thesis": p.get("thesis", ""), "gross_margin": p.get("gross_margin"),
+        "herd": p.get("herd", "UNKNOWN"), "thesis": p.get("thesis", ""), "gross_margin": p.get("gross_margin"),
         "fwd_pe": p.get("fwd_pe"), "debt_equity": p.get("debt_equity"),
     } for p in picks]
     tmp = cache_path.with_suffix(".tmp")
-    tmp.write_text(json.dumps({"week_key": week_key, "picks": slim}, ensure_ascii=False), encoding="utf-8")
+    tmp.write_text(json.dumps({"month_key": month_key, "picks": slim}, ensure_ascii=False), encoding="utf-8")
     tmp.replace(cache_path)
-    logger.info("core discovery: cached %d picks for the week", len(picks))
+    logger.info("core discovery: cached %d picks for the month", len(picks))
 
 
 def _pick_top_5(candidates: List[Dict]) -> List[Dict]:
     """Fallback: pick top 5 by composite score when LLM unavailable."""
     return sorted(candidates, key=lambda c: c.get("score", 0), reverse=True)[:5]
+
+
+def _load_consensus_top_list() -> List[str]:
+    """Load the current top 20 consensus tickers from the snapshot, if it exists.
+
+    Returns empty list if no snapshot, no data, or any error — fail-safe.
+    """
+    from pathlib import Path as _Path
+    try:
+        snapshot_path = _Path.home() / ".tradingagents" / "cache" / "llm_consensus" / "snapshot.json"
+        if snapshot_path.is_file():
+            data = json.loads(snapshot_path.read_text(encoding="utf-8"))
+            return data.get("top_20", [])
+    except (OSError, json.JSONDecodeError, KeyError, TypeError):
+        pass
+    return []
+
+
+def _apply_consensus_tilt(candidates: List[Dict], cfg: Dict[str, Any]) -> List[Dict]:
+    """Apply discovery consensus tilt to re-rank survivors by crowding.
+
+    Uses only consensus_entry_score + consensus_divergence_score (averaged).
+    Retail flow is reserved for the PM sizing layer.
+    Gated behind CONSENSUS_FACTOR_LIVE — returns candidates unchanged if off
+    or if snapshot is empty (fail-safe: never errors, never blocks a pick).
+    """
+    if not cfg.get("CONSENSUS_FACTOR_LIVE", False):
+        return candidates
+
+    tilt_weight = float(cfg.get("consensus_tilt_weight", 0.10))
+    if tilt_weight <= 0:
+        return candidates
+
+    try:
+        from tradingagents.portfolio_advisor.consensus_score import (
+            consensus_entry_score,
+            consensus_divergence_score,
+        )
+
+        for c in candidates:
+            ticker = c["ticker"]
+            entry = consensus_entry_score(ticker)
+            divergence = consensus_divergence_score(ticker)
+            tilt = tilt_weight * (entry + divergence) / 2.0
+            # Store tilt for audit; adjust effective score for ranking
+            c["consensus_tilt"] = round(tilt, 3)
+            c["effective_score"] = round(c.get("score", 0) + tilt, 3)
+
+        # Re-sort by effective score descending
+        candidates.sort(key=lambda c: c.get("effective_score", c.get("score", 0)), reverse=True)
+        logger.info(
+            "core discovery: applied consensus tilt to %d candidates (weight=%.2f)",
+            len(candidates), tilt_weight,
+        )
+    except Exception as e:
+        logger.warning("core discovery: consensus tilt failed, returning unscored: %s", e)
+
+    return candidates
 
 
 def run_core_discovery(cfg: Dict[str, Any]) -> str:
@@ -416,27 +524,97 @@ def run_core_discovery(cfg: Dict[str, Any]) -> str:
     quant_pass = _quantitative_screen(universe)
     t3 = time.monotonic()
     if not quant_pass:
-        return "Core discovery: no tickers passed quantitative filters this week."
+        return "Core discovery: no tickers passed quantitative filters this month."
     logger.info("core discovery: %d passed quantitative screen (%.1fs)", len(quant_pass), t3 - t2)
 
-    # Phase 3: LLM qualitative rank (cache makes it deterministic within a week)
-    week_key = f"{today}_{len(quant_pass)}"
-    picks = _load_weekly_cache(week_key)
+    # Phase 2b: Apply consensus tilt (post-gate, ranking only).
+    # Re-orders survivors by crowding; never changes who passes the gate.
+    # Gated behind CONSENSUS_FACTOR_LIVE — no-ops to neutral until snapshot is populated.
+    quant_pass = _apply_consensus_tilt(quant_pass, cfg)
+
+    # Phase 3: LLM qualitative rank (monthly cache makes it deterministic within a month)
+    # TODO earnings-season refresh: run an extra discovery pass during earnings season.
+    month_key = f"{today}_{len(quant_pass)}"
+    picks = _load_monthly_cache(month_key)
     if picks is None:
         picks = _llm_qualitative_rank(quant_pass, cfg)
         if picks:
-            _save_weekly_cache(week_key, picks)
+            _save_monthly_cache(month_key, picks)
     t4 = time.monotonic()
 
-    # Phase 4: Build Telegram message
-    if not picks:
+    # Phase 4: Split into deep-dive and on-the-radar tiers
+    deep_dive_picks = [p for p in picks if p.get("deep_dive") == "YES"]
+    radar_picks = [p for p in picks if p.get("deep_dive") != "YES"]
+
+    # Phase 4a: Build Telegram message for deep-dive picks only
+    if deep_dive_picks:
+        top_pick = deep_dive_picks[0]
         lines = [
-            f"Screened {len(universe) + total_rejected} names this week — {len(quant_pass)} passed the numbers, "
-            f"but nothing cleared the deep-dive bar after qualitative review.",
+            f"Screened {len(universe) + total_rejected} names this month — {len(quant_pass)} made it past the numbers, "
+            f"and these {len(deep_dive_picks)} came out on top after qualitative review.",
             "",
-            "No deep-dive candidates this week. Sometimes the best move is no move.",
         ]
+
+        for i, pick in enumerate(deep_dive_picks, 1):
+            thesis_line = pick.get("thesis", "")
+            parts = thesis_line.split("—") if "—" in thesis_line else [thesis_line]
+            conviction = parts[1].strip() if len(parts) >= 2 else ""
+            status = parts[2].strip() if len(parts) >= 3 else ""
+            thesis = "—".join(parts[3:]).strip() if len(parts) >= 4 else thesis_line
+
+            label = ""
+            herd_label = f" [{pick.get('herd', '')}]" if pick.get("herd") and pick.get("herd") != "UNKNOWN" else ""
+            if "overlap" in status.lower():
+                label = " (already held)"
+            elif "repeat" in status.lower():
+                label = " (repeat, thesis intact)"
+
+            lines.append(f"{i}. {pick['ticker']}{label}{herd_label} — {thesis}")
+            lines.append(
+                f"   {pick['sector']} | rev_growth {pick['rev_growth']}% | "
+                f"ROIC {pick['roic']}% | PEG {pick['peg']} | score {pick.get('score', 0):.2f}"
+            )
+            lines.append("")
+
+        top_ticker = top_pick["ticker"]
+        radar_note = ""
+        if radar_picks:
+            radar_names = ", ".join(p["ticker"] for p in radar_picks[:5])
+            radar_note = f" {len(radar_picks)} more on the radar: {radar_names}."
+        lines.append(
+            f"Top pick is {top_ticker}. Adding all {len(deep_dive_picks)} to the PM watchlist "
+            f"for the next sleeve allocation.{radar_note} Research queued on the top two."
+        )
+
         body = "\n".join(lines)
+
+        try:
+            from tradingagents.portfolio_advisor.messaging import send_advisor_message
+            send_advisor_message(
+                cfg, "Core Discovery", body, urgent=True,
+                log_as_recommendation=True,
+                rec_trigger="core_discovery",
+                rec_type="core_candidate",
+                rec_action=f"monthly_screen_{len(deep_dive_picks)}_deep_dive",
+                rec_rationale=(
+                    f"Screened {len(universe)} tickers. {len(quant_pass)} passed quant. "
+                    f"{len(deep_dive_picks)} deep-dive, {len(radar_picks)} on-radar. "
+                    f"Herd tags: {', '.join(p['ticker'] + ':' + p.get('herd', 'UNKNOWN') for p in deep_dive_picks)}"
+                ),
+            )
+        except Exception as e:
+            logger.warning("core discovery send failed: %s", e)
+            return f"Core discovery complete but send failed: {e}"
+    else:
+        # No deep-dive picks — send quiet summary if there are radar picks
+        body = (
+            f"Screened {len(universe) + total_rejected} names this month — {len(quant_pass)} passed the numbers, "
+            f"but nothing cleared the deep-dive bar after qualitative review."
+        )
+        if radar_picks:
+            radar_names = ", ".join(p["ticker"] for p in radar_picks[:5])
+            body += f" {len(radar_picks)} on the radar (watchlist only): {radar_names}."
+
         try:
             from tradingagents.portfolio_advisor.messaging import send_advisor_message
             send_advisor_message(
@@ -444,94 +622,31 @@ def run_core_discovery(cfg: Dict[str, Any]) -> str:
                 log_as_recommendation=True,
                 rec_trigger="core_discovery",
                 rec_type="core_candidate",
-                rec_action="weekly_screen_no_candidates",
-                rec_rationale=f"Screened {len(universe)} tickers. {len(quant_pass)} passed quant. 0 deep-dive worthy.",
+                rec_action="monthly_screen_no_deep_dive",
+                rec_rationale=(
+                    f"Screened {len(universe)} tickers. {len(quant_pass)} passed quant. "
+                    f"0 deep-dive, {len(radar_picks)} on-radar."
+                ),
             )
         except Exception as e:
             logger.warning("core discovery send failed: %s", e)
             return f"Core discovery complete but send failed: {e}"
 
-        logger.info("core discovery: complete — no deep-dive candidates (%.1fs total)", time.monotonic() - t0)
-        return "Core discovery: no deep-dive candidates this week."
-    top_pick = picks[0]
-    top_thesis = top_pick.get("thesis", "").split("—")[-1].strip() if "—" in top_pick.get("thesis", "") else ""
-
-    lines = [
-        f"Screened {len(universe) + total_rejected} names this week — {len(quant_pass)} made it past the numbers, and these {len(picks)} came out on top after qualitative review.",
-        "",
-    ]
-
-    for i, pick in enumerate(picks, 1):
-        thesis_line = pick.get("thesis", "")
-        # Parse the LLM output format: TICKER — CONVICTION X — STATUS — thesis
-        parts = thesis_line.split("—") if "—" in thesis_line else [thesis_line]
-        conviction = ""
-        status = ""
-        thesis = ""
-        if len(parts) >= 2:
-            conviction = parts[1].strip()
-        if len(parts) >= 3:
-            status = parts[2].strip()
-        if len(parts) >= 4:
-            thesis = "—".join(parts[3:]).strip()
-        else:
-            thesis = thesis_line
-
-        label = ""
-        if "overlap" in status.lower():
-            label = " (already held)"
-        elif "repeat" in status.lower():
-            label = " (repeat, thesis intact)"
-
-        lines.append(f"{i}. {pick['ticker']}{label} — {thesis}")
-        lines.append(
-            f"   {pick['sector']} | rev_growth {pick['rev_growth']}% | "
-            f"ROIC {pick['roic']}% | PEG {pick['peg']} | score {pick.get('score', 0):.2f}"
-        )
-        lines.append("")
-
-    # Lead recommendation based on top pick
-    top_ticker = top_pick["ticker"]
-    lines.append(
-        f"Top pick is {top_ticker}. I am adding all {len(picks)} to the PM watchlist "
-        f"so they factor into the next sleeve allocation. Research queued on the top two. "
-        f"If any of these overlap with current holdings, the PM already knows and will "
-        f"flag sizing or thesis updates in the next cycle."
-    )
-
-    body = "\n".join(lines)
-
-    # Send via Telegram
-    try:
-        from tradingagents.portfolio_advisor.messaging import send_advisor_message
-        send_advisor_message(
-            cfg, "Core Discovery", body, urgent=True,
-            log_as_recommendation=True,
-            rec_trigger="core_discovery",
-            rec_type="core_candidate",
-            rec_action=f"weekly_screen_{len(picks)}_candidates",
-            rec_rationale=f"Screened {len(universe)} tickers. {len(quant_pass)} passed quant. {len(picks)} selected.",
-        )
-    except Exception as e:
-        logger.warning("core discovery send failed: %s", e)
-        return f"Core discovery complete but send failed: {e}"
-
-    # Phase 5: Push picks into PM watchlist so the PM can factor them into
-    # sleeve allocation and queue research without manual relay.
+    # Phase 5: Push picks into PM watchlist (both tiers)
     try:
         from tradingagents.portfolio_advisor.watchlist import load_watchlist, save_watchlist
 
         wl = load_watchlist(cfg)
-        added = 0
+        added_deep = 0
+        added_radar = 0
         updated = 0
-        for pick in picks:
+
+        for pick in deep_dive_picks:
             ticker = pick["ticker"]
-            # Parse thesis from the LLM line: TICKER — CONVICTION — STATUS — DEEP_DIVE — thesis
             raw = pick.get("thesis", "")
             parts = raw.split("—") if "—" in raw else [raw]
             thesis_text = parts[-1].strip() if len(parts) >= 5 else raw
 
-            # Check if ticker already exists
             found = None
             for e in wl:
                 et = (e if isinstance(e, str) else e.get("ticker", "")).strip().upper()
@@ -541,26 +656,52 @@ def run_core_discovery(cfg: Dict[str, Any]) -> str:
 
             if found and isinstance(found, dict):
                 if found.get("thesis", ""):
-                    continue  # already has a thesis, skip
-                # Update empty-thesis entry
+                    continue
                 found["thesis"] = thesis_text
                 found["source"] = "core_discovery"
                 found["added"] = today
                 updated += 1
             elif not found:
                 wl.append({
-                    "ticker": ticker,
-                    "thesis": thesis_text,
-                    "strategy": "core",
-                    "source": "core_discovery",
+                    "ticker": ticker, "thesis": thesis_text,
+                    "strategy": "core", "source": "core_discovery",
                     "added": today,
                 })
-                added += 1
-        if added or updated:
+                added_deep += 1
+
+        # On-the-radar picks: source="core_discovery_watch", low priority
+        for pick in radar_picks:
+            ticker = pick["ticker"]
+            raw = pick.get("thesis", "")
+            parts = raw.split("—") if "—" in raw else [raw]
+            thesis_text = parts[-1].strip() if len(parts) >= 5 else raw
+
+            found = None
+            for e in wl:
+                et = (e if isinstance(e, str) else e.get("ticker", "")).strip().upper()
+                if et == ticker:
+                    found = e
+                    break
+
+            if found and isinstance(found, dict):
+                continue  # already exists, don't downgrade source
+            elif not found:
+                wl.append({
+                    "ticker": ticker, "thesis": thesis_text,
+                    "strategy": "core", "source": "core_discovery_watch",
+                    "added": today,
+                })
+                added_radar += 1
+
+        if added_deep or added_radar or updated:
             save_watchlist(cfg, wl)
-            logger.info("core discovery: added %d, updated %d in PM watchlist", added, updated)
+            logger.info(
+                "core discovery: deep-dive +%d, radar +%d, updated %d in PM watchlist",
+                added_deep, added_radar, updated,
+            )
     except Exception as e:
         logger.warning("core discovery: watchlist update failed: %s", e)
 
-    logger.info("core discovery: complete (%.1fs total)", time.monotonic() - t0)
-    return f"Core discovery: {len(picks)} candidates sent via Telegram"
+    logger.info("core discovery: complete — %d deep-dive, %d on-radar (%.1fs total)",
+                len(deep_dive_picks), len(radar_picks), time.monotonic() - t0)
+    return f"Core discovery: {len(deep_dive_picks)} deep-dive, {len(radar_picks)} on-radar"

@@ -117,6 +117,8 @@ def get_ticker_fundamentals(ticker: str) -> Dict[str, Any]:
     gross_margin = gross_profit / revenue if revenue > 0 else 0.0
 
     fwd_pe = _f(data.get("ForwardPE"))
+    ev_to_revenue = _f(data.get("EVToRevenue"))
+    price_to_sales = _f(data.get("PriceToSalesRatioTTM"))
     debt_equity_raw = data.get("DebtToEquityRatio")
     if debt_equity_raw is None or str(debt_equity_raw).strip().upper() in ("NONE", ""):
         debt_equity = 0.0
@@ -139,6 +141,8 @@ def get_ticker_fundamentals(ticker: str) -> Dict[str, Any]:
         "sector": sector,
         "industry": industry,
         "forwardPE": fwd_pe,
+        "evToRevenue": ev_to_revenue,
+        "priceToSales": price_to_sales,
         "debtToEquity": debt_equity,
         "currentPrice": 0.0,  # AV OVERVIEW does not include price
         "summary": summary,
