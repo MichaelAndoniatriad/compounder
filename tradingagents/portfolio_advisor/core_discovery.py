@@ -295,17 +295,33 @@ def _llm_qualitative_rank(candidates: List[Dict], cfg: Dict[str, Any]) -> List[D
     except Exception:
         pass
 
+    # Build anti-herd context: load consensus top_20 if available
+    consensus_top = _load_consensus_top_list()
+    consensus_text = ""
+    if consensus_top:
+        consensus_text = (
+            "\n\nCONSENSUS HERD LIST (names the AI/financial-media herd is currently pushing):\n"
+            + ", ".join(consensus_top[:20])
+            + "\nDo NOT default to these names. Treat a consensus presence as a mild negative "
+            "unless the setup is genuinely exceptional."
+        )
+
     prompt = (
         "You are screening stocks for a concentrated growth portfolio. "
         "From the candidates below, identify up to 5 that have the best long-term compounding potential. "
         "Prioritise: durable competitive moat, founder-led or strong operator, secular tailwind, "
         "and clean financials (cash flow tracks earnings, limited dilution, manageable debt, "
-        "growth not decelerating).\n\n"
-        f"Candidates:\n{cand_text}\n"
-        f"{holdings_text}\n"
-        f"{researched_text}\n"
-        "Return EXACTLY one line per pick. Format each line as:\n"
-        "TICKER — CONVICTION (High/Medium/Low) — STATUS (new/overlap/repeat) — DEEP_DIVE (YES/NO) — punchy one-line thesis\n\n"
+        "growth not decelerating).\\n\\n"
+        "IMPORTANT: Do not default to the obvious mega-caps that every AI screen surfaces. "
+        "Prefer under-followed, differentiated businesses that clear the same quality bar. "
+        "If a candidate is in the consensus/herd list above, treat that as a mild negative "
+        "unless its setup is exceptional.\\n\\n"
+        f"Candidates:\\n{cand_text}\\n"
+        f"{consensus_text}\\n"
+        f"{holdings_text}\\n"
+        f"{researched_text}\\n"
+        "Return EXACTLY one line per pick. Format each line as:\\n"
+        "TICKER — CONVICTION (High/Medium/Low) — STATUS (new/overlap/repeat) — DEEP_DIVE (YES/NO) — HERD (CONSENSUS/DIFFERENTIATED) — punchy one-line thesis\\n\\n"
         "DEEP_DIVE rules:\n"
         "- YES = genuinely worth Michael spending 2+ hours researching. Must have BOTH High conviction "
         "AND at least two of: clear moat, founder-led, secular tailwind, exceptional numbers.\n"
@@ -327,10 +343,10 @@ def _llm_qualitative_rank(candidates: List[Dict], cfg: Dict[str, Any]) -> List[D
         return _pick_top_5(candidates)
 
     # Parse ticker lines.
-    # LLM format: TICKER — High — new — YES — thesis (or with labels)
+    # LLM format: TICKER — CONVICTION — STATUS — DEEP_DIVE — HERD — thesis
     ticker_re = _re.compile(
         r"^([A-Z]{1,5})\s*[—\-]\s*(High|Medium|Low)\s*[—\-]\s*(new|overlap|repeat|\w+)"
-        r"\s*[—\-]\s*(YES|NO)",
+        r"\s*[—\-]\s*(YES|NO)\s*[—\-]\s*(CONSENSUS|DIFFERENTIATED|\w+)",
         _re.IGNORECASE,
     )
 
@@ -338,6 +354,17 @@ def _llm_qualitative_rank(candidates: List[Dict], cfg: Dict[str, Any]) -> List[D
     for line in str(content).split("\n"):
         line = line.strip()
         m = ticker_re.search(line)
+        if not m:
+            # Fall back to old format without HERD tag for backward compatibility
+            fallback_re = _re.compile(
+                r"^([A-Z]{1,5})\s*[—\-]\s*(High|Medium|Low)\s*[—\-]\s*(new|overlap|repeat|\w+)"
+                r"\s*[—\-]\s*(YES|NO)",
+                _re.IGNORECASE,
+            )
+            m = fallback_re.search(line)
+            herd_tag = "UNKNOWN"
+        else:
+            herd_tag = m.group(5).upper()
         if not m:
             continue
         ticker = m.group(1).upper()
@@ -348,6 +375,7 @@ def _llm_qualitative_rank(candidates: List[Dict], cfg: Dict[str, Any]) -> List[D
                 c["thesis"] = line
                 c["conviction"] = conviction
                 c["deep_dive"] = deep_dive
+                c["herd"] = herd_tag
                 selected.append(c)
                 break
         if len(selected) >= 5:
@@ -390,7 +418,7 @@ def _save_monthly_cache(month_key: str, picks: List[Dict]) -> None:
         "ticker": p["ticker"], "name": p.get("name", ""), "sector": p.get("sector", ""),
         "rev_growth": p.get("rev_growth"), "roic": p.get("roic"), "peg": p.get("peg"),
         "score": p.get("score"), "conviction": p.get("conviction"), "deep_dive": p.get("deep_dive"),
-        "thesis": p.get("thesis", ""), "gross_margin": p.get("gross_margin"),
+        "herd": p.get("herd", "UNKNOWN"), "thesis": p.get("thesis", ""), "gross_margin": p.get("gross_margin"),
         "fwd_pe": p.get("fwd_pe"), "debt_equity": p.get("debt_equity"),
     } for p in picks]
     tmp = cache_path.with_suffix(".tmp")
@@ -402,6 +430,22 @@ def _save_monthly_cache(month_key: str, picks: List[Dict]) -> None:
 def _pick_top_5(candidates: List[Dict]) -> List[Dict]:
     """Fallback: pick top 5 by composite score when LLM unavailable."""
     return sorted(candidates, key=lambda c: c.get("score", 0), reverse=True)[:5]
+
+
+def _load_consensus_top_list() -> List[str]:
+    """Load the current top 20 consensus tickers from the snapshot, if it exists.
+
+    Returns empty list if no snapshot, no data, or any error — fail-safe.
+    """
+    from pathlib import Path as _Path
+    try:
+        snapshot_path = _Path.home() / ".tradingagents" / "cache" / "llm_consensus" / "snapshot.json"
+        if snapshot_path.is_file():
+            data = json.loads(snapshot_path.read_text(encoding="utf-8"))
+            return data.get("top_20", [])
+    except (OSError, json.JSONDecodeError, KeyError, TypeError):
+        pass
+    return []
 
 
 def run_core_discovery(cfg: Dict[str, Any]) -> str:
@@ -431,7 +475,7 @@ def run_core_discovery(cfg: Dict[str, Any]) -> str:
     quant_pass = _quantitative_screen(universe)
     t3 = time.monotonic()
     if not quant_pass:
-        return "Core discovery: no tickers passed quantitative filters this week."
+        return "Core discovery: no tickers passed quantitative filters this month."
     logger.info("core discovery: %d passed quantitative screen (%.1fs)", len(quant_pass), t3 - t2)
 
     # Phase 3: LLM qualitative rank (monthly cache makes it deterministic within a month)
@@ -447,10 +491,10 @@ def run_core_discovery(cfg: Dict[str, Any]) -> str:
     # Phase 4: Build Telegram message
     if not picks:
         lines = [
-            f"Screened {len(universe) + total_rejected} names this week — {len(quant_pass)} passed the numbers, "
+            f"Screened {len(universe) + total_rejected} names this month — {len(quant_pass)} passed the numbers, "
             f"but nothing cleared the deep-dive bar after qualitative review.",
             "",
-            "No deep-dive candidates this week. Sometimes the best move is no move.",
+            "No deep-dive candidates this month. Sometimes the best move is no move.",
         ]
         body = "\n".join(lines)
         try:
@@ -460,7 +504,7 @@ def run_core_discovery(cfg: Dict[str, Any]) -> str:
                 log_as_recommendation=True,
                 rec_trigger="core_discovery",
                 rec_type="core_candidate",
-                rec_action="weekly_screen_no_candidates",
+                rec_action="monthly_screen_no_candidates",
                 rec_rationale=f"Screened {len(universe)} tickers. {len(quant_pass)} passed quant. 0 deep-dive worthy.",
             )
         except Exception as e:
@@ -473,7 +517,7 @@ def run_core_discovery(cfg: Dict[str, Any]) -> str:
     top_thesis = top_pick.get("thesis", "").split("—")[-1].strip() if "—" in top_pick.get("thesis", "") else ""
 
     lines = [
-        f"Screened {len(universe) + total_rejected} names this week — {len(quant_pass)} made it past the numbers, and these {len(picks)} came out on top after qualitative review.",
+        f"Screened {len(universe) + total_rejected} names this month — {len(quant_pass)} made it past the numbers, and these {len(picks)} came out on top after qualitative review.",
         "",
     ]
 
@@ -494,12 +538,13 @@ def run_core_discovery(cfg: Dict[str, Any]) -> str:
             thesis = thesis_line
 
         label = ""
+        herd_label = f" [{pick.get('herd', '')}]" if pick.get("herd") and pick.get("herd") != "UNKNOWN" else ""
         if "overlap" in status.lower():
             label = " (already held)"
         elif "repeat" in status.lower():
             label = " (repeat, thesis intact)"
 
-        lines.append(f"{i}. {pick['ticker']}{label} — {thesis}")
+        lines.append(f"{i}. {pick['ticker']}{label}{herd_label} — {thesis}")
         lines.append(
             f"   {pick['sector']} | rev_growth {pick['rev_growth']}% | "
             f"ROIC {pick['roic']}% | PEG {pick['peg']} | score {pick.get('score', 0):.2f}"
@@ -525,8 +570,9 @@ def run_core_discovery(cfg: Dict[str, Any]) -> str:
             log_as_recommendation=True,
             rec_trigger="core_discovery",
             rec_type="core_candidate",
-            rec_action=f"weekly_screen_{len(picks)}_candidates",
-            rec_rationale=f"Screened {len(universe)} tickers. {len(quant_pass)} passed quant. {len(picks)} selected.",
+            rec_action=f"monthly_screen_{len(picks)}_candidates",
+            rec_rationale=f"Screened {len(universe)} tickers. {len(quant_pass)} passed quant. {len(picks)} selected. "
+                          f"Herd tags: {', '.join(p['ticker'] + ':' + p.get('herd', 'UNKNOWN') for p in picks)}",
         )
     except Exception as e:
         logger.warning("core discovery send failed: %s", e)
