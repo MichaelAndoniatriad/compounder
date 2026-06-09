@@ -281,6 +281,11 @@ def reconcile_with_portfolio(cfg: Dict[str, Any], held_tickers: Iterable[str]) -
     for r in rows:
         if (
             r.get("status") == "proposed"
+            # ONLY reduce-side (sell/trim) proposals are mooted by a name leaving
+            # the book. A BUY/ADD is precisely FOR a name not held yet — never
+            # cancel it just because the position doesn't exist (that silently
+            # killed every catalyst entry 16s after it was proposed).
+            and _side(r.get("action")) == "reduce"
             and (r.get("ticker") or "").strip().upper() not in held
         ):
             r["status"] = "cancelled"
