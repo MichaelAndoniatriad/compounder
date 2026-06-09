@@ -184,6 +184,18 @@ DEFAULT_CONFIG = _apply_env_overrides({
     "portfolio_advisor_catalyst_trailing_stop_pct": 0.08,    # then exit if down 8% from peak
     "portfolio_advisor_catalyst_time_stop_days": 3,          # days after catalyst date to exit if move didn't happen
     "portfolio_advisor_catalyst_max_hold_days": 30,          # hard hold cap when no catalyst date is set
+    # Dip-watch (quality-on-a-dip): watch CORE watchlist names for a SHALLOW pullback
+    # into a buy zone, then let the PM judge (value-trap check) + propose a staged entry.
+    # Bounds are config because the research found exact thresholds are indicative, not
+    # validated — tune to taste. below_ma_pct is positive when price sits BELOW the MA.
+    "portfolio_advisor_dip_watch_enabled": True,
+    "portfolio_advisor_dip_watch_ma_window": 50,                   # moving-average window (days)
+    "portfolio_advisor_dip_watch_min_below_ma_pct": 0.0,          # buy zone starts at/just below the MA
+    "portfolio_advisor_dip_watch_max_below_ma_pct": 12.0,        # ...up to 12% below the MA
+    "portfolio_advisor_dip_watch_off_high_min_pct": 8.0,         # must be >=8% off the 52-wk high (a real pullback)
+    "portfolio_advisor_dip_watch_off_high_max_pct": 35.0,       # >=35% off the high = collapsed, reject
+    "portfolio_advisor_dip_watch_falling_knife_below_ma_pct": 25.0,  # >=25% below the MA = knife, reject
+    "portfolio_advisor_dip_watch_rsi_floor": 25.0,              # RSI < 25 = capitulation, reject
     # Core sleeve: a +15% position only fires PRE_EARNINGS_TRIM (red) when its next earnings
     # date is within this many days; otherwise it stays amber ("trim armed").
     "portfolio_advisor_pre_earnings_trim_window_days": 14,

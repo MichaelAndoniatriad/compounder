@@ -651,6 +651,14 @@ def run_watchdog(cfg: Dict[str, Any], *, ignore_market_hours: bool = False) -> i
     return int(watchdog_mod.run_watchdog(cfg, ignore_market_hours=ignore_market_hours))
 
 
+def run_dip_watch(cfg: Dict[str, Any], *, ignore_market_hours: bool = False) -> int:
+    """Quality-on-a-dip scan: watch core watchlist names, hand fresh dips to the PM."""
+    set_config(cfg)
+    from tradingagents.portfolio_advisor import dip_watch as dip_watch_mod
+
+    return int(dip_watch_mod.run_dip_watch(cfg, ignore_market_hours=ignore_market_hours))
+
+
 def run_post_earnings(cfg: Dict[str, Any], ticker: str) -> str:
     """Email a one-shot post-earnings verdict using the configured reasoning model."""
     from tradingagents.portfolio_advisor.post_verdict import run_post_earnings_verdict

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +57,62 @@ def next_earnings_date_yfinance(ticker: str) -> Optional[str]:
         return None
     except Exception as e:
         logger.debug("yfinance earnings date failed for %s: %s", sym, e)
+        return None
+
+
+def _rsi_wilder(close: Any, period: int = 14) -> Optional[float]:
+    """Wilder's RSI on a pandas close series. None if not enough data."""
+    try:
+        deltas = close.diff().dropna()
+        if len(deltas) < period:
+            return None
+        gains = deltas.clip(lower=0.0)
+        losses = (-deltas).clip(lower=0.0)
+        avg_gain = gains.ewm(alpha=1.0 / period, adjust=False).mean().iloc[-1]
+        avg_loss = losses.ewm(alpha=1.0 / period, adjust=False).mean().iloc[-1]
+        if avg_loss == 0:
+            return 100.0
+        rs = float(avg_gain) / float(avg_loss)
+        return float(100.0 - 100.0 / (1.0 + rs))
+    except Exception:
+        return None
+
+
+def dip_signal_yfinance(ticker: str, *, ma_window: int = 50) -> Optional[Dict[str, Optional[float]]]:
+    """One-shot technical dip read from a single yfinance history fetch.
+
+    Returns ``{price, ma, below_ma_pct, off_high_pct, rsi}`` or None. ``below_ma_pct``
+    is POSITIVE when price sits below the moving average (a dip), negative when above;
+    ``off_high_pct`` is the percent below the trailing ~1yr high; ``rsi`` is Wilder(14).
+    The classification of these into "buy zone" vs "falling knife" lives in dip_watch.
+    """
+    sym = (ticker or "").strip().upper()
+    if not sym:
+        return None
+    try:
+        import yfinance as yf
+
+        need = max(int(ma_window), 20)
+        hist = yf.Ticker(sym).history(period="1y")
+        if hist is None or len(hist.index) < need:
+            return None
+        close = hist["Close"].dropna()
+        if len(close) < need:
+            return None
+        price = float(close.iloc[-1])
+        if price <= 0:
+            return None
+        ma = float(close.tail(int(ma_window)).mean())
+        high = float(close.max())
+        return {
+            "price": price,
+            "ma": ma,
+            "below_ma_pct": ((ma - price) / ma * 100.0) if ma > 0 else 0.0,
+            "off_high_pct": ((high - price) / high * 100.0) if high > 0 else 0.0,
+            "rsi": _rsi_wilder(close, 14),
+        }
+    except Exception as e:
+        logger.debug("yfinance dip signal failed for %s: %s", sym, e)
         return None
 
 

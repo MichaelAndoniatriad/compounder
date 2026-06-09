@@ -18,6 +18,7 @@ mkdir -p "$LA" "$LOGDIR"
 
 LABELS=(
   com.compounder.watchdog
+  com.compounder.dip-watch
   com.compounder.run-due
   com.compounder.ep-scan
   com.compounder.ep-scan-postclose
@@ -80,6 +81,9 @@ cal() { # cal <Hour> <Minute> [extraKey extraVal]
 install() {
   # --- interval jobs (self-gate where market-tied) ---
   write_plist com.compounder.watchdog "$(interval 300)" "exec $RUN watchdog"
+  # dip-watch: quality watchlist names → buy-zone dips → PM. Dips form over hours,
+  # so 30 min is ample; self-skips outside US equity hours.
+  write_plist com.compounder.dip-watch "$(interval 1800)" "exec $RUN dip-watch"
   write_plist com.compounder.run-due  "$(interval 900)" "exec $RUN run-due"
 
   # --- catalyst scans (13:30 local = 08:30 ET pre-market; 21:15 = 16:15 ET post-close) ---

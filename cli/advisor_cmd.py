@@ -276,6 +276,26 @@ def portfolio_advisor_watchdog(
         raise typer.Exit(1) from e
 
 
+@portfolio_app.command("dip-watch")
+def portfolio_advisor_dip_watch(
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Run even outside the default 13:30 to 20:00 UTC weekday window (for tests).",
+    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+):
+    """Quality-on-a-dip scan: watch CORE watchlist names, ping the PM when one dips into a buy zone (no LLM here; PM judges)."""
+    _configure_logging(verbose)
+    cfg = DEFAULT_CONFIG.copy()
+    try:
+        n = portfolio_advisor_service.run_dip_watch(cfg, ignore_market_hours=force)
+        console.print(f"[cyan]Advisor dip-watch:[/cyan] new dip hand-offs {n}.")
+    except Exception as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1) from e
+
+
 @portfolio_app.command("bootstrap")
 def portfolio_advisor_bootstrap(
     delay: float = typer.Option(
