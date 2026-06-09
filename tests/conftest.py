@@ -35,6 +35,31 @@ def _dummy_api_keys(monkeypatch):
         monkeypatch.setenv(env_var, os.environ.get(env_var, "placeholder"))
 
 
+@pytest.fixture(autouse=True)
+def _isolate_live_event_log(tmp_path, monkeypatch):
+    """No test may write to the real ~/.tradingagents event log.
+
+    append_event() falls back to ~/.tradingagents/memory/events.jsonl when a
+    config carries no explicit path. A graph-path test (propagate) leaked
+    phantom NVDA 2026-01-10 "Buy" decisions into production this way, faking a
+    persistent PM conflict. Redirect ONLY that real-home fallback to a temp
+    file; explicit event_log_path / memory_log_path configs are untouched.
+    """
+    from pathlib import Path
+
+    import tradingagents.agents.utils.event_log as el
+
+    real = Path.home() / ".tradingagents" / "memory" / "events.jsonl"
+    safe = tmp_path / "events.jsonl"
+    _orig = el._default_event_path
+
+    def _guarded(cfg):
+        resolved = _orig(cfg)
+        return safe if Path(resolved) == real else resolved
+
+    monkeypatch.setattr(el, "_default_event_path", _guarded)
+
+
 @pytest.fixture()
 def mock_llm_client():
     client = MagicMock()
