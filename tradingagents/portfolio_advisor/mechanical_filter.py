@@ -4,7 +4,12 @@ Layer 1: deterministic, no LLM. Runs before quantitative screen.
 Filters out stocks that definitively cannot qualify. Fast, debuggable,
 logs every rejection with reason.
 
-Eliminates ~80% of universe before yfinance detail calls.
+All gates are HARD (per core_discovery_v2_plan.md section 4):
+price >= $5, market cap >= $500M, volume >= 500K/day, debt/equity <= 5x.
+Nothing below the floor, ever. EPS is now a fragility gate (Phase 1a),
+not a hard disqualifier.
+
+Eliminates ~80% of universe before quantitative screening.
 """
 
 from __future__ import annotations

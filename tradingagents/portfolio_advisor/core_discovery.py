@@ -39,6 +39,10 @@ def _build_universe() -> List[str]:
 
     Scans all tables on each page for a Symbol/Ticker column rather than
     hardcoding table indices, which break when Wikipedia editors reorder tables.
+
+    UNIVERSE = S&P 500 + NASDAQ 100. Down-cap widening is DELIBERATELY DEFERRED:
+    a separate decision after de-biasing is proven (see core_discovery_v2_plan.md section 9).
+    Widening the universe raises risk and must be assessed independently.
     """
     import pandas as pd
 
@@ -99,11 +103,18 @@ def _build_universe() -> List[str]:
 
 
 def _score_quantitative(info: Dict[str, Any]) -> float:
-    """Composite quality score [0.0, 1.0] from yfinance info dict.
+    """Composite quality score [0.0, 1.0] from fundamentals dict.
 
     Each criterion contributes points by tier. Names that are strong on most
     criteria but weak on one still survive. Names below the minimum cap are
     returned as 0 (hard gate handled by caller).
+
+    VALUATION POLICY (per core_discovery_v2_plan.md section 6):
+    Valuation enters only as GROWTH-ADJUSTED (PEG or EV/Sales / growth for
+    loss-makers), as one weighted input among moat/growth/ROIC/margins.
+    No deep-value / "buy cheap" bias: that excludes the best compounders
+    and walks into value traps. Entry timing lives in the PM layer. DO NOT
+    add any "undervalued" or "cheap" filter here.
     """
     market_cap = info.get("marketCap", 0) or 0
     if market_cap < MIN_MARKET_CAP:
