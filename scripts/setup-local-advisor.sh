@@ -28,6 +28,7 @@ LABELS=(
   com.compounder.consensus-scrape
   com.compounder.measure-outcomes
   com.compounder.heartbeat
+  com.compounder.checkin
   com.compounder.telegram-listener
 )
 
@@ -91,6 +92,9 @@ install() {
   write_plist com.compounder.weekly "$(cal 14 0 Weekday 6)" "exec $RUN weekly"
   write_plist com.compounder.heartbeat "$(cal 8 0)" "exec $RUN heartbeat"
   write_plist com.compounder.measure-outcomes "$(cal 11 0 Weekday 0)" "exec $RUN measure-outcomes"
+
+  # --- daily Telegram check-in reminder (glanceable advisor status) ---
+  write_plist com.compounder.checkin "$(cal 9 0)" "exec $ROOT/scripts/send-checkin-reminder.sh"
 
   # --- monthly core discovery (1st of month, 15:00 local) ---
   write_plist com.compounder.core-scan "$(cal 15 0 Day 1)" "exec $RUN core-scan"
