@@ -24,10 +24,14 @@ fi
 
 LOCK="$HOME/.tradingagents/run/telegram-listener.lock"
 mkdir -p "$(dirname "$LOCK")"
-exec 200>"$LOCK"
-if ! flock -n 200; then
-  echo "$(date '+%Y-%m-%dT%H:%M:%S%z') run-telegram-listener: another instance is holding the lock; exiting" >&2
-  exit 1
+# flock is Linux-only; macOS lacks it. Under launchd KeepAlive only one
+# instance runs per label, so the lock is only needed for cron/manual use.
+if command -v flock >/dev/null 2>&1; then
+  exec 200>"$LOCK"
+  if ! flock -n 200; then
+    echo "$(date '+%Y-%m-%dT%H:%M:%S%z') run-telegram-listener: another instance is holding the lock; exiting" >&2
+    exit 1
+  fi
 fi
 
 exec "$PY" -m cli.main advisor portfolio telegram-listen
