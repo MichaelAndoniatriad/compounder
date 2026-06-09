@@ -163,6 +163,15 @@ def run_weekly_quick_check(cfg: Dict[str, Any]) -> Tuple[str, bool, Set[str]]:
         lines.extend(["", "--- Attention ---", "Overdue pending jobs (past scheduled time):"])
         lines.extend(f"  - {o}" for o in overdue[:20])
 
+    try:
+        from tradingagents.integrations.alpaca import executor as _alpaca
+
+        paper_block = _alpaca.build_scoreboard_block(cfg)
+        if paper_block:
+            lines.extend(["", paper_block])
+    except Exception:
+        logger.debug("alpaca scoreboard block skipped", exc_info=True)
+
     lines.extend(["", "--- Account excerpt ---", portfolio_text[:4000]])
     digest = "\n".join(lines)
 

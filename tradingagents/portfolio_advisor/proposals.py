@@ -165,6 +165,15 @@ def add(
         cfg.get("portfolio_advisor_action_tickets", True)
     ):
         _send_action_ticket(cfg, entry)
+    # Mirror onto the Alpaca PAPER book — only a genuinely NEW proposal trades;
+    # a superseding restatement of an open proposal must not double the position.
+    if prior is None:
+        try:
+            from tradingagents.integrations.alpaca import executor as _alpaca
+
+            _alpaca.execute_proposal(cfg, entry)
+        except Exception:
+            pass
     return entry
 
 

@@ -464,6 +464,19 @@ def run_watchdog(cfg: Dict[str, Any], *, ignore_market_hours: bool = False, supp
     if bool(cfg.get("portfolio_advisor_watchdog_direct_alerts", False)):
         _send_direct_watchdog_alerts(cfg, mandatory, trim, review)
 
+    # Mirror deterministic exits onto the Alpaca PAPER book immediately — rule
+    # exits are the risk limit and must not wait for the next PM cycle. The
+    # executor is idempotent (skips names the paper book no longer holds).
+    try:
+        from tradingagents.integrations.alpaca import executor as _alpaca
+
+        for t in mandatory:
+            _alpaca.close_for_watchdog(cfg, t.get("ticker", ""), 1.0, "dd40_mandatory_exit")
+        for t in trim:
+            _alpaca.close_for_watchdog(cfg, t.get("ticker", ""), 0.5, ",".join(t.get("codes") or []) or "trim")
+    except Exception:
+        logger.debug("alpaca watchdog mirror skipped", exc_info=True)
+
     # Build the hand-off payload from the full pending set, reconstructing each
     # ticker's data from its latch so retries read the same as fresh changes.
     kind_by_ticker = {c["ticker"]: c["kind"] for c in changes}
