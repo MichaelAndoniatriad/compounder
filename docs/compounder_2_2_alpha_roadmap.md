@@ -60,7 +60,7 @@ Accept: unit tests for SUE math, gate logic, calendar parsing (fixture CSV), pro
 
 Accept: unit tests with fixture JSON for EDGAR parsing; RVOL gate tests; pre-market path test (mocked).
 
-## R5 — Down-cap universe expansion (gated behind R1–R4; ship code now, flag off)
+## R5 — Down-cap universe expansion ✅ d2c288a (gated behind R1–R4; ship code now, flag off)
 
 1. `core_discovery._build_universe`: behind cfg `portfolio_advisor_universe_smallcap_enabled` (default False until R1–R4 are verified live), add S&P 600 constituents (fetch + cache; fall back to a vendored CSV).
 2. `mechanical_filter.py`: replace flat share-count/size gates with dollar-ADV gates — tradable iff $2M ≤ 20d avg dollar volume (≤$50M = "edge zone" tag).
@@ -68,6 +68,24 @@ Accept: unit tests with fixture JSON for EDGAR parsing; RVOL gate tests; pre-mar
 4. Small-cap cohort routing: while `portfolio_advisor_smallcap_shadow_days` (default 90) hasn't elapsed since the flag was enabled (persist enable date in state), ALL small-cap candidates route to the shadow book only — never live proposals.
 
 Accept: unit tests for ADV gates, shadow routing window, universe flag off-by-default.
+
+---
+
+---
+
+## Status 2026-06-10
+
+All five Compounder 2.2 alpha roadmap items are complete and merged to main.
+
+| Item | Hash | Notes |
+|------|------|-------|
+| R1 — Execution machinery | aacec0b | Marketable-limit entries, broker-resident stop, closed-market catalyst skip, fill logging |
+| R2 — Measurement loop | f7e8944 | outcome tracker wired, shadow book activated, NAV history, recommendation log |
+| R3 — PEAD scanner | b4b2141 | Nightly earnings calendar + morning drift scan feeding catalyst sleeve |
+| R4 — EP scanner fixes + EDGAR 8-K feed | 0012974 | RVOL gate, pre-market honesty, edgar.py with 8-K feed |
+| R5 — Down-cap universe expansion | d2c288a | S&P 600 cohort, dollar-ADV gates, XBRL companyfacts, 90d shadow window; flag off until R1–R4 live validation |
+
+Suite: 714 tests + 93 subtests, all green.
 
 ---
 
