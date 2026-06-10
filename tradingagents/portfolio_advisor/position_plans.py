@@ -120,6 +120,8 @@ class PositionPlan:
     last_updated: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     # ISO timestamp set when the +100% core trim-half fires so it only fires once.
     double_trim_done_at: str = ""
+    # ISO timestamp set when the pre-binary-event flat rule fires so it only fires once per plan.
+    pre_event_flat_done_at: str = ""
 
     def __post_init__(self) -> None:
         self.strategy = (self.strategy or _DEFAULT_STRATEGY).strip().lower()
@@ -194,6 +196,7 @@ def load_position_plans(cfg: Dict[str, Any]) -> Dict[str, PositionPlan]:
                 decision_history=[d for d in (data.get("decision_history") or []) if isinstance(d, dict)],
                 last_updated=str(data.get("last_updated") or ""),
                 double_trim_done_at=str(data.get("double_trim_done_at") or ""),
+                pre_event_flat_done_at=str(data.get("pre_event_flat_done_at") or ""),
             )
         except (TypeError, ValueError):
             continue

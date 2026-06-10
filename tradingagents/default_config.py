@@ -197,6 +197,7 @@ DEFAULT_CONFIG = _apply_env_overrides({
     "portfolio_advisor_catalyst_trailing_stop_pct": 0.08,    # (legacy) then exit if down 8% from peak
     "portfolio_advisor_catalyst_time_stop_days": 3,          # days after catalyst date to exit if move didn't happen
     "portfolio_advisor_catalyst_max_hold_days": 30,          # hard hold cap when no catalyst date is set
+    "portfolio_advisor_catalyst_pre_event_days_before": 1,   # go flat this many days before catalyst event (Option B: avoid binary print)
     # Dip-watch (quality-on-a-dip): watch CORE watchlist names for a SHALLOW pullback
     # into a buy zone, then let the PM judge (value-trap check) + propose a staged entry.
     # Bounds are config because the research found exact thresholds are indicative, not

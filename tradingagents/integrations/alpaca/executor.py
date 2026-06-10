@@ -742,6 +742,24 @@ def enforce_paper_exits(cfg: Dict[str, Any]) -> int:
                 if plpc <= -hard_stop_pct:
                     rule = f"paper_catalyst_hard_stop_{-hard_stop_pct*100:.0f}pct"
                 else:
+                    # Pre-binary-event flat (Option B): go flat N days before the catalyst event.
+                    # Catalyst trades capture the pre-event run-up; going flat before the print
+                    # avoids the binary outcome (FDA approval/rejection, earnings surprise, M&A vote).
+                    # One-shot per plan: pre_event_flat_done_at consumption flag prevents log spam.
+                    if catalyst_date and plan is not None and not plan.pre_event_flat_done_at:
+                        pre_event_days = int(
+                            cfg.get("portfolio_advisor_catalyst_pre_event_days_before", 1) or 1
+                        )
+                        try:
+                            cat_dt = datetime.fromisoformat(catalyst_date[:10]).replace(tzinfo=timezone.utc)
+                            days_until = (cat_dt - now).days
+                            # Fire within the window: 1 day before through 1 day after (timezone buffer).
+                            if -1 <= days_until <= pre_event_days:
+                                rule = "paper_catalyst_pre_event_flat"
+                        except (TypeError, ValueError):
+                            pass
+
+                if not rule:
                     # F6: Ratchet peak from Alpaca price and evaluate trailing/time stops.
                     if plan is not None and current_price is not None and catalyst_rules is not None:
                         # update_catalyst_peak saves to disk — do it in-memory to batch saves.
@@ -797,6 +815,12 @@ def enforce_paper_exits(cfg: Dict[str, Any]) -> int:
                         # Persist the consumption flag so this rule never re-fires.
                         plan.double_trim_done_at = datetime.now(timezone.utc).isoformat()
                         plan.last_updated = plan.double_trim_done_at
+                        plans[tk] = plan
+                        plans_dirty = True
+                    elif rule == "paper_catalyst_pre_event_flat" and plan is not None:
+                        # Persist the consumption flag so re-open-order retries don't re-spam.
+                        plan.pre_event_flat_done_at = datetime.now(timezone.utc).isoformat()
+                        plan.last_updated = plan.pre_event_flat_done_at
                         plans[tk] = plan
                         plans_dirty = True
 

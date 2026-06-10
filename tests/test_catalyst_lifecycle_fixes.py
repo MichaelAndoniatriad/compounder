@@ -658,3 +658,217 @@ class TestDuplicateBuyGuards:
         )
         assert "submitted" in msg.lower() or "buy" in msg.lower()
         assert submitted.get("notional", 0) > 0
+
+
+# ===========================================================================
+# Pre-binary-event flat rule (Option B)
+# ===========================================================================
+
+
+class TestPreEventFlatRule:
+    """Option B: enforce_paper_exits closes catalyst positions N days before the
+    catalyst event to avoid the binary print (FDA, earnings, M&A vote).
+
+    Behaviour:
+    - fires when today is within pre_event_days of catalyst_date (default 1)
+    - does NOT fire while the event is more than N days away
+    - does NOT fire when the position is already hard-stopped (plpc <= -8%)
+    - consumes pre_event_flat_done_at on the plan so it fires only once
+    - does NOT fire on a core sleeve position
+    """
+
+    def _cfg(self, tmp_path, pre_event_days=1):
+        return {
+            "portfolio_advisor_dir": str(tmp_path / "pa"),
+            "portfolio_advisor_alpaca_paper": True,
+            "portfolio_advisor_catalyst_hard_stop_pct": 0.08,
+            "portfolio_advisor_catalyst_pre_event_days_before": pre_event_days,
+            "portfolio_advisor_catalyst_trail_arm_pct": 0.05,
+            "portfolio_advisor_catalyst_trail_dist_pct": 0.08,
+            "portfolio_advisor_catalyst_time_stop_days": 3,
+            "portfolio_advisor_catalyst_max_hold_days": 30,
+        }
+
+    def _write_plan(self, cfg, ticker, entry_price, catalyst_date="", pre_event_flat_done_at="", strategy="catalyst"):
+        from tradingagents.portfolio_advisor.position_plans import PositionPlan, upsert_position_plan
+        plan = PositionPlan(
+            ticker=ticker.upper(),
+            entry_price=entry_price,
+            strategy=strategy,
+            catalyst_date=catalyst_date,
+            pre_event_flat_done_at=pre_event_flat_done_at,
+        )
+        upsert_position_plan(cfg, plan)
+
+    def _make_position(self, ticker, plpc=0.02, mv=5000.0, qty=50.0):
+        pos = MagicMock()
+        pos.symbol = ticker
+        pos.unrealized_plpc = str(plpc)
+        pos.market_value = str(mv)
+        pos.qty = str(qty)
+        pos.current_price = str(abs(mv) / abs(qty))
+        pos.avg_entry_price = str(abs(mv) / abs(qty))
+        return pos
+
+    def _make_client(self, positions, close_called=None):
+        client = MagicMock()
+        client.get_all_positions.return_value = positions
+        closed = {"tickers": []}
+        def _close(tk, **kwargs):
+            closed["tickers"].append(tk)
+            r = MagicMock()
+            r.id = "close-order"
+            return r
+        client.close_position.side_effect = _close
+        if close_called is not None:
+            close_called.update(closed)
+        return client, closed
+
+    def test_fires_day_before_event(self, tmp_path):
+        """Pre-event flat fires when catalyst_date is tomorrow (1 day away)."""
+        cfg = self._cfg(tmp_path)
+        tomorrow = (datetime.now(timezone.utc) + timedelta(days=1)).strftime("%Y-%m-%d")
+        pa_dir = Path(cfg["portfolio_advisor_dir"])
+        pa_dir.mkdir(parents=True, exist_ok=True)
+        self._write_plan(cfg, "FDA1", entry_price=100.0, catalyst_date=tomorrow)
+
+        closed_tracker = {}
+        client, closed_tracker = self._make_client(
+            [self._make_position("FDA1", plpc=0.05)], closed_tracker
+        )
+
+        with patch("tradingagents.integrations.alpaca.executor.enabled", return_value=True), \
+             patch("tradingagents.integrations.alpaca.executor._client", return_value=client), \
+             patch("tradingagents.integrations.alpaca.executor._notify"):
+            from tradingagents.integrations.alpaca import executor as ex
+            count = ex.enforce_paper_exits(cfg)
+
+        assert count == 1
+        assert "FDA1" in closed_tracker["tickers"]
+
+    def test_fires_day_of_event(self, tmp_path):
+        """Pre-event flat fires on the catalyst_date itself."""
+        cfg = self._cfg(tmp_path)
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        pa_dir = Path(cfg["portfolio_advisor_dir"])
+        pa_dir.mkdir(parents=True, exist_ok=True)
+        self._write_plan(cfg, "MRNA1", entry_price=50.0, catalyst_date=today)
+
+        client, closed_tracker = self._make_client([self._make_position("MRNA1", plpc=0.03)])
+
+        with patch("tradingagents.integrations.alpaca.executor.enabled", return_value=True), \
+             patch("tradingagents.integrations.alpaca.executor._client", return_value=client), \
+             patch("tradingagents.integrations.alpaca.executor._notify"):
+            from tradingagents.integrations.alpaca import executor as ex
+            count = ex.enforce_paper_exits(cfg)
+
+        assert count == 1
+        assert "MRNA1" in closed_tracker["tickers"]
+
+    def test_does_not_fire_when_event_is_far_out(self, tmp_path):
+        """Pre-event flat does NOT fire when the event is 5 days away."""
+        cfg = self._cfg(tmp_path, pre_event_days=1)
+        five_days_out = (datetime.now(timezone.utc) + timedelta(days=5)).strftime("%Y-%m-%d")
+        pa_dir = Path(cfg["portfolio_advisor_dir"])
+        pa_dir.mkdir(parents=True, exist_ok=True)
+        self._write_plan(cfg, "AAPL1", entry_price=200.0, catalyst_date=five_days_out)
+
+        client, closed_tracker = self._make_client([self._make_position("AAPL1", plpc=0.04)])
+
+        with patch("tradingagents.integrations.alpaca.executor.enabled", return_value=True), \
+             patch("tradingagents.integrations.alpaca.executor._client", return_value=client), \
+             patch("tradingagents.integrations.alpaca.executor._notify"):
+            from tradingagents.integrations.alpaca import executor as ex
+            count = ex.enforce_paper_exits(cfg)
+
+        assert count == 0
+        assert "AAPL1" not in closed_tracker["tickers"]
+
+    def test_hard_stop_takes_priority_over_pre_event_flat(self, tmp_path):
+        """When plpc <= -8%, hard stop fires instead of pre-event flat."""
+        cfg = self._cfg(tmp_path)
+        tomorrow = (datetime.now(timezone.utc) + timedelta(days=1)).strftime("%Y-%m-%d")
+        pa_dir = Path(cfg["portfolio_advisor_dir"])
+        pa_dir.mkdir(parents=True, exist_ok=True)
+        self._write_plan(cfg, "HARD1", entry_price=100.0, catalyst_date=tomorrow)
+
+        logged_rules = []
+        client, closed_tracker = self._make_client([self._make_position("HARD1", plpc=-0.10)])
+
+        with patch("tradingagents.integrations.alpaca.executor.enabled", return_value=True), \
+             patch("tradingagents.integrations.alpaca.executor._client", return_value=client), \
+             patch("tradingagents.integrations.alpaca.executor._notify"), \
+             patch("tradingagents.integrations.alpaca.executor._log_row",
+                   side_effect=lambda cfg, row: logged_rules.append(row.get("rule", ""))):
+            from tradingagents.integrations.alpaca import executor as ex
+            count = ex.enforce_paper_exits(cfg)
+
+        assert count == 1
+        # Rule should reference the hard stop, not the pre-event flat.
+        assert any("hard_stop" in r for r in logged_rules)
+        assert not any("pre_event_flat" in r for r in logged_rules)
+
+    def test_consumption_flag_prevents_refiring(self, tmp_path):
+        """pre_event_flat_done_at set → rule does not fire again on next tick."""
+        cfg = self._cfg(tmp_path)
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        pa_dir = Path(cfg["portfolio_advisor_dir"])
+        pa_dir.mkdir(parents=True, exist_ok=True)
+        # Plan already has the consumed flag set.
+        self._write_plan(
+            cfg, "CONS1", entry_price=80.0,
+            catalyst_date=today,
+            pre_event_flat_done_at="2026-06-10T09:00:00+00:00",
+        )
+
+        client, closed_tracker = self._make_client([self._make_position("CONS1", plpc=0.02)])
+
+        with patch("tradingagents.integrations.alpaca.executor.enabled", return_value=True), \
+             patch("tradingagents.integrations.alpaca.executor._client", return_value=client), \
+             patch("tradingagents.integrations.alpaca.executor._notify"):
+            from tradingagents.integrations.alpaca import executor as ex
+            count = ex.enforce_paper_exits(cfg)
+
+        assert count == 0
+        assert "CONS1" not in closed_tracker["tickers"]
+
+    def test_does_not_fire_on_core_sleeve(self, tmp_path):
+        """Pre-event flat is catalyst-only; core positions are unaffected."""
+        cfg = self._cfg(tmp_path)
+        tomorrow = (datetime.now(timezone.utc) + timedelta(days=1)).strftime("%Y-%m-%d")
+        pa_dir = Path(cfg["portfolio_advisor_dir"])
+        pa_dir.mkdir(parents=True, exist_ok=True)
+        self._write_plan(cfg, "CORE1", entry_price=100.0, catalyst_date=tomorrow, strategy="core")
+
+        client, closed_tracker = self._make_client([self._make_position("CORE1", plpc=0.05)])
+
+        with patch("tradingagents.integrations.alpaca.executor.enabled", return_value=True), \
+             patch("tradingagents.integrations.alpaca.executor._client", return_value=client), \
+             patch("tradingagents.integrations.alpaca.executor._notify"):
+            from tradingagents.integrations.alpaca import executor as ex
+            count = ex.enforce_paper_exits(cfg)
+
+        assert count == 0
+        assert "CORE1" not in closed_tracker["tickers"]
+
+    def test_consumption_flag_persisted_to_plan(self, tmp_path):
+        """After firing, pre_event_flat_done_at is saved to position_plans.json."""
+        cfg = self._cfg(tmp_path)
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        pa_dir = Path(cfg["portfolio_advisor_dir"])
+        pa_dir.mkdir(parents=True, exist_ok=True)
+        self._write_plan(cfg, "PERSIST1", entry_price=60.0, catalyst_date=today)
+
+        client, _ = self._make_client([self._make_position("PERSIST1", plpc=0.01)])
+
+        with patch("tradingagents.integrations.alpaca.executor.enabled", return_value=True), \
+             patch("tradingagents.integrations.alpaca.executor._client", return_value=client), \
+             patch("tradingagents.integrations.alpaca.executor._notify"):
+            from tradingagents.integrations.alpaca import executor as ex
+            ex.enforce_paper_exits(cfg)
+
+        from tradingagents.portfolio_advisor.position_plans import load_position_plans
+        plans = load_position_plans(cfg)
+        plan = plans.get("PERSIST1")
+        assert plan is not None
+        assert plan.pre_event_flat_done_at, "pre_event_flat_done_at should be set after firing"
