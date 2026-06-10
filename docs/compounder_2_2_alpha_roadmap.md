@@ -87,6 +87,23 @@ All five Compounder 2.2 alpha roadmap items are complete and merged to main.
 
 Suite: 714 tests + 93 subtests, all green.
 
+### Post-review hardening (adversarial review wbx14udym) — 2026-06-11
+
+Five fail-open holes found and closed across the R5 shadow window and catalyst exit logic:
+
+| Finding | Hash | Fix |
+|---------|------|-----|
+| Phase 5b fail-open (empty cohort map bypassed shadow routing) | 29f216d / d4aa92e | Drop `and _cohort_map` gate; empty map shadows all picks + Telegram alert |
+| proposals.add() shadow bypass (watchlist/catalyst paths skipped choke) | d4aa92e | Central shadow choke in proposals.add(): every buy/add during window, unknown cohort → shadow_book, status=shadowed |
+| `get_ticker_cohort` missing (no cache-only lookup existed) | d4aa92e | New cache-only helper; "unknown" return = callers fail closed |
+| Smallcap quant screen: $1B floor killed smallcap candidates | d4aa92e | MIN_MARKET_CAP_SMALLCAP=$100M for smallcap cohort; shares_outstanding×price cap fallback |
+| enabled_at missing = silent debug log, no self-heal | d4aa92e | Self-heal: record now, WARNING log, Telegram, return True |
+| Time-stop insta-close on PEAD entries (past catalyst_date) | d4aa92e | Anchor to max(catalyst_date, entry_date) in eval_catalyst_exit and executor no-plan fallback |
+
+Also fixed a pre-existing test isolation leak in test_pm_catalyst_guard.py (direct `proposals.add = lambda` was never restored, contaminating subsequent tests).
+
+Suite after hardening: **784 tests + 93 subtests, all green** (19 new tests added).
+
 ---
 
 ## Explicitly rejected (do not build)
