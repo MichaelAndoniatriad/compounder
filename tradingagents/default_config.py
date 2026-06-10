@@ -489,4 +489,7 @@ DEFAULT_CONFIG = _apply_env_overrides({
     # to be accepted. Beyond this window the thesis is speculative and the dated-event
     # constraint loses meaning. Default 90 days. Must be a positive integer.
     "portfolio_advisor_catalyst_max_days_out": 90,
+    # PEAD scanner settings (R3)
+    # Max Alpha Vantage EARNINGS calls per scan_post_reports run (free-tier budget).
+    "portfolio_advisor_pead_max_names": 15,
 })

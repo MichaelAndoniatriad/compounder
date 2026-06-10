@@ -461,6 +461,48 @@ def portfolio_advisor_ep_scan(
         raise typer.Exit(1) from e
 
 
+@portfolio_app.command("pead")
+def portfolio_advisor_pead(
+    action: str = typer.Argument("scan", help="calendar | scan"),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+):
+    """PEAD (Post-Earnings Announcement Drift) scanner.
+
+    pead calendar  — nightly: pull Alpha Vantage EARNINGS_CALENDAR and cache it.
+    pead scan      — morning: check yesterday's reporters for SUE/gap/RVOL/dollar-vol.
+    """
+    _configure_logging(verbose)
+    cfg = DEFAULT_CONFIG.copy()
+    try:
+        from tradingagents.portfolio_advisor import pead_scanner
+
+        if action == "calendar":
+            result = pead_scanner.refresh_calendar(cfg)
+            console.print(
+                f"[cyan]pead calendar:[/cyan] symbols={result.get('symbols', 0)}, "
+                f"cached={result.get('cached', False)}, path={result.get('path', '')}"
+            )
+        elif action == "scan":
+            result = pead_scanner.scan_post_reports(cfg)
+            n_cands = len(result.get("candidates") or [])
+            n_skip = len(result.get("skipped") or [])
+            console.print(
+                f"[cyan]pead scan:[/cyan] reporters={result.get('reporters_found', 0)}, "
+                f"candidates={n_cands}, skipped={n_skip}"
+            )
+            for c in result.get("candidates") or []:
+                console.print(
+                    f"  {c['ticker']} SUE={c['sue_pct']:+.1f}% gap={c['gap_pct']:+.1f}% "
+                    f"RVOL={c['rvol']:.1f}x $vol=${c['dollar_vol']:,.0f}"
+                )
+        else:
+            console.print(f"[red]Unknown pead action: {action!r}. Use 'calendar' or 'scan'.[/red]")
+            raise typer.Exit(1)
+    except Exception as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1) from e
+
+
 @portfolio_app.command("macro-review")
 def portfolio_advisor_macro_review(
     verbose: bool = typer.Option(False, "--verbose", "-v"),

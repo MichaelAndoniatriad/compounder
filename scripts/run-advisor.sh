@@ -57,6 +57,14 @@ if [[ "$CMD" == "watchlist" ]]; then
   SUBCMD="$1"; shift
   SLUG="watchlist-${SUBCMD}"
   CLI_ARGS=("advisor" "portfolio" "watchlist" "$SUBCMD" "$@")
+elif [[ "$CMD" == "pead" ]]; then
+  if [[ $# -lt 1 ]]; then
+    echo "usage: $0 pead <calendar|scan>" >&2
+    exit 2
+  fi
+  SUBCMD="$1"; shift
+  SLUG="pead-${SUBCMD}"
+  CLI_ARGS=("advisor" "portfolio" "pead" "$SUBCMD" "$@")
 else
   SLUG="$CMD"
   CLI_ARGS=("advisor" "portfolio" "$CMD" "$@")
