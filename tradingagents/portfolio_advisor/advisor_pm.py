@@ -149,23 +149,28 @@ your messages on a phone. You text like a friend — not a robot, not a report.
 - Use full_graph for new multi-agent research; single_model for a quick thesis check,
   weekly recap, post-earnings read, or routine monitor.
 
-## Catalyst sleeve — act when it's empty
+## Catalyst sleeve — evaluate when it's empty
 The portfolio targets 50% core / 40% catalyst / 10% cash. When catalyst is at 0% and
-cash > $500, you MUST deploy — not wait for a perfect standalone Buy. The right frame
-is: **which available candidate best fits as a catalyst entry right now?**
+cash > $500, it is worth evaluating whether a deployment makes sense — but sitting in
+cash is a valid decision when no clean setup is present. The right frame is: **which
+available candidate best fits as a catalyst entry right now, if any?**
+
+Note: new-buy sizing is adjusted by a regime overlay enforced in code (see the Regime
+block in the prompt if present). You do not need to act on it — it is already applied.
 
 Evaluation order when the catalyst sleeve is empty:
 1. Does any candidate have a near-term catalyst (earnings, product launch, guidance,
-   regulatory event) within 60 days? If yes, that's your first pick — deploy ~$300-500
-   starter. Catalyst sleeve entries are short-term by design; a Hold rating on the
-   long-term view is fine if the near-term setup is clean.
-2. No near-term catalyst? Pick the best-rated candidate and frame it as a **"starter core"**
-   (not catalyst) — you're putting idle cash to work rather than letting it sit at 0%.
+   regulatory event) within 60 days? If yes, that's a strong candidate — consider a
+   ~$300-500 starter if the setup is clean. Catalyst sleeve entries are short-term by
+   design; a Hold rating on the long-term view is fine if the near-term setup is clean.
+2. No near-term catalyst? Consider the best-rated candidate as a **"starter core"**
+   (not catalyst) to put idle cash to work — but only if the thesis warrants it.
 3. Nothing researched? Queue a `catalyst_scan` job_type on the top 2-3 watchlist names
    to get catalyst-specific research, not just a thesis check.
 
-When you decide, call `propose_trade` with the exact size and reason. Don't just
-describe the move — log it so the human can approve it.
+When you decide to enter, call `propose_trade` with the exact size and reason. Don't
+just describe the move — log it so the human can approve it. Equally: if no candidate
+meets the bar, say so and hold cash.
 
 ## Portfolio-fit thinking (not just standalone valuation)
 The graph rates names in isolation. Your job is relative:
@@ -2000,7 +2005,7 @@ def run_pm_cycle(
             portfolio_text
             + "\n(no open positions — book is 100% cash: "
             + _cash_str
-            + "; your job this cycle is re-entry from candidates/watchlist)"
+            + "; re-entry from candidates/watchlist is an option this cycle if a clean setup exists — cash is also a valid position)"
         )
 
     live_tickers = etoro_scan.current_ticker_set(tickers)
@@ -2236,6 +2241,25 @@ def run_pm_cycle(
         logger.debug("scoreboard block failed: %s", e)
         scoreboard_blk = ""
 
+    # T1 — Regime overlay info block (informational: sizing already enforced in code).
+    try:
+        from tradingagents.portfolio_advisor.regime import compute_regime, new_buy_multiplier
+        _reg = compute_regime(cfg)
+        _reg_label = _reg.get("regime", "unknown")
+        _reg_above = _reg.get("above_200dma")
+        _reg_vol = _reg.get("vol")
+        _reg_mult = new_buy_multiplier(_reg_label)
+        _dma_str = "above" if _reg_above else ("below" if _reg_above is not None else "unknown vs")
+        _vol_str = f"{_reg_vol*100:.0f}%" if _reg_vol is not None else "?"
+        regime_blk = (
+            f"Regime: {_reg_label} (SPY {_dma_str} 200DMA, vol {_vol_str}). "
+            f"New-buy multiplier: {_reg_mult:.2f}x. "
+            "This is enforced in code — you do not need to act on it.\n"
+        )
+    except Exception as e:
+        logger.debug("regime block failed: %s", e)
+        regime_blk = ""
+
     # Broad-move detection — prompts PM to log the cause when 3+ positions moved together.
     try:
         broad_move_blk = _broad_move_block(cfg, portfolio_rows)
@@ -2331,7 +2355,7 @@ Execution tiers (for append_jobs only): "full_graph" runs the full multi-agent p
 
 Trigger for this cycle: {trigger_label}
 
-{strategy_block}{rules_blk}{cash_change_blk}{rule_book_blk}{lessons_blk}{mem_blk}{ep_open_blk}{ep_stats_blk}{conv_blk}{decisions_blk}{memory_block}{market_memory_blk}{evidence_blk}{macro_risk_blk}{portfolio_risk_blk}{paper_blk}{scoreboard_blk}{broad_move_blk}Portfolio snapshot:
+{strategy_block}{rules_blk}{cash_change_blk}{rule_book_blk}{lessons_blk}{mem_blk}{ep_open_blk}{ep_stats_blk}{conv_blk}{decisions_blk}{memory_block}{market_memory_blk}{evidence_blk}{macro_risk_blk}{portfolio_risk_blk}{paper_blk}{scoreboard_blk}{regime_blk}{broad_move_blk}Portfolio snapshot:
 {portfolio_snapshot}
 
 {sleeve_block}

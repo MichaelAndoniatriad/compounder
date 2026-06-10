@@ -512,4 +512,18 @@ DEFAULT_CONFIG = _apply_env_overrides({
     "portfolio_advisor_pead_hold_days": 20,
     # Max number of per-ticker EDGAR CIK fetches per ep-scan run (fair-use cap).
     "portfolio_advisor_edgar_max_ticker_fetches": 60,
+    # ---------------------------------------------------------------------------
+    # Regime overlay + circuit breaker (T1)
+    # ---------------------------------------------------------------------------
+    # Master switch — set False to skip all regime/breaker logic (multiplier 1.0).
+    "portfolio_advisor_regime_enabled": True,
+    # Annualised 20-day SPY realised vol above this threshold = degraded condition.
+    # risk_on requires vol < threshold; risk_off = below 200DMA AND vol >= threshold.
+    "portfolio_advisor_regime_vol_threshold": 0.25,
+    # Circuit breaker: drawdown from high-water mark that triggers "halve" level.
+    # At "halve", new-buy notional is cut by 50% in addition to the regime multiplier.
+    "portfolio_advisor_breaker_halve_pct": 0.10,
+    # Circuit breaker: drawdown from HWM that triggers "halt" level.
+    # At "halt", all new buys are skipped entirely; sells/exits are never gated.
+    "portfolio_advisor_breaker_halt_pct": 0.15,
 })

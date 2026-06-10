@@ -363,6 +363,62 @@ def _paper_buy(
         _log_row(cfg, {"ticker": tk, "action": "buy", "status": "skipped", "note": f"notional {notional} < $1"})
         return f"skipped {tk}: scaled notional under $1"
 
+    # T1 — Regime overlay + circuit breaker.
+    # Applies AFTER normal sizing (including HC path) so we downsize on top of the
+    # already-sized notional.  Any failure in this block falls back to multiplier 1.0
+    # so a data error never blocks a buy.  Sells/exits are never routed through here.
+    _regime_mult = 1.0
+    _breaker_level = "none"
+    _regime_label = "unknown"
+    _breaker_note = ""
+    if cfg.get("portfolio_advisor_regime_enabled", True):
+        try:
+            from tradingagents.portfolio_advisor.regime import (
+                compute_regime,
+                drawdown_breaker,
+                new_buy_multiplier,
+            )
+
+            _regime_data = compute_regime(cfg)
+            _regime_label = _regime_data.get("regime", "caution")
+            _regime_mult = new_buy_multiplier(_regime_label)
+
+            _breaker = drawdown_breaker(cfg, equity)
+            _breaker_level = _breaker.get("level", "none")
+            _dd_pct = _breaker.get("drawdown_pct", 0.0)
+
+            if _breaker_level == "halt":
+                reason = (
+                    f"circuit breaker: drawdown halt "
+                    f"(−{_dd_pct*100:.1f}% from HWM)"
+                )
+                _log_row(cfg, {
+                    "ticker": tk, "action": act, "status": "skipped",
+                    "note": reason, "regime": _regime_label,
+                    "breaker_level": _breaker_level, "drawdown_pct": _dd_pct,
+                })
+                return f"skipped {tk}: {reason}"
+
+            if _breaker_level == "halve":
+                _regime_mult *= 0.5
+                _breaker_note = f"breaker=halve(-{_dd_pct*100:.1f}%)"
+
+        except Exception:
+            logger.warning(
+                "_paper_buy: regime overlay failed for %s — proceeding at full size", tk,
+                exc_info=True,
+            )
+            _regime_mult = 1.0
+            _breaker_level = "none"
+
+    if _regime_mult != 1.0:
+        notional = round(notional * _regime_mult, 2)
+        if notional < 1.0:
+            _log_row(cfg, {"ticker": tk, "action": act, "status": "skipped",
+                           "note": f"regime-scaled notional {notional} < $1",
+                           "regime": _regime_label, "breaker_level": _breaker_level})
+            return f"skipped {tk}: regime-scaled notional under $1"
+
     sleeve = (proposal.get("sleeve") or "").lower() or "core"
     catalyst_date = (proposal.get("catalyst_date") or "").strip() or None
 
@@ -464,6 +520,9 @@ def _paper_buy(
             "proposal_ts": proposal.get("ts"),
             "intended_price": intended_price,
             "fill_check_pending": True,
+            # T1 — regime overlay fields
+            "regime": _regime_label,
+            "breaker_level": _breaker_level,
             # Catalyst entries need a standalone GTC stop submitted post-fill.
             # reconcile_fills detects this flag and submits the stop after confirming fill.
             "catalyst_stop_pending": sleeve == "catalyst" and use_limit,

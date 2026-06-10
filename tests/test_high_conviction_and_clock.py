@@ -49,6 +49,10 @@ def _cfg(tmp_path: Path, **overrides) -> Dict[str, Any]:
         "portfolio_advisor_catalyst_max_hold_days": 30,
         "portfolio_advisor_catalyst_time_stop_days": 3,
         "portfolio_advisor_catalyst_hard_stop_pct": 0.08,
+        # Disable regime overlay for these pre-regime tests so the caution fallback
+        # (triggered when yfinance is mocked to return empty history) does not
+        # reduce HC notional and break sizing assertions written before T1 shipped.
+        "portfolio_advisor_regime_enabled": False,
     }
     cfg.update(overrides)
     return cfg
