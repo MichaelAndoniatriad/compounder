@@ -76,12 +76,34 @@ def _format_ticker_block(t: Dict[str, Any]) -> List[str]:
 
 
 def in_us_equity_watch_window_utc() -> bool:
-    """Weekdays roughly Mon to Fri, 13:30 to 20:00 UTC inclusive of end minute."""
+    """Weekdays roughly Mon to Fri, 13:30 to 20:00 UTC inclusive of end minute.
+
+    Fallback heuristic only — no US-holiday or DST awareness. Prefer
+    market_is_open(), which asks Alpaca's clock first and falls back here.
+    """
     now = datetime.now(timezone.utc)
     if now.weekday() >= 5:
         return False
     m = now.hour * 60 + now.minute
     return 13 * 60 + 30 <= m <= 20 * 60
+
+
+def market_is_open() -> bool:
+    """True when US equities are tradable right now.
+
+    Alpaca's clock API is authoritative (weekends, US bank holidays, half-days,
+    DST). When it is unreachable (no keys, network down, pytest) fall back to
+    the fixed UTC weekday window so the watchdog never goes blind.
+    """
+    try:
+        from tradingagents.integrations.alpaca import executor as _alpaca_exec
+
+        clock = _alpaca_exec.market_clock()
+        if clock is not None:
+            return bool(clock.get("is_open"))
+    except Exception:
+        logger.debug("alpaca market clock check failed", exc_info=True)
+    return in_us_equity_watch_window_utc()
 
 
 def _split_watchdog_triggers(
@@ -311,8 +333,8 @@ def _send_direct_watchdog_alerts(
 
 def run_watchdog(cfg: Dict[str, Any], *, ignore_market_hours: bool = False, suppress_pm_handoff: bool = False) -> int:
     """Return count of outbound watchdog notifications (0 to 3 if all buckets fire)."""
-    if not ignore_market_hours and not in_us_equity_watch_window_utc():
-        logger.info("watchdog skipped (outside US equity watch window UTC)")
+    if not ignore_market_hours and not market_is_open():
+        logger.info("watchdog skipped (market closed: weekend, US holiday, or outside hours)")
         return 0
 
     # Paper-book hard floor — runs EVERY tick, before any eToro-dependent early

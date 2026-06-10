@@ -267,6 +267,7 @@ def build_pm_tools(cfg: Dict[str, Any], live_tickers: set) -> List[Any]:
         reason: str = "",
         catalyst_date: str = "",
         confidence: float = 0.0,
+        high_conviction: bool = False,
     ) -> str:
         """Log a PROPOSED trade for the human to review and execute manually on eToro.
 
@@ -285,6 +286,16 @@ def build_pm_tools(cfg: Dict[str, Any], live_tickers: set) -> List[Any]:
         stated conviction is measured against outcomes — miscalibration shows up
         as paper P&L. Be honest, not uniformly high: your calibration record is
         injected into future cycles.
+
+        high_conviction=True requests the HIGH-CONVICTION sizing tier (buy/add
+        only): the per-position cap rises (default 15% of book vs the normal cap)
+        while the STOPS STAY UNCHANGED — size up, never loosen the exit. Use it
+        RARELY: it requires stated confidence >= 0.85, at most 2 positions may
+        hold the tier at once, and the executor denies the size-up (trade still
+        executes at normal size) when a guard fails. Reserve it for your single
+        best ideas where the thesis, the catalyst, and the price all line up —
+        a high-conviction flag on a mediocre setup wrecks your calibration
+        record at 2-3x the P&L damage.
 
         reason is REQUIRED — explain WHY (what changed, the catalyst, the rule that
         fired, the thesis read). A proposal with no reason is rejected. For a held
@@ -326,6 +337,26 @@ def build_pm_tools(cfg: Dict[str, Any], live_tickers: set) -> List[Any]:
             _valid, _err = validate_catalyst_date(catalyst_date, cfg)
             if not _valid:
                 return f"error: {_err}"
+        # Guard: high_conviction applies only to buy/add (size-up makes no sense on exits).
+        if high_conviction and act not in ("buy", "add"):
+            return (
+                "error: high_conviction=True only applies to buy/add actions "
+                f"(you passed action={act!r}). Remove the flag or change the action."
+            )
+        # Guard: high_conviction requires confidence >= the configured floor.
+        # Do NOT instruct the PM to inflate confidence — the whole point of the
+        # floor is to force honest calibration.
+        if high_conviction:
+            _hc_floor = float(
+                cfg.get("portfolio_advisor_alpaca_high_conviction_min_confidence", 0.85) or 0.85
+            )
+            if float(confidence or 0) < _hc_floor:
+                return (
+                    f"error: high_conviction=True requires stated confidence >= {_hc_floor:.2f}; "
+                    f"you stated {float(confidence or 0):.2f}. "
+                    f"If your honest confidence is below {_hc_floor:.2f} this is not a "
+                    "high-conviction trade; re-propose without the flag."
+                )
         try:
             from tradingagents.portfolio_advisor import proposals as _proposals
             # add() supersedes any existing open proposal for the same ticker+side,
@@ -341,6 +372,7 @@ def build_pm_tools(cfg: Dict[str, Any], live_tickers: set) -> List[Any]:
                 reason=reason_clean,
                 catalyst_date=catalyst_date,
                 confidence=confidence,
+                high_conviction=bool(high_conviction),
             )
             # Mirror the decision + WHY into the position plan's history so the
             # rationale travels with the holding (held names; new buys stay in

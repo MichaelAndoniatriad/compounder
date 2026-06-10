@@ -122,6 +122,9 @@ class PositionPlan:
     double_trim_done_at: str = ""
     # ISO timestamp set when the pre-binary-event flat rule fires so it only fires once per plan.
     pre_event_flat_done_at: str = ""
+    # True when this position was sized under the high-conviction tier — counts
+    # against the concurrent HC slot cap while the position is open.
+    high_conviction: bool = False
 
     def __post_init__(self) -> None:
         self.strategy = (self.strategy or _DEFAULT_STRATEGY).strip().lower()
@@ -197,6 +200,7 @@ def load_position_plans(cfg: Dict[str, Any]) -> Dict[str, PositionPlan]:
                 last_updated=str(data.get("last_updated") or ""),
                 double_trim_done_at=str(data.get("double_trim_done_at") or ""),
                 pre_event_flat_done_at=str(data.get("pre_event_flat_done_at") or ""),
+                high_conviction=bool(data.get("high_conviction")),
             )
         except (TypeError, ValueError):
             continue

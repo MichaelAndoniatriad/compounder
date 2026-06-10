@@ -123,6 +123,7 @@ def add(
     reason: str = "",
     catalyst_date: str = "",
     confidence: float = 0.0,
+    high_conviction: bool = False,
 ) -> Dict[str, Any]:
     """Record a proposal, superseding any existing OPEN proposal for the same
     ticker+side.
@@ -162,6 +163,9 @@ def add(
         "reason": (reason or "").strip()[:500],
         # 0.0 means "not stated" — the paper executor sizes mid-range for it.
         "confidence": float(confidence) if confidence else None,
+        # PM-requested high-conviction size-up; the executor grants/denies it
+        # against the confidence floor and the concurrent HC slot cap.
+        "high_conviction": bool(high_conviction),
         "status": "proposed",
     }
     rows.append(entry)

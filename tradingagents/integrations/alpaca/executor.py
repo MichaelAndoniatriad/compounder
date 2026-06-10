@@ -116,6 +116,48 @@ def _scale_factor(cfg: Dict[str, Any], paper_equity: float) -> float:
     return 1.0
 
 
+def market_clock() -> Optional[Dict[str, Any]]:
+    """US market clock from Alpaca — authoritative for holidays, half-days, DST.
+
+    Returns {"is_open": bool, "next_open": str, "next_close": str} or None when
+    Alpaca is unreachable / keys absent / under pytest. Callers must treat None
+    as "unknown" and fall back to their own heuristic, not as "closed".
+    """
+    if "PYTEST_CURRENT_TEST" in os.environ:
+        return None
+    if not (os.environ.get("ALPACA_API_KEY") and os.environ.get("ALPACA_SECRET_KEY")):
+        return None
+    try:
+        c = _client().get_clock()
+        return {
+            "is_open": bool(c.is_open),
+            "next_open": str(c.next_open),
+            "next_close": str(c.next_close),
+        }
+    except Exception:
+        logger.debug("market clock unavailable", exc_info=True)
+        return None
+
+
+def _vol_dampener(ticker: str) -> float:
+    """60-day realized-vol divisor ∈ [0.5, 1.5]; 1.0 (neutral) on any failure.
+
+    vol 0.30 annualized → 1.0 (neutral); 0.60+ → 1.5 (position halved);
+    0.15 → 0.75 (position boosted). Divide a target size by this.
+    """
+    try:
+        import yfinance as yf
+
+        hist = yf.Ticker(ticker).history(period="60d")["Close"]
+        if len(hist) >= 20:
+            returns = hist.pct_change().dropna()
+            vol = float(returns.std() * (252 ** 0.5))  # annualized
+            return max(0.5, min(1.5, vol / 0.30))
+    except Exception:
+        pass
+    return 1.0
+
+
 def _confidence_size_multiplier(cfg: Dict[str, Any], confidence: Optional[float], ticker: str) -> float:
     """§5.4 Compounder 2.0: confidence-weighted position sizing.
 
@@ -142,17 +184,7 @@ def _confidence_size_multiplier(cfg: Dict[str, Any], confidence: Optional[float]
     target_pct = min_pct + t * (max_pct - min_pct)
 
     # Vol dampener: shrink for high-vol names
-    try:
-        import yfinance as yf
-        hist = yf.Ticker(ticker).history(period="60d")["Close"]
-        if len(hist) >= 20:
-            returns = hist.pct_change().dropna()
-            vol = float(returns.std() * (252 ** 0.5))  # annualized
-            # Map vol to a dampener: vol 0.30 → 1.0 (neutral), 0.60+ → 1.5 (halved), 0.15 → 0.75 (boosted)
-            dampener = max(0.5, min(1.5, vol / 0.30))
-            target_pct = target_pct / dampener
-    except Exception:
-        pass  # skip dampener on any failure
+    target_pct = target_pct / _vol_dampener(ticker)
 
     # Return as a multiplier relative to the max_pct cap
     return min(1.0, target_pct / max_pct)
@@ -273,8 +305,21 @@ def _paper_buy(
     cap = float(cfg.get("portfolio_advisor_alpaca_max_position_pct", 0.10) or 0.10)
     # §5.4: confidence-weighted sizing — multiplier ∈ [0.2, 1.0] of the cap
     conf = proposal.get("confidence")
-    conf_mult = _confidence_size_multiplier(cfg, conf, tk)
-    notional = round(min(usd * scale, equity * cap * conf_mult), 2)
+
+    # High-conviction tier: a granted HC buy sizes against the bigger HC cap,
+    # still vol-dampened (studied risk: size up on conviction, shrink on vol —
+    # never both loosened). Denied requests fall through to normal sizing.
+    hc_granted = False
+    hc_note = ""
+    if proposal.get("high_conviction"):
+        hc_granted, hc_note = _high_conviction_grant(cfg, client, tk, conf)
+    if hc_granted:
+        hc_cap = float(cfg.get("portfolio_advisor_alpaca_high_conviction_pct", 0.15) or 0.15)
+        conf_mult = min(1.0, 1.0 / _vol_dampener(tk))
+        notional = round(min(usd * scale, equity * hc_cap * conf_mult), 2)
+    else:
+        conf_mult = _confidence_size_multiplier(cfg, conf, tk)
+        notional = round(min(usd * scale, equity * cap * conf_mult), 2)
     if notional < 1.0:
         _log_row(cfg, {"ticker": tk, "action": "buy", "status": "skipped", "note": f"notional {notional} < $1"})
         return f"skipped {tk}: scaled notional under $1"
@@ -298,6 +343,8 @@ def _paper_buy(
             "conf_mult": round(conf_mult, 3),
             "sleeve": sleeve,
             "catalyst_date": catalyst_date,
+            "high_conviction": hc_granted,
+            "hc_note": hc_note or None,
             "proposal_ts": proposal.get("ts"),
         },
     )
@@ -306,18 +353,62 @@ def _paper_buy(
     # hard stops) actually run for autonomous buys. Wraps in try/except so a
     # plan-creation failure never breaks the buy path.
     try:
-        _auto_create_position_plan(cfg, tk, proposal, sleeve, catalyst_date)
+        _auto_create_position_plan(cfg, tk, proposal, sleeve, catalyst_date, high_conviction=hc_granted)
     except Exception:
         logger.debug("auto-create position plan failed for %s", tk, exc_info=True)
 
     conf_note = f", conf {conf:.2f}→{conf_mult:.0%} of cap" if conf is not None else ""
     sleeve_display = sleeve if sleeve != "?" else "?"
+    hc_prefix = "HIGH-CONVICTION " if hc_granted else ""
     if abs(scale - 1.0) < 1e-9:
-        msg = f"BUY {tk} ~${notional:,.0f} ({sleeve_display}) executed on Alpaca paper{conf_note}."
+        msg = f"{hc_prefix}BUY {tk} ~${notional:,.0f} ({sleeve_display}) executed on Alpaca paper{conf_note}."
     else:
-        msg = f"BUY {tk} ~${notional:,.0f} ({sleeve_display}) submitted to Alpaca paper (scaled from ~${usd:,.0f} eToro-size{conf_note})."
+        msg = f"{hc_prefix}BUY {tk} ~${notional:,.0f} ({sleeve_display}) submitted to Alpaca paper (scaled from ~${usd:,.0f} eToro-size{conf_note})."
+    if proposal.get("high_conviction") and not hc_granted:
+        msg += f"\nHigh-conviction size-up DENIED: {hc_note}. Sized normally."
     _notify(cfg, f"BUY {tk}", msg + "\nFills at next market open if currently closed.")
     return msg
+
+
+def _high_conviction_grant(
+    cfg: Dict[str, Any], client, tk: str, confidence: Optional[float]
+) -> tuple:
+    """Decide whether a high-conviction size-up is allowed. Returns (granted, note).
+
+    Guards (all must pass):
+      1. Tier enabled in config.
+      2. Stated confidence >= high_conviction_min_confidence (default 0.85).
+      3. A concurrent HC slot is free: at most high_conviction_max_positions
+         (default 2) open positions may carry the high_conviction plan flag.
+
+    A denial NEVER blocks the trade — the buy proceeds at normal sizing and the
+    denial reason is surfaced so the PM learns why. Cash only; this tier raises
+    the per-position cap, it does not borrow.
+    """
+    if not bool(cfg.get("portfolio_advisor_alpaca_high_conviction_enabled", True)):
+        return False, "high-conviction tier disabled in config"
+    min_conf = float(cfg.get("portfolio_advisor_alpaca_high_conviction_min_confidence", 0.85) or 0.85)
+    if confidence is None or float(confidence) < min_conf:
+        stated = "unstated" if confidence is None else f"{float(confidence):.2f}"
+        return False, f"confidence {stated} below high-conviction floor {min_conf:.2f}"
+    max_hc = int(cfg.get("portfolio_advisor_alpaca_high_conviction_max_positions", 2) or 2)
+    try:
+        from tradingagents.portfolio_advisor.position_plans import load_position_plans
+
+        plans = load_position_plans(cfg)
+        open_syms = {str(p.symbol).upper() for p in (client.get_all_positions() or [])}
+        hc_open = sorted(
+            t for t, pl in plans.items()
+            if getattr(pl, "high_conviction", False) and t in open_syms and t != tk
+        )
+        if len(hc_open) >= max_hc:
+            return False, f"high-conviction slots full ({', '.join(hc_open)}); max {max_hc} concurrent"
+    except Exception:
+        # Slot accounting failed — deny the size-up (the conservative direction),
+        # but the buy itself still executes at normal size.
+        logger.debug("high-conviction slot check failed for %s", tk, exc_info=True)
+        return False, "slot check failed; sized normally"
+    return True, f"high-conviction granted (confidence {float(confidence):.2f} >= floor {min_conf:.2f})"
 
 
 def _open_buy_order_exists(client, tk: str) -> bool:
@@ -408,12 +499,14 @@ def _auto_create_position_plan(
     proposal: Dict[str, Any],
     sleeve: str,
     catalyst_date: Optional[str],
+    high_conviction: bool = False,
 ) -> None:
     """Create or upsert a PositionPlan for an autonomous buy.
 
     Entry price: proposal target_price if > 0, else last close from yfinance.
     Existing plans are NOT overwritten — an existing plan means the user or a
-    prior autonomous buy already set one up.
+    prior autonomous buy already set one up. high_conviction marks the plan as
+    occupying an HC slot (counted by _high_conviction_grant while open).
     """
     from tradingagents.portfolio_advisor.position_plans import (
         PositionPlan,
@@ -424,10 +517,17 @@ def _auto_create_position_plan(
     existing = load_position_plans(cfg)
     if tk in existing:
         # Plan already exists — do not clobber it. Only update catalyst_date if
-        # the existing plan has none and the new proposal supplies one.
+        # the existing plan has none and the new proposal supplies one, and
+        # latch the HC flag if this buy was granted the high-conviction tier.
         plan = existing[tk]
+        dirty = False
         if catalyst_date and not plan.catalyst_date:
             plan.catalyst_date = catalyst_date
+            dirty = True
+        if high_conviction and not plan.high_conviction:
+            plan.high_conviction = True
+            dirty = True
+        if dirty:
             upsert_position_plan(cfg, plan)
         return
 
@@ -454,6 +554,7 @@ def _auto_create_position_plan(
         entry_date=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
         catalyst_date=catalyst_date or "",
         notes=note,
+        high_conviction=bool(high_conviction),
     )
     upsert_position_plan(cfg, plan)
 
@@ -849,6 +950,17 @@ def build_scoreboard_block(cfg: Dict[str, Any]) -> str:
         base = _ensure_baseline(cfg, equity)
         start_eq = float(base.get("start_equity") or 0)
         lines = ["--- Alpaca paper book (advisor track record) ---"]
+        # Market clock (Alpaca-authoritative: weekends, US holidays, half-days).
+        clock = market_clock()
+        if clock is not None:
+            if clock.get("is_open"):
+                lines.append(f"Market: OPEN (closes {str(clock.get('next_close'))[:16]})")
+            else:
+                lines.append(
+                    f"Market: CLOSED (weekend/holiday/after-hours) — next open {str(clock.get('next_open'))[:16]}. "
+                    "Orders placed now queue as DAY orders and fill at the next open; "
+                    "position prices below are frozen at the last close."
+                )
         if start_eq > 0:
             ret = (equity / start_eq - 1) * 100
             line = f"Equity ${equity:,.0f} | {ret:+.2f}% since {str(base.get('start_iso',''))[:10]}"

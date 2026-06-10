@@ -198,6 +198,14 @@ DEFAULT_CONFIG = _apply_env_overrides({
     "portfolio_advisor_catalyst_time_stop_days": 3,          # days after catalyst date to exit if move didn't happen
     "portfolio_advisor_catalyst_max_hold_days": 30,          # hard hold cap when no catalyst date is set
     "portfolio_advisor_catalyst_pre_event_days_before": 1,   # go flat this many days before catalyst event (Option B: avoid binary print)
+    # --- High-conviction sizing tier (studied concentration, NOT margin) ---
+    # The PM may flag a buy as high_conviction. If confidence clears the floor and a
+    # slot is free, the position cap rises from max_position_pct to the pct below.
+    # Stops are NEVER loosened — bigger size, same exit discipline. Cash only, no margin.
+    "portfolio_advisor_alpaca_high_conviction_enabled": True,
+    "portfolio_advisor_alpaca_high_conviction_pct": 0.15,             # per-position cap of book for granted HC buys
+    "portfolio_advisor_alpaca_high_conviction_min_confidence": 0.85,  # stated confidence floor to qualify
+    "portfolio_advisor_alpaca_high_conviction_max_positions": 2,      # concurrent HC slots across the whole book
     # Dip-watch (quality-on-a-dip): watch CORE watchlist names for a SHALLOW pullback
     # into a buy zone, then let the PM judge (value-trap check) + propose a staged entry.
     # Bounds are config because the research found exact thresholds are indicative, not

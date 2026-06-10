@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Tuple
 
 from tradingagents.portfolio_advisor import price_util, state as pa_state, watchlist as watchlist_mod
-from tradingagents.portfolio_advisor.watchdog import in_us_equity_watch_window_utc
+from tradingagents.portfolio_advisor.watchdog import market_is_open
 
 logger = logging.getLogger(__name__)
 
@@ -156,8 +156,8 @@ def run_dip_watch(
     if not bool(cfg.get("portfolio_advisor_dip_watch_enabled", True)):
         logger.info("dip-watch disabled")
         return 0
-    if not ignore_market_hours and not in_us_equity_watch_window_utc():
-        logger.info("dip-watch skipped (outside US equity watch window UTC)")
+    if not ignore_market_hours and not market_is_open():
+        logger.info("dip-watch skipped (market closed: weekend, US holiday, or outside hours)")
         return 0
 
     candidates = _core_watchlist_names(cfg)
