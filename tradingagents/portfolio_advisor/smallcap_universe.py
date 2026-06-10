@@ -7,6 +7,9 @@ Implements:
     where cohort is "largecap" (S&P 500 + NASDAQ 100) or "smallcap" (S&P 600).
   - smallcap_shadow_active(cfg): single function that decides whether the
     shadow-routing window is still active.
+  - get_ticker_cohort(ticker, cfg): cache-only cohort lookup (no network).
+    Returns "largecap", "smallcap", or "unknown" (unknown → treat as smallcap
+    when the shadow window is active, per the fail-closed policy).
 
 All network fetches are no-ops when portfolio_advisor_universe_smallcap_enabled
 is False — the S&P 600 fetch is never attempted in that case.
@@ -174,7 +177,11 @@ def smallcap_shadow_active(cfg: Dict[str, Any]) -> bool:
 
     The window is defined as: now < smallcap_enabled_at + shadow_days.
     The enable timestamp is read from the pa_state dict (persisted via state.py).
-    If smallcap_enabled is off, or the enabled_at timestamp is missing, returns False.
+    If smallcap_enabled is off the window is always closed.
+
+    SELF-HEAL: if the flag is on but smallcap_enabled_at is absent from state,
+    this function records it as now (so the 90-day clock starts), logs a WARNING,
+    sends a one-time Telegram note, and returns True for this call.
 
     This is the SINGLE function that controls shadow routing — used by both
     core_discovery and any catalyst-side path.
@@ -189,7 +196,38 @@ def smallcap_shadow_active(cfg: Dict[str, Any]) -> bool:
         pa_state = _state.load_state(cfg)
         enabled_at_str = pa_state.get("smallcap_enabled_at")
         if not enabled_at_str:
-            return True  # flag on but no timestamp yet → treat as still in window (conservative)
+            # SELF-HEAL: flag is on but timestamp is missing — record it now so
+            # the 90-day clock starts, emit a WARNING so the operator knows the
+            # clock was just anchored, and return True (still in window).
+            now_iso = datetime.now(timezone.utc).isoformat()
+            pa_state["smallcap_enabled_at"] = now_iso
+            try:
+                _state.save_state(cfg, pa_state)
+            except Exception as _save_exc:
+                logger.warning(
+                    "smallcap_shadow_active: self-heal timestamp write failed: %s", _save_exc
+                )
+            logger.warning(
+                "smallcap_shadow_active: smallcap_enabled_at was missing — "
+                "self-healed to %s; 90-day shadow clock now starts from this call. "
+                "All unvetted smallcap buys are shadow-routed until the window expires.",
+                now_iso,
+            )
+            # One-time Telegram note so the operator is aware
+            try:
+                from tradingagents.portfolio_advisor.messaging import send_advisor_message
+                send_advisor_message(
+                    cfg,
+                    "Smallcap Shadow",
+                    "smallcap cohort map unavailable — failing closed. "
+                    f"Shadow window clock anchored to {now_iso}. "
+                    "All unvetted smallcap proposals are shadow-routed for the next "
+                    f"{shadow_days} days.",
+                    urgent=False,
+                )
+            except Exception:
+                pass
+            return True
         enabled_at = datetime.fromisoformat(str(enabled_at_str).replace("Z", "+00:00"))
         if enabled_at.tzinfo is None:
             enabled_at = enabled_at.replace(tzinfo=timezone.utc)
@@ -214,3 +252,65 @@ def record_smallcap_enabled_at(cfg: Dict[str, Any]) -> None:
             logger.info("smallcap_universe: recorded smallcap_enabled_at")
     except Exception as exc:
         logger.warning("smallcap_universe: could not persist smallcap_enabled_at: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Cohort lookup — cache-only, no network
+# ---------------------------------------------------------------------------
+
+# Module-level in-memory cache of the sp600 set to avoid repeated disk I/O.
+# Populated lazily on the first get_ticker_cohort call.
+_sp600_set_cache: Optional[set] = None
+
+
+def get_ticker_cohort(ticker: str, cfg: Optional[Dict[str, Any]] = None) -> str:
+    """Return the cohort label for *ticker* using only the cached S&P 600 list.
+
+    Never touches the network — reads only from the disk cache or the vendored
+    CSV (both are loaded by fetch_sp600_constituents at discovery time).
+
+    Return values:
+      "largecap"  — ticker was definitively NOT in the S&P 600 constituent list
+                    (it may still be small; the S&P 500 / NASDAQ-100 check is
+                    handled by the caller using the original universe sets).
+      "smallcap"  — ticker is in the cached S&P 600 list.
+      "unknown"   — cache is empty or unreadable.  Callers MUST treat "unknown"
+                    as "smallcap" when the shadow window is active (fail-closed).
+
+    Design: this is intentionally a lightweight set-membership test.  The full
+    cohort map built by _build_cohort_map in core_discovery is the authoritative
+    source during discovery runs; this helper is for the proposals.add() choke
+    point that runs outside of discovery (potentially hours later).
+    """
+    global _sp600_set_cache
+
+    tk = (ticker or "").strip().upper()
+    if not tk:
+        return "unknown"
+
+    # Populate in-memory cache lazily (from disk; never from the network).
+    if _sp600_set_cache is None:
+        _cfg = cfg or {}
+        data_cache_dir = _cfg.get("data_cache_dir")
+        cached_list = _load_sp600_from_cache(data_cache_dir)
+        if cached_list:
+            _sp600_set_cache = set(cached_list)
+        else:
+            # Try vendored CSV as last resort
+            vendored = _load_sp600_from_vendored_csv()
+            if vendored:
+                _sp600_set_cache = set(vendored)
+            else:
+                # No data available at all — return "unknown" so callers fail closed.
+                return "unknown"
+
+    if not _sp600_set_cache:
+        return "unknown"
+
+    return "smallcap" if tk in _sp600_set_cache else "largecap"
+
+
+def _invalidate_sp600_cache() -> None:
+    """Clear the module-level sp600 in-memory cache (for tests and after refreshes)."""
+    global _sp600_set_cache
+    _sp600_set_cache = None

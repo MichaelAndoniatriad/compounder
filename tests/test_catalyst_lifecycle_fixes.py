@@ -872,3 +872,126 @@ class TestPreEventFlatRule:
         plan = plans.get("PERSIST1")
         assert plan is not None
         assert plan.pre_event_flat_done_at, "pre_event_flat_done_at should be set after firing"
+
+
+# ===========================================================================
+# Fix 4 — Time-stop anchor: measures from max(catalyst_date, entry_date)
+# ===========================================================================
+
+
+class TestTimeStopAnchor:
+    """Mandated design item 5: the time stop must not fire immediately when
+    catalyst_date is in the past (e.g. PEAD report_date = yesterday) and the
+    position was just entered today.
+
+    The anchor is max(catalyst_date, entry_date); the clock starts from
+    whichever is later — meaning the time stop cannot fire before
+    entry_date + time_stop_days days have passed.
+    """
+
+    def test_past_catalyst_date_and_fresh_entry_does_not_fire(self):
+        """catalyst_date 4 days ago + entry_date today → time stop does NOT fire.
+
+        Without the anchor fix, days_since(catalyst_date)=4 >= time_stop_days=3
+        would incorrectly fire the time stop on the first tick after entry.
+        """
+        from tradingagents.portfolio_advisor.position_plans import (
+            CatalystRules,
+            PositionPlan,
+            eval_catalyst_exit,
+        )
+
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        four_days_ago = (datetime.now(timezone.utc) - timedelta(days=4)).strftime("%Y-%m-%d")
+
+        plan = PositionPlan(
+            ticker="PEAD1",
+            entry_price=100.0,
+            strategy="catalyst",
+            catalyst_date=four_days_ago,  # report date was 4 days ago
+            entry_date=today,              # but the trade was entered TODAY
+        )
+        rules = CatalystRules(time_stop_days=3)
+
+        result = eval_catalyst_exit(plan, 98.0, rules)
+        assert result is None, (
+            f"Time stop should NOT fire when entry is today even though catalyst_date is "
+            f"4d in the past. Got: {result!r}"
+        )
+
+    def test_time_stop_fires_after_entry_plus_stop_days(self):
+        """catalyst_date 4 days ago + entry_date 3 days ago → time stop DOES fire."""
+        from tradingagents.portfolio_advisor.position_plans import (
+            CatalystRules,
+            PositionPlan,
+            eval_catalyst_exit,
+        )
+
+        four_days_ago = (datetime.now(timezone.utc) - timedelta(days=4)).strftime("%Y-%m-%d")
+        three_days_ago = (datetime.now(timezone.utc) - timedelta(days=3)).strftime("%Y-%m-%d")
+
+        plan = PositionPlan(
+            ticker="PEAD2",
+            entry_price=100.0,
+            strategy="catalyst",
+            catalyst_date=four_days_ago,   # report date
+            entry_date=three_days_ago,     # entered 3 days ago → max(4d, 3d) = 3d
+        )
+        rules = CatalystRules(time_stop_days=3)
+
+        # Price hasn't moved up (98 < 105), so time stop should fire
+        result = eval_catalyst_exit(plan, 98.0, rules)
+        assert result is not None and "time_stop" in result, (
+            f"Time stop should fire when entry is 3d ago (>= time_stop_days=3). Got: {result!r}"
+        )
+
+    def test_past_catalyst_no_entry_date_uses_catalyst_date_fallback(self):
+        """When entry_date is empty, falls back to catalyst_date (original behaviour)."""
+        from tradingagents.portfolio_advisor.position_plans import (
+            CatalystRules,
+            PositionPlan,
+            eval_catalyst_exit,
+        )
+
+        four_days_ago = (datetime.now(timezone.utc) - timedelta(days=4)).strftime("%Y-%m-%d")
+
+        # No entry_date — this is a pre-event catalyst; entry happened BEFORE the event
+        plan = PositionPlan(
+            ticker="PRE1",
+            entry_price=100.0,
+            strategy="catalyst",
+            catalyst_date=four_days_ago,
+            entry_date="",  # absent
+        )
+        rules = CatalystRules(time_stop_days=3)
+
+        result = eval_catalyst_exit(plan, 98.0, rules)
+        assert result is not None and "time_stop" in result, (
+            f"Without entry_date, time stop should fall back to catalyst_date. Got: {result!r}"
+        )
+
+    def test_time_stop_does_not_fire_when_position_is_up(self):
+        """Time stop never fires when price is >= entry * 1.05 (position ran)."""
+        from tradingagents.portfolio_advisor.position_plans import (
+            CatalystRules,
+            PositionPlan,
+            eval_catalyst_exit,
+        )
+
+        four_days_ago = (datetime.now(timezone.utc) - timedelta(days=4)).strftime("%Y-%m-%d")
+        four_days_ago2 = (datetime.now(timezone.utc) - timedelta(days=4)).strftime("%Y-%m-%d")
+
+        plan = PositionPlan(
+            ticker="WIN1",
+            entry_price=100.0,
+            strategy="catalyst",
+            catalyst_date=four_days_ago,
+            entry_date=four_days_ago2,
+        )
+        rules = CatalystRules(time_stop_days=3)
+
+        # Price is up 10% — time stop must not fire even though window expired
+        result = eval_catalyst_exit(plan, 110.0, rules)
+        assert result is None, (
+            f"Time stop should NOT fire when position is up >= 5%. Got: {result!r}"
+        )

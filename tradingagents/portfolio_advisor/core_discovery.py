@@ -19,7 +19,12 @@ logger = logging.getLogger(__name__)
 # Only market cap is a hard gate. The rest contribute to a composite score so
 # strong-on-most / weak-on-one names survive the funnel into LLM ranking.
 # The 4-hard-filter version produced zero candidates in the 7 Jun 2026 run.
-MIN_MARKET_CAP = 1_000_000_000  # $1B — the only hard gate
+MIN_MARKET_CAP = 1_000_000_000  # $1B — hard gate for the largecap cohort
+# R5 — smallcap cohort uses a much lower cap floor because S&P 600 names
+# frequently trade below $1B.  The real liquidity gate is the ADV check in
+# mechanical_filter ($2M+), not market cap.  $100M excludes genuine micro-caps
+# while keeping the bulk of the S&P 600.
+MIN_MARKET_CAP_SMALLCAP = 100_000_000  # $100M for S&P 600 cohort
 SURVIVOR_SCORE = 0.55  # composite threshold to graduate to LLM ranking
 
 # Tier breakpoints (each contributes points to the composite)
@@ -167,7 +172,7 @@ def _build_cohort_map(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
     return cohort
 
 
-def _score_quantitative(info: Dict[str, Any]) -> float:
+def _score_quantitative(info: Dict[str, Any], cohort: str = "largecap") -> float:
     """Composite quality score [0.0, 1.0] from fundamentals dict.
 
     Each criterion contributes points by tier. Names that are strong on most
@@ -182,7 +187,8 @@ def _score_quantitative(info: Dict[str, Any]) -> float:
     add any "undervalued" or "cheap" filter here.
     """
     market_cap = info.get("marketCap", 0) or 0
-    if market_cap < MIN_MARKET_CAP:
+    cap_floor = MIN_MARKET_CAP_SMALLCAP if cohort == "smallcap" else MIN_MARKET_CAP
+    if market_cap < cap_floor:
         return 0.0
 
     rev_growth = info.get("revenueGrowth", 0) or 0
@@ -311,10 +317,31 @@ def _quantitative_screen(
                     continue
 
             market_cap = info.get("marketCap", 0) or 0
-            if market_cap < MIN_MARKET_CAP:
+
+            # R5 smallcap cap-estimate fallback:
+            # companyfacts never sets marketCap; yfinance may miss it for thin names.
+            # When marketCap is 0/missing for a smallcap, estimate from
+            # shares_outstanding × price if both are available from AV/yfinance —
+            # this prevents the companyfacts-only path from being dead code.
+            # If neither shares nor price are available, let the name pass the cap
+            # gate and rely on the ADV gate (the real liquidity filter for this cohort).
+            if cohort == "smallcap" and not market_cap:
+                shares_out = info.get("sharesOutstanding") or info.get("impliedSharesOutstanding") or 0
+                price = info.get("currentPrice") or info.get("regularMarketPrice") or 0
+                if shares_out and price:
+                    market_cap = float(shares_out) * float(price)
+                    info = dict(info)
+                    info["marketCap"] = market_cap
+                # If we still can't estimate cap, let it pass and rely on ADV gate.
+                # (The ADV gate already ran in mechanical_filter — this name cleared it.)
+
+            cap_floor = MIN_MARKET_CAP_SMALLCAP if cohort == "smallcap" else MIN_MARKET_CAP
+            if market_cap and market_cap < cap_floor:
+                # Only hard-reject when we actually have a cap figure.
+                # If market_cap is still 0 here (smallcap, no shares/price), pass through.
                 continue
 
-            score = _score_quantitative(info)
+            score = _score_quantitative(info, cohort=cohort)
             if score < SURVIVOR_SCORE:
                 continue
 
@@ -834,41 +861,71 @@ def run_core_discovery(cfg: Dict[str, Any]) -> str:
 
     # Phase 5b: R5 shadow-routing window — smallcap deep-dive picks that would
     # become proposals are instead written to the shadow book during the window.
-    if cfg.get("portfolio_advisor_universe_smallcap_enabled", False) and _cohort_map:
+    #
+    # FAIL-CLOSED policy: when the flag is on and the shadow window is active,
+    # a ticker is only allowed to proceed to live PM promotion when it is
+    # DEFINITIVELY in the largecap cohort (i.e. appears in _cohort_map as
+    # "largecap").  Unknown tickers (map empty or ticker absent) are treated as
+    # smallcap and diverted.  If _cohort_map is empty AND the window is active,
+    # ALL deep-dive picks are shadow-routed — no unvetted name reaches Phase 6.
+    if cfg.get("portfolio_advisor_universe_smallcap_enabled", False):
         try:
             from tradingagents.portfolio_advisor.smallcap_universe import smallcap_shadow_active
             from tradingagents.portfolio_advisor.candidates import shadow_book_add
 
             _shadow_active = smallcap_shadow_active(cfg)
-            _shadow_diverted: List[Dict] = []
-            _live_deep_dive: List[Dict] = []
-            for pick in deep_dive_picks:
-                cohort = _cohort_map.get(pick["ticker"], "largecap")
-                if cohort == "smallcap" and _shadow_active:
-                    result = shadow_book_add(
-                        cfg,
-                        ticker=pick["ticker"],
-                        source="core_discovery_smallcap",
-                        reason=pick.get("thesis", "")[:200],
-                        strategy="core",
-                        gates_passed=["quant_screen", "llm_qualitative"],
-                        status="shadow_smallcap_window",
+            if _shadow_active:
+                _shadow_diverted: List[Dict] = []
+                _live_deep_dive: List[Dict] = []
+                _cohort_map_empty = not _cohort_map
+                if _cohort_map_empty:
+                    logger.warning(
+                        "core discovery Phase 5b: cohort map is empty — failing closed; "
+                        "ALL %d deep-dive picks shadow-routed (none proceed to Phase 6)",
+                        len(deep_dive_picks),
                     )
-                    if result is not None:
-                        logger.info(
-                            "core discovery: smallcap shadow window — diverted %s to shadow book",
-                            pick["ticker"],
+                    try:
+                        from tradingagents.portfolio_advisor.messaging import send_advisor_message
+                        send_advisor_message(
+                            cfg,
+                            "Smallcap Shadow",
+                            "smallcap cohort map unavailable — failing closed. "
+                            f"All {len(deep_dive_picks)} deep-dive pick(s) routed to shadow book "
+                            "rather than live proposals.",
+                            urgent=False,
                         )
-                    _shadow_diverted.append(pick)
-                else:
-                    _live_deep_dive.append(pick)
-            if _shadow_diverted:
-                logger.info(
-                    "core discovery: shadow window active — %d smallcap pick(s) routed to shadow, "
-                    "%d largecap pick(s) proceed normally",
-                    len(_shadow_diverted), len(_live_deep_dive),
-                )
-            deep_dive_picks = _live_deep_dive
+                    except Exception:
+                        pass
+                for pick in deep_dive_picks:
+                    # Fail-closed: unknown cohort → treat as smallcap
+                    cohort = _cohort_map.get(pick["ticker"], "unknown") if _cohort_map else "unknown"
+                    should_shadow = _cohort_map_empty or cohort != "largecap"
+                    if should_shadow:
+                        result = shadow_book_add(
+                            cfg,
+                            ticker=pick["ticker"],
+                            source="core_discovery_smallcap",
+                            reason=pick.get("thesis", "")[:200],
+                            strategy="core",
+                            gates_passed=["quant_screen", "llm_qualitative"],
+                            status="shadow_smallcap_window",
+                        )
+                        if result is not None:
+                            logger.info(
+                                "core discovery: smallcap shadow window — diverted %s "
+                                "(cohort=%s) to shadow book",
+                                pick["ticker"], cohort,
+                            )
+                        _shadow_diverted.append(pick)
+                    else:
+                        _live_deep_dive.append(pick)
+                if _shadow_diverted:
+                    logger.info(
+                        "core discovery: shadow window active — %d pick(s) routed to shadow "
+                        "(cohort unknown/smallcap), %d largecap pick(s) proceed normally",
+                        len(_shadow_diverted), len(_live_deep_dive),
+                    )
+                deep_dive_picks = _live_deep_dive
         except Exception as _sr_err:
             logger.warning("core discovery: shadow routing failed: %s", _sr_err)
 

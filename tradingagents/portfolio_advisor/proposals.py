@@ -21,12 +21,15 @@ release the gate so new tranches and re-entries work correctly.
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from tradingagents.portfolio_advisor import state as pa_state
+
+logger = logging.getLogger(__name__)
 
 _STATUSES = ("proposed", "approved", "rejected", "executed", "cancelled", "deferred_market_closed")
 
@@ -174,6 +177,73 @@ def add(
     }
     rows.append(entry)
     save_all(cfg, rows)
+
+    # -------------------------------------------------------------------------
+    # R5 Central shadow choke — intercepts EVERY buy/add that could become a
+    # smallcap live proposal while the 90-day shadow window is active.
+    # Belt-and-braces: core_discovery Phase 5b already diverts picks during
+    # discovery; this gate catches any path that reaches proposals.add() without
+    # going through Phase 5b (e.g. catalyst-side, watchlist dip-watch, etc.).
+    #
+    # FAIL-CLOSED policy: when the flag is on and the shadow window is active,
+    # any ticker whose cohort is "smallcap" or "unknown" (i.e. not definitively
+    # in the largecap S&P 500 / NASDAQ-100 universe) is diverted to the shadow
+    # book and NOT executed.  A WARNING is logged; a one-time Telegram note is
+    # sent if the cohort map was unavailable (see smallcap_shadow_active).
+    # -------------------------------------------------------------------------
+    if prior is None and act in ("buy", "add") and cfg.get(
+        "portfolio_advisor_universe_smallcap_enabled", False
+    ):
+        try:
+            from tradingagents.portfolio_advisor.smallcap_universe import (
+                get_ticker_cohort,
+                smallcap_shadow_active,
+            )
+            from tradingagents.portfolio_advisor.candidates import shadow_book_add
+
+            if smallcap_shadow_active(cfg):
+                cohort = get_ticker_cohort(tk, cfg)
+                # Unknown-but-not-definitively-largecap → treat as smallcap (fail-closed)
+                if cohort in ("smallcap", "unknown"):
+                    shadow_result = shadow_book_add(
+                        cfg,
+                        ticker=tk,
+                        source=f"proposals_choke_{source}" if source else "proposals_choke",
+                        reason=(entry.get("reason") or "")[:200],
+                        strategy=str(entry.get("sleeve") or "core"),
+                        catalyst_date=str(entry.get("catalyst_date") or ""),
+                        gates_passed=["proposals_add"],
+                        status="shadow_smallcap_window",
+                    )
+                    logger.warning(
+                        "proposals.add: smallcap shadow window active — "
+                        "diverted %s (cohort=%s, action=%s) to shadow book, "
+                        "NOT executing. Shadow entry: %s",
+                        tk, cohort, act,
+                        shadow_result.get("ts") if shadow_result else "duplicate",
+                    )
+                    # Mark the proposal row as cancelled so the dedup gate
+                    # releases correctly and the ledger stays honest.
+                    rows_fresh = load_all(cfg)
+                    for r in rows_fresh:
+                        if r.get("ts") == entry["ts"] and r.get("ticker") == entry["ticker"]:
+                            r["status"] = "cancelled"
+                            r["status_set_at"] = datetime.now(timezone.utc).isoformat()
+                            r["status_note"] = (
+                                f"shadowed: smallcap window active, cohort={cohort}"
+                            )
+                            break
+                    save_all(cfg, rows_fresh)
+                    entry["status"] = "shadowed"
+                    return entry
+        except Exception as _sc_exc:
+            # Shadow-routing failure must never block the proposal path.
+            # Log at WARNING level so it is auditable.
+            logger.warning(
+                "proposals.add: shadow-choke check failed for %s: %s — proceeding to execution",
+                tk, _sc_exc,
+            )
+
     # Push a clean, executable ticket to the human ONLY when this is genuinely
     # new or materially changed — so a rule that re-fires every cycle (same side,
     # same size) doesn't re-spam. Action-only: no proposal, no message.

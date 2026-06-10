@@ -1517,13 +1517,25 @@ def enforce_paper_exits(cfg: Dict[str, Any]) -> int:
                         rule = eval_catalyst_exit(plan, current_price, catalyst_rules)
                     else:
                         # No plan — fall back to legacy time-stop logic from ledger.
+                        # Anchor: measure from max(catalyst_date, buy_ts) so that a
+                        # past catalyst_date (e.g. PEAD report date = yesterday) does
+                        # NOT fire the time stop on the very first tick after entry.
                         time_stop_days = int(cfg.get("portfolio_advisor_catalyst_time_stop_days", 3) or 3)
                         if catalyst_date:
                             try:
-                                from datetime import timedelta
+                                from datetime import timedelta as _td
                                 cat_dt = datetime.fromisoformat(catalyst_date[:10])
                                 cat_dt = cat_dt.replace(tzinfo=timezone.utc)
-                                if (now - cat_dt).days >= time_stop_days:
+                                # Anchor to the buy timestamp when available so the
+                                # clock doesn't start before the trade was entered.
+                                try:
+                                    buy_dt = datetime.fromisoformat(
+                                        str(buy.get("ts") or "").replace("Z", "+00:00")
+                                    ).replace(tzinfo=timezone.utc)
+                                    anchor_dt = max(cat_dt, buy_dt)
+                                except (TypeError, ValueError):
+                                    anchor_dt = cat_dt
+                                if (now - anchor_dt).days >= time_stop_days:
                                     rule = f"paper_catalyst_time_stop_{time_stop_days}d_post_catalyst"
                             except (TypeError, ValueError):
                                 pass

@@ -755,16 +755,36 @@ def eval_catalyst_exit(
         if px <= trailing_stop_level:
             return "paper_catalyst_trailing_stop"
 
-    # Time stop: catalyst_date + time_stop_days, position hasn't run.
-    # When the plan carries a time_stop_days_override (set for PEAD plans to give
-    # drift more time), that value supersedes CatalystRules.time_stop_days.
+    # Time stop: measures elapsed days from max(catalyst_date, entry_date).
+    #
+    # WHY: a PEAD catalyst_date is yesterday's report date — the position is
+    # entered TODAY.  Without this anchor, "days since catalyst_date" is already
+    # >= 1 on the very first watchdog tick after entry, and the time stop fires
+    # immediately even though the trade just opened.  By anchoring to the later
+    # of the two dates we ensure the clock only starts when the position actually
+    # exists.  If entry_date is empty we fall back to catalyst_date (original
+    # behaviour for pre-event catalyst trades where entry precedes the event).
+    #
+    # When the plan carries a time_stop_days_override (set for PEAD plans to
+    # give drift more time), that value supersedes CatalystRules.time_stop_days.
     if plan.catalyst_date:
         effective_time_stop_days = (
             plan.time_stop_days_override
             if plan.time_stop_days_override is not None
             else rules.time_stop_days
         )
-        days_after = _days_since(plan.catalyst_date)
+        # Determine the anchor date: max(catalyst_date, entry_date).
+        # _days_since computes (today - date).days, so we want the date that is
+        # LATER (smaller days_since) to avoid counting pre-entry days.
+        cat_days = _days_since(plan.catalyst_date)
+        entry_days = _days_since(plan.entry_date) if plan.entry_date else None
+        if entry_days is not None and cat_days is not None:
+            # Use the anchor that is CLOSER to today (fewer elapsed days)
+            days_after = min(cat_days, entry_days)
+        elif cat_days is not None:
+            days_after = cat_days
+        else:
+            days_after = None
         if days_after is not None and days_after >= effective_time_stop_days:
             moved_up = px >= entry * 1.05
             if not moved_up:
