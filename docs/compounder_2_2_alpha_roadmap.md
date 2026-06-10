@@ -42,7 +42,7 @@ Audit-confirmed: `outcomes.jsonl` does not exist; recommendation_log has ~5 rows
 
 Accept: unit tests with sandboxed dirs for each writer; outcome cron smoke-callable via CLI.
 
-## R3 — PEAD scanner (the best-documented anomaly at this scale is untargeted)
+## R3 — PEAD scanner ✅ b4b2141 (the best-documented anomaly at this scale is untargeted)
 
 New `tradingagents/portfolio_advisor/pead_scanner.py`:
 - Nightly: pull Alpha Vantage `EARNINGS_CALENDAR` (3-month horizon, CSV endpoint, free tier) → persist a forward calendar `earnings_calendar.json`.
