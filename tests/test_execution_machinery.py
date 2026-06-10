@@ -342,16 +342,24 @@ class TestCatalystOrderRedesign:
     @patch("tradingagents.integrations.alpaca.executor.market_clock", return_value={"is_open": True})
     @patch("tradingagents.integrations.alpaca.executor.enabled", return_value=True)
     def test_catalyst_skip_when_qty_zero(self, mock_enabled, mock_clock, mock_quote, tmp_path):
-        """Catalyst buy is skipped with a clear reason when whole-share qty would be 0."""
-        # Expensive stock: ask=1000, notional=500 → int(500//1001)=0 → skip
-        mock_quote.return_value = _quote(999.0, 1000.0)
-        cfg = _cfg(tmp_path)
-        # tiny notional to force qty=0
-        client = _make_client(equity=100_000.0)
+        """Catalyst buy is skipped with a clear reason when whole-share qty would be 0.
+
+        With R-based sizing: notional = equity × risk_pct / stop_pct.
+        To force qty=0, use a stock priced above the R-based notional:
+          equity=1000, risk_pct=0.01, stop_pct=0.08 → notional=125.
+          ask=500 → int(125 // 501) = 0 → skip.
+        """
+        mock_quote.return_value = _quote(499.0, 500.0)
+        cfg = _cfg(tmp_path,
+                   portfolio_advisor_catalyst_risk_pct=0.01,
+                   portfolio_advisor_catalyst_hard_stop_pct=0.08,
+                   portfolio_advisor_alpaca_max_position_pct=0.15)
+        # tiny equity so R-notional (equity × 1% / 8% = equity × 0.125) is small
+        client = _make_client(equity=1_000.0)
 
         from tradingagents.integrations.alpaca import executor as ex
 
-        result = ex._paper_buy(cfg, client, 100_000.0, "SMCI",
+        result = ex._paper_buy(cfg, client, 1_000.0, "SMCI",
                                {"ticker": "SMCI", "action": "buy", "approx_usd": 500.0,
                                 "sleeve": "catalyst", "catalyst_date": "2026-09-15"})
 

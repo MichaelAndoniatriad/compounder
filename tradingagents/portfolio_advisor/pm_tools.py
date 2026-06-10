@@ -873,6 +873,84 @@ def build_pm_tools(cfg: Dict[str, Any], live_tickers: set) -> List[Any]:
         except Exception as e:
             return f"macro review failed: {e}"
 
+    @tool
+    def veto_candidate(ticker: str, reason: str) -> str:
+        """Veto a scanner-sourced catalyst candidate that is pending execution.
+
+        Scanner-qualified catalyst candidates (source: ep_scanner or pead_scanner)
+        are filed as proposals with a PM veto window (default 45 minutes) before
+        auto-execution.  Call this tool to block a candidate within that window.
+
+        CONTRACT: veto only on DISQUALIFYING evidence — bad data, known corporate
+        action, thesis already dead, or the scan fired on a non-event.  Your vetoes
+        are scored against what they passed on (shadow_book forward returns vs
+        executed candidates) so false-positive vetoes subtract measurable alpha.
+
+        Scanner-qualified candidates execute automatically after <N> minutes unless
+        you veto_candidate(ticker, reason).  Veto only on disqualifying evidence
+        (bad data, known corporate action, thesis already dead) — your vetoes are
+        scored against what they passed on.
+
+        Returns confirmation or an error if no matching pending proposal found.
+        """
+        from datetime import datetime, timezone
+
+        tk = (ticker or "").strip().upper()
+        reason_clean = (reason or "").strip()
+        if not tk:
+            return "error: empty ticker"
+        if not reason_clean:
+            return (
+                "error: veto reason required — explain WHY this candidate is disqualified "
+                "(bad data, known corporate action, thesis already dead, etc.)."
+            )
+        try:
+            from tradingagents.portfolio_advisor import proposals as _proposals
+            from tradingagents.portfolio_advisor.candidates import shadow_book_add
+
+            rows = _proposals.load_all(cfg)
+            now_iso = datetime.now(timezone.utc).isoformat()
+            hit = None
+            for r in rows:
+                if (
+                    r.get("status") == "proposed"
+                    and (r.get("ticker") or "").strip().upper() == tk
+                    and r.get("pm_veto_window_until")  # scanner-sourced gate
+                ):
+                    r["status"] = "pm_vetoed"
+                    r["status_set_at"] = now_iso
+                    r["status_note"] = reason_clean[:300]
+                    hit = dict(r)
+                    break
+            if hit is None:
+                return (
+                    f"no pending scanner-sourced catalyst proposal found for {tk} — "
+                    "veto_candidate only applies to proposals with an active veto window."
+                )
+            _proposals.save_all(cfg, rows)
+
+            # T2: shadow-book the vetoed candidate so its forward return is scored.
+            # Prefix source with "pm_vetoed_" so veto_scorecard can identify these rows.
+            _orig_source = str(hit.get("source") or "scanner")
+            shadow_book_add(
+                cfg,
+                ticker=tk,
+                source=f"pm_vetoed_{_orig_source}",
+                reason=f"pm_vetoed: {reason_clean}"[:200],
+                strategy="catalyst",
+                catalyst_date=str(hit.get("catalyst_date") or ""),
+                gates_passed=["scanner_qualified", "pm_vetoed"],
+                entry_price=float(hit.get("target_price") or 0) or None,
+                status="pm_vetoed",
+            )
+            return (
+                f"VETOED {tk}: proposal cancelled. "
+                f"Shadow-book entry written to score veto forward return. "
+                f"Reason: {reason_clean[:200]}"
+            )
+        except Exception as e:
+            return f"error vetoing {tk}: {e}"
+
     return [
         queue_research,
         mark_action_done,
@@ -894,4 +972,5 @@ def build_pm_tools(cfg: Dict[str, Any], live_tickers: set) -> List[Any]:
         log_ep_trade,
         update_ep_trade,
         run_macro_review,
+        veto_candidate,
     ]

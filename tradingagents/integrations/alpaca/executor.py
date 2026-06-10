@@ -340,25 +340,49 @@ def _paper_buy(
         _log_row(cfg, {"ticker": tk, "action": act, "status": "skipped", "note": skip_reason})
         return f"skipped {tk}: {skip_reason}"
 
-    scale = _scale_factor(cfg, equity)
-    cap = float(cfg.get("portfolio_advisor_alpaca_max_position_pct", 0.10) or 0.10)
-    # §5.4: confidence-weighted sizing — multiplier ∈ [0.2, 1.0] of the cap
+    # Determine sleeve early so sizing branch can use it.
+    sleeve = (proposal.get("sleeve") or "").lower() or "core"
     conf = proposal.get("confidence")
 
-    # High-conviction tier: a granted HC buy sizes against the bigger HC cap,
-    # still vol-dampened (studied risk: size up on conviction, shrink on vol —
-    # never both loosened). Denied requests fall through to normal sizing.
+    scale = _scale_factor(cfg, equity)
+    cap = float(cfg.get("portfolio_advisor_alpaca_max_position_pct", 0.10) or 0.10)
+
+    # T2: R-based sizing for catalyst sleeve.
+    # notional = equity × risk_pct / hard_stop_pct, so a full stop-out costs
+    # exactly risk_pct of the book.  Confidence and high-conviction do NOT
+    # affect catalyst size; the HC tier is core-only.
+    # The regime multiplier and max-position cap still apply after.
     hc_granted = False
     hc_note = ""
-    if proposal.get("high_conviction"):
-        hc_granted, hc_note = _high_conviction_grant(cfg, client, tk, conf)
-    if hc_granted:
-        hc_cap = float(cfg.get("portfolio_advisor_alpaca_high_conviction_pct", 0.15) or 0.15)
-        conf_mult = min(1.0, 1.0 / _vol_dampener(tk))
-        notional = round(min(usd * scale, equity * hc_cap * conf_mult), 2)
+    sizing_method: str
+
+    if sleeve == "catalyst":
+        risk_pct = float(cfg.get("portfolio_advisor_catalyst_risk_pct", 0.01) or 0.01)
+        hard_stop_pct = float(cfg.get("portfolio_advisor_catalyst_hard_stop_pct", 0.08) or 0.08)
+        r_notional = equity * risk_pct / hard_stop_pct if hard_stop_pct > 0 else 0.0
+        notional = round(min(r_notional, equity * cap), 2)
+        sizing_method = "r_based_1pct"
+        conf_mult = 1.0  # not used in catalyst path but kept for ledger
+        # HC denied for catalyst (enforce separately from _high_conviction_grant)
+        if proposal.get("high_conviction"):
+            hc_granted = False
+            hc_note = "high-conviction tier is core-sleeve only (catalyst uses R-based sizing)"
     else:
-        conf_mult = _confidence_size_multiplier(cfg, conf, tk)
-        notional = round(min(usd * scale, equity * cap * conf_mult), 2)
+        # §5.4: confidence-weighted sizing for core sleeve — multiplier ∈ [0.2, 1.0]
+        sizing_method = "confidence"
+        # High-conviction tier: a granted HC buy sizes against the bigger HC cap,
+        # still vol-dampened (studied risk: size up on conviction, shrink on vol —
+        # never both loosened). Denied requests fall through to normal sizing.
+        if proposal.get("high_conviction"):
+            hc_granted, hc_note = _high_conviction_grant(cfg, client, tk, conf, sleeve=sleeve)
+        if hc_granted:
+            hc_cap = float(cfg.get("portfolio_advisor_alpaca_high_conviction_pct", 0.15) or 0.15)
+            conf_mult = min(1.0, 1.0 / _vol_dampener(tk))
+            notional = round(min(usd * scale, equity * hc_cap * conf_mult), 2)
+        else:
+            conf_mult = _confidence_size_multiplier(cfg, conf, tk)
+            notional = round(min(usd * scale, equity * cap * conf_mult), 2)
+
     if notional < 1.0:
         _log_row(cfg, {"ticker": tk, "action": "buy", "status": "skipped", "note": f"notional {notional} < $1"})
         return f"skipped {tk}: scaled notional under $1"
@@ -419,7 +443,7 @@ def _paper_buy(
                            "regime": _regime_label, "breaker_level": _breaker_level})
             return f"skipped {tk}: regime-scaled notional under $1"
 
-    sleeve = (proposal.get("sleeve") or "").lower() or "core"
+    # sleeve was already determined above (for sizing); reuse it here.
     catalyst_date = (proposal.get("catalyst_date") or "").strip() or None
 
     # R1.3 — No overnight queuing for catalyst entries.
@@ -520,6 +544,8 @@ def _paper_buy(
             "proposal_ts": proposal.get("ts"),
             "intended_price": intended_price,
             "fill_check_pending": True,
+            # T2: R-based sizing method label for ledger/audit.
+            "sizing_method": sizing_method,
             # T1 — regime overlay fields
             "regime": _regime_label,
             "breaker_level": _breaker_level,
@@ -927,20 +953,26 @@ def reconcile_fills(cfg: Dict[str, Any]) -> None:
 
 
 def _high_conviction_grant(
-    cfg: Dict[str, Any], client, tk: str, confidence: Optional[float]
+    cfg: Dict[str, Any], client, tk: str, confidence: Optional[float],
+    sleeve: str = "core",
 ) -> tuple:
     """Decide whether a high-conviction size-up is allowed. Returns (granted, note).
 
     Guards (all must pass):
       1. Tier enabled in config.
-      2. Stated confidence >= high_conviction_min_confidence (default 0.85).
-      3. A concurrent HC slot is free: at most high_conviction_max_positions
+      2. Sleeve must be 'core' — the HC tier is core-sleeve only.  Catalyst
+         sleeve uses R-based sizing; the HC cap makes no sense with a hard stop.
+      3. Stated confidence >= high_conviction_min_confidence (default 0.85).
+      4. A concurrent HC slot is free: at most high_conviction_max_positions
          (default 2) open positions may carry the high_conviction plan flag.
 
     A denial NEVER blocks the trade — the buy proceeds at normal sizing and the
     denial reason is surfaced so the PM learns why. Cash only; this tier raises
     the per-position cap, it does not borrow.
     """
+    # T2: HC tier is core-sleeve only. Catalyst positions size by R-math.
+    if sleeve == "catalyst":
+        return False, "high-conviction tier is core-sleeve only (catalyst uses R-based sizing)"
     if not bool(cfg.get("portfolio_advisor_alpaca_high_conviction_enabled", True)):
         return False, "high-conviction tier disabled in config"
     min_conf = float(cfg.get("portfolio_advisor_alpaca_high_conviction_min_confidence", 0.85) or 0.85)
@@ -1409,6 +1441,91 @@ def execute_deferred_entries(cfg: Dict[str, Any]) -> int:
         return 0
 
 
+def execute_unvetoed_candidates(cfg: Dict[str, Any]) -> int:
+    """Execute scanner-sourced catalyst proposals whose PM veto window has expired.
+
+    Scanner-sourced catalyst proposals (source in {"ep_scanner", "pead_scanner"})
+    are filed with a ``pm_veto_window_until`` timestamp.  They sit as
+    status="proposed" during the veto window so the PM can call
+    ``veto_candidate(ticker, reason)`` to block execution.  This function:
+
+    1. Finds all proposed rows with a ``pm_veto_window_until`` in the past.
+    2. Re-checks all existing guards (cooldown, spread, market clock).
+    3. Executes them via execute_proposal on the Alpaca paper book.
+    4. Marks the row executed/cancelled in the proposals ledger.
+
+    Called from enforce_paper_exits top (alongside execute_deferred_entries)
+    so no additional scheduling is needed.
+
+    Never raises. Returns number of proposals attempted.
+    """
+    if not enabled(cfg):
+        return 0
+    # Only run when market is open; if clock is unknown (None) proceed anyway.
+    clock = market_clock()
+    if clock is not None and not clock.get("is_open"):
+        return 0
+    try:
+        from tradingagents.portfolio_advisor import proposals as _prop
+
+        rows = _prop.load_all(cfg)
+        now = datetime.now(timezone.utc)
+        attempted = 0
+        dirty = False
+
+        for r in rows:
+            if r.get("status") != "proposed":
+                continue
+            veto_until_str = r.get("pm_veto_window_until")
+            if not veto_until_str:
+                continue  # not a scanner-sourced veto-gated proposal
+            try:
+                veto_until = datetime.fromisoformat(
+                    str(veto_until_str).replace("Z", "+00:00")
+                )
+            except (ValueError, TypeError):
+                continue  # malformed — skip
+
+            if now < veto_until:
+                continue  # still within veto window — do not execute yet
+
+            tk = (r.get("ticker") or "").upper()
+            # Re-run execute_proposal with the original proposal payload.
+            # All guards (cooldown, spread, market clock, etc.) re-check live.
+            proposal = dict(r)
+            result = execute_proposal(cfg, proposal)
+            ex_status = result.get("status", "error") if isinstance(result, dict) else "error"
+            ex_detail = result.get("detail", "") if isinstance(result, dict) else ""
+
+            now_iso = now.isoformat()
+            if ex_status == "executed":
+                r["status"] = "executed"
+                r["status_set_at"] = now_iso
+                r["status_note"] = f"veto window expired, executed: {ex_detail}"[:300]
+            elif ex_status == "deferred":
+                r["status"] = "deferred_market_closed"
+                r["status_set_at"] = now_iso
+                r["status_note"] = ex_detail[:300]
+            elif ex_status in ("skipped", "error"):
+                r["status"] = "cancelled"
+                r["status_set_at"] = now_iso
+                r["status_note"] = f"veto window expired, {ex_status}: {ex_detail}"[:300]
+            # disabled → leave as proposed
+            dirty = True
+            attempted += 1
+            logger.info(
+                "execute_unvetoed_candidates: %s → %s (%s)",
+                tk, r["status"], ex_detail[:80],
+            )
+
+        if dirty:
+            _prop.save_all(cfg, rows)
+        return attempted
+    except Exception:
+        logger.debug("execute_unvetoed_candidates failed", exc_info=True)
+        return 0
+
+
 def enforce_paper_exits(cfg: Dict[str, Any]) -> int:
     """Deterministic exits for paper positions every watchdog tick.
 
@@ -1444,6 +1561,8 @@ def enforce_paper_exits(cfg: Dict[str, Any]) -> int:
     reconcile_fills(cfg)
     # Re-attempt any catalyst entries that were deferred at market-close time.
     execute_deferred_entries(cfg)
+    # T2 — Execute scanner-sourced catalyst proposals whose PM veto window expired.
+    execute_unvetoed_candidates(cfg)
     try:
         client = _client()
         positions = client.get_all_positions()

@@ -411,6 +411,155 @@ def rule_performance_summary(
     }
 
 
+def veto_scorecard(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Compare PM-vetoed candidate outcomes vs executed candidate outcomes.
+
+    Sources:
+    - shadow_outcomes.jsonl: rows with source containing "pm_vetoed" or
+      status field "pm_vetoed" → the vetoed cohort.
+    - alpaca_trades.jsonl: submitted buy rows for catalyst sleeve → executed cohort.
+      30d forward return is approximated from outcome_tracker outcomes.jsonl where
+      available, or from yfinance for recent trades.
+
+    Returns a dict::
+
+        {
+          "vetoed":   {"count": int, "avg_30d_return": float|None, "avg_alpha_vs_spy": float|None},
+          "executed": {"count": int, "avg_30d_return": float|None, "avg_alpha_vs_spy": float|None},
+          "pm_veto_lift": float|None,  # executed_avg - vetoed_avg (positive = PM adds value by blocking)
+          "note": str,
+        }
+
+    Callable from the ``measure-outcomes`` CLI.
+    """
+    from tradingagents.portfolio_advisor import state as pa_state
+
+    advisor_dir = pa_state.advisor_dir(cfg)
+    shadow_outcomes_path = advisor_dir / "shadow_outcomes.jsonl"
+    ledger_path = advisor_dir / "alpaca_trades.jsonl"
+
+    # --- Vetoed cohort: shadow_outcomes.jsonl rows with pm_vetoed source/status ---
+    vetoed_returns: List[float] = []
+    vetoed_alphas: List[float] = []
+    if shadow_outcomes_path.is_file():
+        for line in shadow_outcomes_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            src = str(row.get("source") or "")
+            if "pm_vetoed" not in src:
+                continue
+            raw_ret = row.get("raw_return")
+            alpha = row.get("alpha_vs_spy")
+            if raw_ret is not None:
+                try:
+                    vetoed_returns.append(float(raw_ret))
+                except (TypeError, ValueError):
+                    pass
+            if alpha is not None:
+                try:
+                    vetoed_alphas.append(float(alpha))
+                except (TypeError, ValueError):
+                    pass
+
+    # --- Executed cohort: outcomes.jsonl rows for catalyst-sleeve buys ---
+    outcomes_path = _outcomes_path(cfg)
+    executed_returns: List[float] = []
+    executed_alphas: List[float] = []
+
+    # Build a set of catalyst-sleeve tickers from the ledger for filtering.
+    catalyst_tickers: set = set()
+    if ledger_path.is_file():
+        for line in ledger_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if (
+                row.get("status") == "submitted"
+                and str(row.get("sleeve") or "").lower() == "catalyst"
+                and str(row.get("action") or "").lower() in ("buy", "add")
+            ):
+                tk = str(row.get("ticker") or "").upper()
+                if tk:
+                    catalyst_tickers.add(tk)
+
+    if outcomes_path.is_file() and catalyst_tickers:
+        for line in outcomes_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            tk = str(row.get("ticker") or "").upper()
+            if tk not in catalyst_tickers:
+                continue
+            raw_ret = row.get("realised_return")
+            # outcomes.jsonl uses alpha_vs_qqq; shadow_outcomes uses alpha_vs_spy.
+            alpha = row.get("alpha_vs_qqq") or row.get("alpha_vs_spy")
+            if raw_ret is not None:
+                try:
+                    executed_returns.append(float(raw_ret))
+                except (TypeError, ValueError):
+                    pass
+            if alpha is not None:
+                try:
+                    executed_alphas.append(float(alpha))
+                except (TypeError, ValueError):
+                    pass
+
+    def _avg(lst: List[float]) -> Optional[float]:
+        return round(sum(lst) / len(lst), 4) if lst else None
+
+    vetoed_avg = _avg(vetoed_returns)
+    executed_avg = _avg(executed_returns)
+    veto_lift: Optional[float] = None
+    if vetoed_avg is not None and executed_avg is not None:
+        veto_lift = round(executed_avg - vetoed_avg, 4)
+
+    note_parts = []
+    if not vetoed_returns:
+        note_parts.append("no scored vetoed candidates yet")
+    if not executed_returns:
+        note_parts.append("no scored executed catalyst trades yet")
+    if veto_lift is not None:
+        if veto_lift > 0:
+            note_parts.append(
+                f"PM vetoes ADD value: executed cohort outperformed vetoed by {veto_lift:+.2%}"
+            )
+        elif veto_lift < 0:
+            note_parts.append(
+                f"PM vetoes SUBTRACT value: vetoed cohort outperformed executed by {-veto_lift:+.2%} "
+                "(consider further demoting PM to advisory-only for catalyst)"
+            )
+        else:
+            note_parts.append("PM vetoes have zero net impact so far")
+
+    return {
+        "vetoed": {
+            "count": len(vetoed_returns),
+            "avg_30d_return": vetoed_avg,
+            "avg_alpha_vs_spy": _avg(vetoed_alphas),
+        },
+        "executed": {
+            "count": len(executed_returns),
+            "avg_30d_return": executed_avg,
+            "avg_alpha_vs_spy": _avg(executed_alphas),
+        },
+        "pm_veto_lift": veto_lift,
+        "note": "; ".join(note_parts) if note_parts else "scorecard computed",
+    }
+
+
 def format_rule_performance_for_pm_prompt(
     cfg: Dict[str, Any],
     *,

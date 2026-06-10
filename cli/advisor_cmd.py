@@ -537,7 +537,10 @@ def portfolio_advisor_measure_outcomes(
     _configure_logging(verbose)
     cfg = DEFAULT_CONFIG.copy()
     try:
-        from tradingagents.portfolio_advisor.outcome_tracker import compute_recommendation_outcomes
+        from tradingagents.portfolio_advisor.outcome_tracker import (
+            compute_recommendation_outcomes,
+            veto_scorecard,
+        )
         from tradingagents.portfolio_advisor.recommendation_log import human_override_analysis
         from tradingagents.portfolio_advisor.candidates import shadow_outcomes
 
@@ -567,6 +570,15 @@ def portfolio_advisor_measure_outcomes(
             o_avg = f"${analysis['overrode_avg_pnl']:.0f}" if analysis["overrode_avg_pnl"] is not None else "N/A"
             console.print(f"  Followed PM advice: n={analysis['followed_count']} avg P&L={f_avg}")
             console.print(f"  Overrode PM advice: n={analysis['overrode_count']} avg P&L={o_avg}")
+
+        # 4. T2 — PM veto scorecard
+        veto = veto_scorecard(cfg)
+        console.print(
+            f"[cyan]veto-scorecard:[/cyan] "
+            f"vetoed={veto['vetoed']['count']} avg={veto['vetoed']['avg_30d_return']}, "
+            f"executed={veto['executed']['count']} avg={veto['executed']['avg_30d_return']}, "
+            f"pm_veto_lift={veto['pm_veto_lift']} — {veto['note']}"
+        )
 
     except Exception as e:
         console.print(f"[red]{e}[/red]")

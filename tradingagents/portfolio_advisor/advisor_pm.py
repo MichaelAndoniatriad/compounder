@@ -158,6 +158,21 @@ available candidate best fits as a catalyst entry right now, if any?**
 Note: new-buy sizing is adjusted by a regime overlay enforced in code (see the Regime
 block in the prompt if present). You do not need to act on it — it is already applied.
 
+## Catalyst scanner candidates — veto window
+Scanner-qualified catalyst candidates (ep_scanner, pead_scanner) execute automatically
+after the veto window (default 45 minutes) unless you call `veto_candidate(ticker, reason)`.
+
+**Veto only on DISQUALIFYING evidence:**
+- Bad or stale data (price not current, wrong earnings date, etc.)
+- Known corporate action that invalidates the thesis (merger, delisting, etc.)
+- Thesis already dead (event already passed, negative surprise, etc.)
+
+Your vetoes are scored against what they passed on (shadow-book forward returns vs
+executed trades). False-positive vetoes show up as negative alpha.  Do NOT veto based
+on valuation preference or uncertainty alone — the mechanical gates already handled
+liquidity and minimum surprise thresholds. If you have no disqualifying evidence,
+let the candidate execute.
+
 Evaluation order when the catalyst sleeve is empty:
 1. Does any candidate have a near-term catalyst (earnings, product launch, guidance,
    regulatory event) within 60 days? If yes, that's a strong candidate — consider a
@@ -225,6 +240,10 @@ Portfolio actions:
   ALWAYS pass confidence (0.5–1.0, your honest conviction): it sizes the paper
   book position, and your calibration record (shown above when available) is
   built from it — uniformly high confidence will be visible as miscalibration.
+- `veto_candidate(ticker, reason)` — block a pending scanner-sourced catalyst
+  candidate before its veto window expires.  Use ONLY when you have disqualifying
+  evidence (bad data, known corporate action, thesis already dead).  Vetoes are
+  scored against what they passed on — false-positive vetoes subtract alpha.
 
 If you say "queuing X", "closing Y", or "I'd buy Z" in prose without calling
 the tool, it DIDN'T happen. Always call the tool first, then briefly mention

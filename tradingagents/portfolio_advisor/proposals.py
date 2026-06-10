@@ -4,7 +4,8 @@ Each proposal is one JSONL row at
 ``~/.tradingagents/portfolio_advisor/proposed_trades.jsonl``:
 
   {ts, ticker, action, shares, approx_usd, target_price, sleeve, reason,
-   catalyst_date, confidence, status, status_set_at, status_note}
+   catalyst_date, confidence, status, status_set_at, status_note,
+   source, pm_veto_window_until}
 
 Status lifecycle:
   ``proposed``  → new row, waiting for execution
@@ -13,6 +14,27 @@ Status lifecycle:
                   or auto-closed as stale (auto_close_stale)
   ``approved``  → human explicitly approved (advisory mode)
   ``rejected``  → human explicitly rejected
+  ``pm_vetoed`` → PM vetoed the candidate before the veto window expired
+  ``deferred_market_closed`` → catalyst entry queued for next open
+
+T2 — PM veto gate (scanner-sourced proposals only):
+  Scanner-qualified catalyst candidates (source in {"ep_scanner",
+  "pead_scanner"}) are filed with a ``pm_veto_window_until`` timestamp
+  (now + portfolio_advisor_pm_veto_minutes, default 45). Their status
+  stays ``proposed`` — they do NOT auto-execute immediately.
+
+  The PM, on its next cycle, may call ``veto_candidate(ticker, reason)``
+  which marks the proposal ``pm_vetoed`` and writes a shadow_book row so
+  the veto's forward return can be scored against executed candidates.
+
+  ``execute_unvetoed_candidates(cfg)`` (called from enforce_paper_exits
+  top, alongside execute_deferred_entries) finds proposals whose veto
+  window has expired un-vetoed and runs them through execute_proposal
+  with all existing guards re-checked (cooldown, spread, market clock).
+
+  PM-originated proposals (propose_trade tool) keep the current
+  immediate-execute path — the veto flow applies only to scanner-sourced
+  rows (source in {"ep_scanner", "pead_scanner"}).
 
 The dedup gate only considers ``proposed`` rows — executed/cancelled rows
 release the gate so new tranches and re-entries work correctly.
@@ -31,7 +53,7 @@ from tradingagents.portfolio_advisor import state as pa_state
 
 logger = logging.getLogger(__name__)
 
-_STATUSES = ("proposed", "approved", "rejected", "executed", "cancelled", "deferred_market_closed")
+_STATUSES = ("proposed", "approved", "rejected", "executed", "cancelled", "deferred_market_closed", "pm_vetoed")
 
 # A fired rule (e.g. DOUBLE_FROM_ENTRY) often gets re-proposed as either "sell"
 # or "trim" cycle after cycle. Both express the same intent — reduce the
@@ -155,6 +177,19 @@ def add(
             r["status"] = "cancelled"
             r["status_set_at"] = now
             r["status_note"] = "superseded by a newer proposal"
+    # T2: scanner-sourced catalyst proposals get a PM veto window.
+    # They do NOT auto-execute; execute_unvetoed_candidates() fires them
+    # after the window without a veto.  PM-originated proposals (source not
+    # in the scanner set) keep the immediate-execute path.
+    _SCANNER_SOURCES = frozenset({"ep_scanner", "pead_scanner"})
+    src_clean = (source or "").strip()
+    _is_scanner_sourced = src_clean in _SCANNER_SOURCES and act in ("buy", "add") and (sleeve or "").strip().lower() == "catalyst"
+
+    pm_veto_window_until: Optional[str] = None
+    if _is_scanner_sourced:
+        veto_minutes = int(cfg.get("portfolio_advisor_pm_veto_minutes", 45) or 45)
+        pm_veto_window_until = (datetime.now(timezone.utc) + timedelta(minutes=veto_minutes)).isoformat()
+
     entry: Dict[str, Any] = {
         "ts": now,
         "ticker": tk,
@@ -173,7 +208,10 @@ def add(
         "status": "proposed",
         # Scanner source (e.g. "pead_scanner") — carried through to PositionPlan
         # so source-specific exit-rule overrides (e.g. PEAD hold window) apply.
-        "source": (source or "").strip(),
+        "source": src_clean,
+        # T2: non-null for scanner-sourced catalyst proposals (ISO datetime).
+        # execute_unvetoed_candidates() checks this field.
+        "pm_veto_window_until": pm_veto_window_until,
     }
     rows.append(entry)
     save_all(cfg, rows)
@@ -257,6 +295,18 @@ def add(
     # a superseding restatement of an open proposal must not double the position.
     # After execution, mark the row with the machine-readable result so the dedup
     # gate sees executed/cancelled rows as "resolved" and releases for re-entry.
+    #
+    # T2: scanner-sourced catalyst proposals have a PM veto window — skip
+    # immediate execution.  execute_unvetoed_candidates() (called from
+    # enforce_paper_exits) fires them after the window expires without a veto.
+    if prior is None and _is_scanner_sourced:
+        logger.info(
+            "proposals.add: scanner-sourced catalyst proposal for %s "
+            "filed with veto window until %s — NOT auto-executing immediately.",
+            tk, pm_veto_window_until,
+        )
+        return entry
+
     if prior is None:
         try:
             from tradingagents.integrations.alpaca import executor as _alpaca

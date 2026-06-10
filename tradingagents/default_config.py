@@ -205,6 +205,15 @@ DEFAULT_CONFIG = _apply_env_overrides({
     "portfolio_advisor_catalyst_time_stop_days": 3,          # days after catalyst date to exit if move didn't happen
     "portfolio_advisor_catalyst_max_hold_days": 30,          # hard hold cap when no catalyst date is set
     "portfolio_advisor_catalyst_pre_event_days_before": 1,   # go flat this many days before catalyst event (Option B: avoid binary print)
+    # --- T2: R-based catalyst sizing ---
+    # Replaces confidence-based sizing for catalyst sleeve. Position notional =
+    # equity × risk_pct / hard_stop_pct, so a stop-out costs exactly risk_pct of book.
+    "portfolio_advisor_catalyst_risk_pct": 0.01,             # fraction of equity to risk per catalyst trade (1%)
+    # --- T2: PM veto gate for scanner-sourced catalyst candidates ---
+    # Scanner-qualified candidates (source in {ep_scanner, pead_scanner}) are filed as
+    # proposals with status="proposed" and a veto deadline. The PM can veto within the
+    # window; unvetoed proposals execute automatically after it expires.
+    "portfolio_advisor_pm_veto_minutes": 45,                  # PM has this many minutes to veto a scanner proposal
     # --- High-conviction sizing tier (studied concentration, NOT margin) ---
     # The PM may flag a buy as high_conviction. If confidence clears the floor and a
     # slot is free, the position cap rises from max_position_pct to the pct below.
