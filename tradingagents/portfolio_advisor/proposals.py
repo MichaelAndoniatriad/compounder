@@ -1,16 +1,21 @@
-"""Proposed-trade ledger: read/list/approve/reject the dry-run trade
-proposals the PM emits via the ``propose_trade`` tool.
+"""Proposed-trade ledger: record, auto-execute, and track PM proposals.
 
 Each proposal is one JSONL row at
 ``~/.tradingagents/portfolio_advisor/proposed_trades.jsonl``:
 
-  {ts, ticker, action, shares, approx_usd, target_price, sleeve, reason, status}
+  {ts, ticker, action, shares, approx_usd, target_price, sleeve, reason,
+   catalyst_date, confidence, status, status_set_at, status_note}
 
-Status lifecycle: ``proposed`` → ``approved`` (human marked OK to execute)
-or ``rejected`` (human said no) or ``executed`` (set later by a real
-executor; nothing writes this status yet — placeholder for the future
-browser-automation layer). All transitions are append-only via rewriting
-the file under a short lock; we never lose history beyond explicit clears.
+Status lifecycle:
+  ``proposed``  → new row, waiting for execution
+  ``executed``  → mirrored onto Alpaca paper book (autonomous mode)
+  ``cancelled`` → superseded by newer proposal, skipped by executor,
+                  or auto-closed as stale (auto_close_stale)
+  ``approved``  → human explicitly approved (advisory mode)
+  ``rejected``  → human explicitly rejected
+
+The dedup gate only considers ``proposed`` rows — executed/cancelled rows
+release the gate so new tranches and re-entries work correctly.
 """
 
 from __future__ import annotations
@@ -170,11 +175,35 @@ def add(
         _send_action_ticket(cfg, entry)
     # Mirror onto the Alpaca PAPER book — only a genuinely NEW proposal trades;
     # a superseding restatement of an open proposal must not double the position.
+    # After execution, mark the row with the machine-readable result so the dedup
+    # gate sees executed/cancelled rows as "resolved" and releases for re-entry.
     if prior is None:
         try:
             from tradingagents.integrations.alpaca import executor as _alpaca
 
-            _alpaca.execute_proposal(cfg, entry)
+            result = _alpaca.execute_proposal(cfg, entry)
+            # result is {"status": "executed"|"skipped"|"error"|"disabled", "detail": str}
+            ex_status = result.get("status", "disabled") if isinstance(result, dict) else "disabled"
+            ex_detail = result.get("detail", "") if isinstance(result, dict) else str(result or "")
+            now = datetime.now(timezone.utc).isoformat()
+            # Reload rows from disk in case they were modified by the executor
+            # (e.g. position plan save), then apply status update.
+            rows_fresh = load_all(cfg)
+            for r in rows_fresh:
+                if r.get("ts") == entry["ts"] and r.get("ticker") == entry["ticker"]:
+                    if ex_status == "executed":
+                        r["status"] = "executed"
+                        r["status_set_at"] = now
+                        r["status_note"] = ex_detail[:300]
+                    elif ex_status in ("skipped", "error"):
+                        # A skipped/errored intent must not block future proposals
+                        # for the same ticker+side (e.g. re-entry after exit).
+                        r["status"] = "cancelled"
+                        r["status_set_at"] = now
+                        r["status_note"] = ex_detail[:300]
+                    # "disabled" leaves status as "proposed" (human-advisory mode)
+                    break
+            save_all(cfg, rows_fresh)
         except Exception:
             pass
     return entry

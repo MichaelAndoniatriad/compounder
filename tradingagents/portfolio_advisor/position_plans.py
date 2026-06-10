@@ -95,6 +95,8 @@ class PositionPlan:
     #   {ts, action (buy/sell/trim/add/hold/watch/…), rationale, source, price?}
     decision_history: List[Dict[str, Any]] = field(default_factory=list)
     last_updated: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    # ISO timestamp set when the +100% core trim-half fires so it only fires once.
+    double_trim_done_at: str = ""
 
     def __post_init__(self) -> None:
         self.strategy = (self.strategy or _DEFAULT_STRATEGY).strip().lower()
@@ -168,6 +170,7 @@ def load_position_plans(cfg: Dict[str, Any]) -> Dict[str, PositionPlan]:
                 peak_price=float(peak) if peak not in (None, "") else None,
                 decision_history=[d for d in (data.get("decision_history") or []) if isinstance(d, dict)],
                 last_updated=str(data.get("last_updated") or ""),
+                double_trim_done_at=str(data.get("double_trim_done_at") or ""),
             )
         except (TypeError, ValueError):
             continue
@@ -644,6 +647,101 @@ def _fetch_earnings_dates_for_trim(
     return out
 
 
+def update_catalyst_peak(
+    cfg: Dict[str, Any],
+    ticker: str,
+    current_price: float,
+) -> Optional[float]:
+    """Ratchet the persisted peak price for a catalyst position.
+
+    Loads the plan, updates peak_price if current_price > existing peak,
+    saves, and returns the new (or unchanged) peak. Returns None if there is
+    no plan for *ticker* or the plan is not a catalyst sleeve.
+
+    This helper is shared by build_trigger_block (PM prompt path) and
+    enforce_paper_exits (watchdog tick path) so peak ratcheting happens on
+    every Alpaca tick, not just once-per-PM-cycle.
+    """
+    plans = load_position_plans(cfg)
+    plan = plans.get(ticker.upper())
+    if plan is None or plan.strategy != "catalyst":
+        return None
+    old_peak = plan.peak_price
+    new_peak = current_price if (old_peak is None or current_price > old_peak) else old_peak
+    if new_peak != old_peak:
+        plan.peak_price = new_peak
+        plan.last_updated = datetime.now(timezone.utc).isoformat()
+        plans[plan.ticker.upper()] = plan
+        try:
+            save_position_plans(cfg, plans)
+        except Exception as e:
+            logger.debug("failed to persist catalyst peak for %s: %s", ticker, e)
+    return new_peak
+
+
+def eval_catalyst_exit(
+    plan: PositionPlan,
+    current_price: float,
+    rules: CatalystRules,
+) -> Optional[str]:
+    """Evaluate whether a catalyst position should be closed right now.
+
+    Returns the rule name string (e.g. ``"paper_catalyst_trailing_stop"``)
+    if an exit rule fires, or ``None`` if no exit is warranted.
+
+    Rules (in priority order):
+    1. Trailing stop: peak >= entry*trailing_activate_pct AND price <= peak*(1-trailing_stop_pct)
+    2. Time stop: catalyst_date set AND today >= catalyst_date + time_stop_days
+                  AND the position has NOT run (price < entry*1.05)
+    (Hard stop is already handled by enforce_paper_exits via plpc threshold.)
+    """
+    px = current_price
+    entry = plan.entry_price
+    if entry <= 0:
+        return None
+
+    trailing_activate = entry * (1 + rules.trailing_activate_pct)
+    peak = plan.peak_price  # already ratcheted by update_catalyst_peak
+
+    # Trailing stop: arms when peak >= entry*(1+trailing_activate_pct)
+    if peak is not None and peak >= trailing_activate:
+        trailing_stop_level = peak * (1 - rules.trailing_stop_pct)
+        if px <= trailing_stop_level:
+            return "paper_catalyst_trailing_stop"
+
+    # Time stop: catalyst_date + time_stop_days, position hasn't run
+    if plan.catalyst_date:
+        days_after = _days_since(plan.catalyst_date)
+        if days_after is not None and days_after >= rules.time_stop_days:
+            moved_up = px >= entry * 1.05
+            if not moved_up:
+                return f"paper_catalyst_time_stop_{rules.time_stop_days}d_post_catalyst"
+
+    return None
+
+
+def persist_catalyst_peaks_from_statuses(
+    cfg: Dict[str, Any],
+    plans: Dict[str, "PositionPlan"],
+    statuses: Dict[str, "TriggerStatus"],
+) -> None:
+    """Persist updated catalyst peak prices from compute_trigger_status results.
+
+    Extracted from build_trigger_block so it can be called independently.
+    """
+    peaks_changed = False
+    for ticker, s in statuses.items():
+        if s.strategy == "catalyst" and s.peak_price is not None:
+            if plans[ticker].peak_price != s.peak_price:
+                plans[ticker].peak_price = s.peak_price
+                peaks_changed = True
+    if peaks_changed:
+        try:
+            save_position_plans(cfg, plans)
+        except Exception as e:
+            logger.debug("failed to persist catalyst peaks: %s", e)
+
+
 def build_trigger_block(
     cfg: Dict[str, Any],
     live_tickers: Any,
@@ -675,17 +773,7 @@ def build_trigger_block(
     )
 
     # Persist updated catalyst peak prices so trailing stops ratchet across cycles.
-    peaks_changed = False
-    for ticker, s in statuses.items():
-        if s.strategy == "catalyst" and s.peak_price is not None:
-            if plans[ticker].peak_price != s.peak_price:
-                plans[ticker].peak_price = s.peak_price
-                peaks_changed = True
-    if peaks_changed:
-        try:
-            save_position_plans(cfg, plans)
-        except Exception as e:
-            logger.debug("failed to persist catalyst peaks: %s", e)
+    persist_catalyst_peaks_from_statuses(cfg, plans, statuses)
 
     triggered_tickers = [tk for tk, s in statuses.items() if s.triggered]
     watch_tickers = [tk for tk, s in statuses.items() if not s.triggered and s.watch]

@@ -478,7 +478,11 @@ def format_scan_for_pm(scan: Dict[str, Any]) -> str:
         "own knowledge of what the catalyst means. For each that you classify as Tier 1 or Tier 2 "
         "AND that meets Section 5 (gap >= 10%% held through close, trend context, no upcoming earnings <10 "
         "sessions out — check via your tools), CALL `emit_ep_candidate(ticker, tier, catalyst, "
-        "entry_price, stop_price)`. Entry recommendation is for the next session open, not intraday. "
+        "entry_price, stop_price, catalyst_date=<ISO YYYY-MM-DD of the catalyst event>)`. "
+        "catalyst_date is REQUIRED for autonomous execution — it must be the concrete event date "
+        "(e.g. earnings date, FDA decision date, contract announcement date). "
+        "Without catalyst_date the trade will be advisory-only even in autonomous mode. "
+        "Entry recommendation is for the next session open, not intraday. "
         "Disqualified or weak setups: explain WHY in your summary. Do not "
         "emit a candidate that fails any Section 5 condition or any Section 10 disqualifier."
     )

@@ -135,6 +135,8 @@ def _split_watchdog_triggers(
             "gain_pct": gain,
             "drawdown_pct": dd,
             "units": units,
+            # Include earnings_date so the consumed-marker check can key on it.
+            "earnings_date": str(ed) if ed is not None else "",
         }
         if dd >= 40.0:
             mandatory.append({**base, "codes": ["dd40_mandatory_exit"]})
@@ -478,13 +480,42 @@ def run_watchdog(cfg: Dict[str, Any], *, ignore_market_hours: bool = False, supp
     # Mirror deterministic exits onto the Alpaca PAPER book immediately — rule
     # exits are the risk limit and must not wait for the next PM cycle. The
     # executor is idempotent (skips names the paper book no longer holds).
+    #
+    # Pre-earnings trims are one-shot: after a trim fires for (ticker, earnings_date)
+    # it is marked consumed in state so subsequent ticks don't re-trim.
     try:
         from tradingagents.integrations.alpaca import executor as _alpaca
 
         for t in mandatory:
             _alpaca.close_for_watchdog(cfg, t.get("ticker", ""), 1.0, "dd40_mandatory_exit")
+
+        # Consumed-marker set for pre-earnings trims, keyed by "TICKER:earnings_date".
+        consumed_trims: set = set()
+        try:
+            consumed_trims = set(st.get("pre_earnings_trim_consumed") or [])
+        except (TypeError, AttributeError):
+            consumed_trims = set()
+
         for t in trim:
-            _alpaca.close_for_watchdog(cfg, t.get("ticker", ""), 0.5, ",".join(t.get("codes") or []) or "trim")
+            ticker_str = str(t.get("ticker") or "").strip().upper()
+            codes = list(t.get("codes") or [])
+            rule = ",".join(codes) or "trim"
+            if "pre_earnings_trim_window" in codes:
+                earnings_date_str = str(t.get("earnings_date") or "").strip()
+                consumed_key = f"{ticker_str}:{earnings_date_str}"
+                if consumed_key in consumed_trims:
+                    logger.debug(
+                        "watchdog: pre_earnings_trim_window for %s / %s already consumed — skipping",
+                        ticker_str, earnings_date_str,
+                    )
+                    continue  # one-shot: do not re-fire
+                result = _alpaca.close_for_watchdog(cfg, ticker_str, 0.5, rule)
+                if result is not None:
+                    # Mark consumed so this (ticker, earnings_date) pair never fires again.
+                    consumed_trims.add(consumed_key)
+                    st["pre_earnings_trim_consumed"] = sorted(consumed_trims)
+            else:
+                _alpaca.close_for_watchdog(cfg, ticker_str, 0.5, rule)
     except Exception:
         logger.debug("alpaca watchdog mirror skipped", exc_info=True)
 

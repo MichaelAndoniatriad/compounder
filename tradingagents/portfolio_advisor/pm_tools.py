@@ -617,17 +617,22 @@ def build_pm_tools(cfg: Dict[str, Any], live_tickers: set) -> List[Any]:
         sector: str = "",
         gap_pct: float = 0.0,
         notes: str = "",
+        catalyst_date: str = "",
+        confidence: float = 0.0,
     ) -> str:
-        """Push a structured Episodic Pivot recommendation to the human via Telegram.
+        """Push a structured Episodic Pivot recommendation via Telegram and, in
+        autonomous mode with a dated catalyst, file a proposals row for auto-execution.
 
         Call this when you have identified a qualifying EP setup per
         rules/strategies/episodic_pivot.md Section 5. It computes risk-based
         sizing (Section 6.1, default 1%% portfolio risk) and emits a Telegram
         message with the suggested entry, stop, and exact share/USD size.
 
-        This is ADVISORY ONLY. The human decides whether to execute on eToro.
-        Entry is recommended at the next session open, per the AI Advisory
-        Edition (v2) workflow Section 9.3.
+        In eToro mode this is ADVISORY ONLY — the human decides whether to
+        execute. In autonomous (alpaca) mode a dated catalyst_date triggers an
+        autonomous buy proposal (sleeve=catalyst) via proposals.add(); an undated
+        candidate stays advisory-only even in autonomous mode. The Telegram
+        notification is sent in both modes.
 
         - tier: "Tier 1" or "Tier 2" (per Section 4).
         - entry_price: recommended entry at next session open (today's close).
@@ -636,6 +641,10 @@ def build_pm_tools(cfg: Dict[str, Any], live_tickers: set) -> List[Any]:
         - sector: free-text sector, for the Section 6.2 1-per-sector check.
         - gap_pct: catalyst-day gap percentage, for journal.
         - notes: catalyst description, drift thesis, invalidation triggers.
+        - catalyst_date: ISO YYYY-MM-DD of the catalyst event (e.g. earnings date,
+          FDA decision date). Required in autonomous mode to trigger a proposal;
+          without it the candidate stays advisory-only regardless of mode.
+        - confidence: your conviction 0.5–1.0 (drives sizing in autonomous mode).
         """
         from tradingagents.portfolio_advisor import etoro_scan, messaging
         tk = (ticker or "").strip().upper()
@@ -661,16 +670,53 @@ def build_pm_tools(cfg: Dict[str, Any], live_tickers: set) -> List[Any]:
         risk_per_share = max(float(entry_price) - float(stop_price), 0.0001)
         shares = round(usd_risk / risk_per_share, 4)
         usd_position = round(shares * float(entry_price), 2)
+
+        # Autonomous mode: file a buy proposal when a dated catalyst is present.
+        # Hard guard: no catalyst_date → advisory-only regardless of mode.
+        _dated_catalyst = (catalyst_date or "").strip()
+        _mode = etoro_scan.account_mode()
+        _proposal_filed = False
+        if _mode == "alpaca" and _dated_catalyst:
+            try:
+                from tradingagents.portfolio_advisor import proposals as _proposals
+                _proposals.add(
+                    cfg,
+                    ticker=tk,
+                    action="buy",
+                    shares=shares,
+                    approx_usd=usd_position,
+                    target_price=float(entry_price),
+                    sleeve="catalyst",
+                    reason=(
+                        f"EP {tier}: {catalyst} | gap={gap_pct:+.1f}% | "
+                        f"sector={sector or 'unknown'} | stop=${float(stop_price):.2f}"
+                        + (f" | {notes[:200]}" if notes else "")
+                    )[:500],
+                    catalyst_date=_dated_catalyst,
+                    confidence=float(confidence) if confidence else 0.0,
+                )
+                _proposal_filed = True
+            except Exception:
+                import logging as _logging
+                _logging.getLogger(__name__).exception(
+                    "emit_ep_candidate: failed to file proposal for %s", tk
+                )
+
         body = (
-            f"EP RECOMMENDATION: {tk} [{tier}]\n"
+            f"EP {'PROPOSAL' if _proposal_filed else 'RECOMMENDATION'}: {tk} [{tier}]\n"
             f"Catalyst: {catalyst}\n"
-            f"Gap: {gap_pct:+.1f}%  |  Sector: {sector or 'unknown'}\n"
+            + (f"Catalyst date: {_dated_catalyst}\n" if _dated_catalyst else "")
+            + f"Gap: {gap_pct:+.1f}%  |  Sector: {sector or 'unknown'}\n"
             f"Entry (next session open): ${float(entry_price):.2f}\n"
             f"Stop: ${float(stop_price):.2f}  (-{((float(entry_price)-float(stop_price))/float(entry_price)*100):.1f}%)\n"
             f"Risk: ${usd_risk:.0f}  ({float(risk_pct):.1f}% of ~${eq:.0f} equity)\n"
             f"Size: {shares:.2f} shares  /  ~${usd_position:.0f} position\n"
-            f"Action: enter at next session open if gap held through close (Section 5.2).\n"
-            f"Reply: 'entered {tk} <shares>sh @ <price>' to log; 'skipped' to discard.\n"
+            + (
+                f"Action: AUTONOMOUS BUY QUEUED — proposal filed for auto-execution.\n"
+                if _proposal_filed else
+                f"Action: enter at next session open if gap held through close (Section 5.2).\n"
+                f"Reply: 'entered {tk} <shares>sh @ <price>' to log; 'skipped' to discard.\n"
+            )
             + (f"Notes: {notes}\n" if notes else "")
         )
         messaging.send_advisor_message(
@@ -682,7 +728,8 @@ def build_pm_tools(cfg: Dict[str, Any], live_tickers: set) -> List[Any]:
             rec_ticker=tk,
             rec_rationale=f"{catalyst} | gap={gap_pct:+.1f}% | sector={sector or 'unknown'}",
         )
-        return f"emitted EP recommendation for {tk}: entry=${entry_price} stop=${stop_price} risk=${usd_risk} shares={shares}"
+        status = "proposal filed" if _proposal_filed else "advisory recommendation emitted"
+        return f"emitted EP {status} for {tk}: entry=${entry_price} stop=${stop_price} risk=${usd_risk} shares={shares}"
 
     @tool
     def log_ep_trade(

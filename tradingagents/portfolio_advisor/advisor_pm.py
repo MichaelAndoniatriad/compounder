@@ -317,7 +317,11 @@ def _compact_portfolio_snapshot(portfolio_text: str, rows: List[Dict[str, Any]])
     """Build compact portfolio summary from raw eToro rows. Target: under 1200 chars."""
     first_line = (portfolio_text or "").split("\n")[0].strip()
     if not rows:
-        return first_line or "(portfolio empty)"
+        # F3: empty-book path — return the full text (truncated to 1200 chars) so
+        # the PM sees the cash balance and the all-cash re-entry note rather than
+        # just the one-line Headlines string.
+        full = (portfolio_text or "").strip()
+        return full[:1200] if full else "(portfolio empty)"
     ubv_vals = [float(r["unitsBaseValueDollars"]) for r in rows if r.get("unitsBaseValueDollars") is not None]
     total_ubv = sum(ubv_vals) if ubv_vals else None
     items = []
@@ -1311,6 +1315,20 @@ def _apply_candidate_comparisons(
         reason = (getattr(c, "rationale", "") or "PM portfolio-fit decision").strip()[:500]
         repl = str(getattr(c, "replace_ticker", "") or "").strip().upper()
 
+        # F4C: the candidate_comparison model carries no catalyst_date field — the
+        # LLM cannot supply a dated event through this path.  A catalyst buy without
+        # a dated event bypasses the guard in pm_tools.propose_trade and would slap
+        # an −8% hard stop on what might be a secular compounder.  Force core so the
+        # exit rules match the actual thesis.
+        if sleeve == "catalyst":
+            sleeve = "core"
+            reason = (reason + " (forced core: no dated catalyst)")[:500]
+            logger.debug(
+                "_apply_candidate_comparisons: %s sleeve forced from catalyst to core "
+                "(no catalyst_date available on CandidateComparison)",
+                cand,
+            )
+
         effective = decision
         if decision == "replace" and repl and repl in live_tickers:
             try:
@@ -1873,7 +1891,30 @@ def run_pm_cycle(
 
     _payload, portfolio_text, tickers, portfolio_rows = etoro_scan.fetch_portfolio_rows()
     if not tickers:
-        raise RuntimeError("No tickers in eToro portfolio export.")
+        # F3: in alpaca autonomous mode an empty book means all-cash — the PM
+        # must still run so it can re-enter from candidates/watchlist.  In eToro
+        # mode an empty book means the API fetch failed; raise as before.
+        try:
+            from tradingagents.portfolio_advisor.etoro_scan import account_mode as _am_check
+            _is_alpaca = _am_check() == "alpaca"
+        except Exception:
+            _is_alpaca = False
+        if not _is_alpaca:
+            raise RuntimeError("No tickers in eToro portfolio export.")
+        # Alpaca all-cash path: synthesise a snapshot that names the available
+        # cash so the PM knows how much it has to deploy this cycle.
+        _cash_amount = None
+        try:
+            _cash_amount = _parse_available_balance(portfolio_text)
+        except Exception:
+            pass
+        _cash_str = f"${_cash_amount:,.2f}" if _cash_amount is not None else "(unknown)"
+        portfolio_text = (
+            portfolio_text
+            + "\n(no open positions — book is 100% cash: "
+            + _cash_str
+            + "; your job this cycle is re-entry from candidates/watchlist)"
+        )
 
     live_tickers = etoro_scan.current_ticker_set(tickers)
 

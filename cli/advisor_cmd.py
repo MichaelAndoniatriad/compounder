@@ -15,6 +15,7 @@ from tradingagents.portfolio_advisor import messaging as portfolio_messaging
 from tradingagents.portfolio_advisor import service as portfolio_advisor_service
 
 console = Console()
+logger = logging.getLogger(__name__)
 advisor_app = typer.Typer(
     help=(
         "Optional position rule alerts (e.g. drawdown / earnings trims). "
@@ -706,6 +707,17 @@ def portfolio_advisor_action_check(
     cfg = DEFAULT_CONFIG.copy()
     try:
         from tradingagents.portfolio_advisor.advisor_pm import run_action_check
+
+        # Defense-in-depth: close proposals that have been open too long with no
+        # action before running the PM cycle so stale rows don't pile up.
+        try:
+            from tradingagents.portfolio_advisor import proposals as _proposals
+
+            stale_count = _proposals.auto_close_stale(cfg)
+            if stale_count:
+                logger.debug("action_check: auto_close_stale closed %d proposals", stale_count)
+        except Exception:
+            logger.debug("action_check: auto_close_stale failed", exc_info=True)
 
         out = run_action_check(cfg)
         pushed = bool((out.push_note or "").strip())

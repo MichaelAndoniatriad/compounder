@@ -1,18 +1,15 @@
 # tradingagents/integrations/alpaca/executor.py
 """Paper-trade executor: mirrors PM proposals onto the Alpaca PAPER account.
 
-This is the Compounder 2.0 measurement layer (docs/compounder_2_0_vision.md §6).
-Every proposal the PM emits is executed for real on Alpaca's paper environment,
-so the advisor's track record is verifiable by a third-party system instead of
-internal bookkeeping. The real eToro account is untouched — the human still
-executes there manually.
+In autonomous mode (TRADINGAGENTS_ACCOUNT_MODE=alpaca) the PM manages an Alpaca
+PAPER account end-to-end. Every proposal the PM emits is executed here, building
+a verifiable track record without touching any live account.
 
 Safety invariants:
 - PAPER ONLY. The client refuses any key that is not an Alpaca paper key
   (paper key IDs start with "PK"); ``paper=True`` is hard-coded.
-- Sizing is scaled from eToro-book dollars to paper-book dollars by
-  ``alpaca_equity / etoro_last_total_value`` and capped at
-  ``portfolio_advisor_alpaca_max_position_pct`` of paper equity.
+- ``PYTEST_CURRENT_TEST`` guard: ``enabled()`` returns False during tests —
+  tests must mock the client rather than hitting live APIs.
 - Every public entry point swallows its own errors (alerted via Telegram,
   logged to the ledger) — a broken paper trade must never break a PM cycle
   or the watchdog.
@@ -36,6 +33,10 @@ from tradingagents.portfolio_advisor import state as pa_state
 logger = logging.getLogger(__name__)
 
 _TRIM_DEFAULT_FRACTION = 0.5
+
+# Track tickers for which a "no plan, defaulting to core floors" warning has
+# already been sent this process lifetime — avoids one Telegram per tick.
+_warned_no_plan_tickers: set = set()
 
 
 def _now_iso() -> str:
@@ -178,28 +179,38 @@ def _ensure_baseline(cfg: Dict[str, Any], equity: float) -> Dict[str, Any]:
     return base
 
 
-def execute_proposal(cfg: Dict[str, Any], proposal: Dict[str, Any]) -> Optional[str]:
-    """Mirror one PM proposal onto the paper account. Returns a one-line result
-    (also Telegram'd and written to the ledger) or None when disabled/skipped.
-    Never raises."""
+def execute_proposal(cfg: Dict[str, Any], proposal: Dict[str, Any]) -> Dict[str, str]:
+    """Mirror one PM proposal onto the paper account.
+
+    Returns a machine-readable result dict::
+
+        {"status": "executed"|"skipped"|"error"|"disabled", "detail": <str>}
+
+    Also Telegram-alerts and writes to the ledger on executed/error. Never raises.
+    """
     if not enabled(cfg):
-        return None
+        return {"status": "disabled", "detail": "executor not enabled"}
     tk = (proposal.get("ticker") or "").strip().upper()
     act = (proposal.get("action") or "").strip().lower()
     if not tk or act not in ("buy", "add", "sell", "trim"):
-        return None
+        return {"status": "skipped", "detail": f"invalid ticker or action: {tk!r} / {act!r}"}
     try:
         client = _client()
         acct = client.get_account()
         equity = float(acct.equity)
         _ensure_baseline(cfg, equity)
         if act in ("buy", "add"):
-            return _paper_buy(cfg, client, equity, tk, proposal)
-        return _paper_reduce(cfg, client, tk, act, proposal, equity)
+            detail = _paper_buy(cfg, client, equity, tk, proposal)
+        else:
+            detail = _paper_reduce(cfg, client, tk, act, proposal, equity)
+        # _paper_buy/_paper_reduce prefix "skipped" for non-executing outcomes.
+        if detail.startswith("skipped"):
+            return {"status": "skipped", "detail": detail}
+        return {"status": "executed", "detail": detail}
     except Exception as e:
         _log_row(cfg, {"ticker": tk, "action": act, "status": "error", "error": str(e)[:300]})
         _notify(cfg, f"{act.upper()} {tk} failed", f"Paper execution error: {e}")
-        return f"paper execution error: {e}"
+        return {"status": "error", "detail": f"paper execution error: {e}"}
 
 
 def _paper_buy(
@@ -220,15 +231,26 @@ def _paper_buy(
         _log_row(cfg, {"ticker": tk, "action": "buy", "status": "skipped", "note": "no size on proposal"})
         return f"skipped {tk}: proposal has no dollar size"
 
+    act = (proposal.get("action") or "").lower()
+
     # A plain "buy" of a name the paper book already holds is the PM restating
     # itself — only an explicit "add" increases an existing position.
-    if (proposal.get("action") or "").lower() == "buy":
+    if act == "buy":
         try:
             client.get_open_position(tk)
             _log_row(cfg, {"ticker": tk, "action": "buy", "status": "skipped", "note": "already held"})
             return f"skipped {tk}: already held in paper book"
         except Exception:
             pass  # no position — proceed
+
+    # Restatement double-buy protection for "add": skip if a same-ticker
+    # buy/add executed within portfolio_advisor_add_cooldown_days (default 5).
+    if act == "add":
+        cooldown = int(cfg.get("portfolio_advisor_add_cooldown_days", 5) or 5)
+        skip_reason = _cooldown_skip_reason(cfg, tk, cooldown)
+        if skip_reason:
+            _log_row(cfg, {"ticker": tk, "action": "add", "status": "skipped", "note": skip_reason})
+            return f"skipped {tk}: {skip_reason}"
 
     scale = _scale_factor(cfg, equity)
     cap = float(cfg.get("portfolio_advisor_alpaca_max_position_pct", 0.10) or 0.10)
@@ -243,7 +265,8 @@ def _paper_buy(
     order = client.submit_order(
         MarketOrderRequest(symbol=tk, notional=notional, side=OrderSide.BUY, time_in_force=TimeInForce.DAY)
     )
-    sleeve = (proposal.get("sleeve") or "").lower() or "?"
+    sleeve = (proposal.get("sleeve") or "").lower() or "core"
+    catalyst_date = (proposal.get("catalyst_date") or "").strip() or None
     _log_row(
         cfg,
         {
@@ -257,16 +280,113 @@ def _paper_buy(
             "confidence": conf,
             "conf_mult": round(conf_mult, 3),
             "sleeve": sleeve,
+            "catalyst_date": catalyst_date,
             "proposal_ts": proposal.get("ts"),
         },
     )
+
+    # Auto-create a PositionPlan so exit rules (trailing stop, time stop,
+    # hard stops) actually run for autonomous buys. Wraps in try/except so a
+    # plan-creation failure never breaks the buy path.
+    try:
+        _auto_create_position_plan(cfg, tk, proposal, sleeve, catalyst_date)
+    except Exception:
+        logger.debug("auto-create position plan failed for %s", tk, exc_info=True)
+
     conf_note = f", conf {conf:.2f}→{conf_mult:.0%} of cap" if conf is not None else ""
+    sleeve_display = sleeve if sleeve != "?" else "?"
     if abs(scale - 1.0) < 1e-9:
-        msg = f"BUY {tk} ~${notional:,.0f} ({sleeve}) executed on Alpaca paper{conf_note}."
+        msg = f"BUY {tk} ~${notional:,.0f} ({sleeve_display}) executed on Alpaca paper{conf_note}."
     else:
-        msg = f"BUY {tk} ~${notional:,.0f} ({sleeve}) submitted to Alpaca paper (scaled from ~${usd:,.0f} eToro-size{conf_note})."
+        msg = f"BUY {tk} ~${notional:,.0f} ({sleeve_display}) submitted to Alpaca paper (scaled from ~${usd:,.0f} eToro-size{conf_note})."
     _notify(cfg, f"BUY {tk}", msg + "\nFills at next market open if currently closed.")
     return msg
+
+
+def _cooldown_skip_reason(cfg: Dict[str, Any], tk: str, cooldown_days: int) -> str:
+    """Return a non-empty skip reason if a same-ticker buy/add was executed
+    within cooldown_days in the alpaca ledger; empty string otherwise."""
+    from datetime import timedelta
+
+    p = _ledger_path(cfg)
+    if not p.is_file():
+        return ""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=cooldown_days)
+    for line in p.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if (
+            row.get("status") == "submitted"
+            and str(row.get("ticker") or "").upper() == tk
+            and str(row.get("action") or "").lower() in ("buy", "add")
+        ):
+            try:
+                ts = datetime.fromisoformat(str(row.get("ts") or "").replace("Z", "+00:00"))
+                if ts >= cutoff:
+                    return f"cooldown: buy/add within last {cooldown_days}d"
+            except (TypeError, ValueError):
+                pass
+    return ""
+
+
+def _auto_create_position_plan(
+    cfg: Dict[str, Any],
+    tk: str,
+    proposal: Dict[str, Any],
+    sleeve: str,
+    catalyst_date: Optional[str],
+) -> None:
+    """Create or upsert a PositionPlan for an autonomous buy.
+
+    Entry price: proposal target_price if > 0, else last close from yfinance.
+    Existing plans are NOT overwritten — an existing plan means the user or a
+    prior autonomous buy already set one up.
+    """
+    from tradingagents.portfolio_advisor.position_plans import (
+        PositionPlan,
+        load_position_plans,
+        upsert_position_plan,
+    )
+
+    existing = load_position_plans(cfg)
+    if tk in existing:
+        # Plan already exists — do not clobber it. Only update catalyst_date if
+        # the existing plan has none and the new proposal supplies one.
+        plan = existing[tk]
+        if catalyst_date and not plan.catalyst_date:
+            plan.catalyst_date = catalyst_date
+            upsert_position_plan(cfg, plan)
+        return
+
+    entry_price = float(proposal.get("target_price") or 0)
+    if entry_price <= 0:
+        try:
+            import yfinance as yf
+
+            hist = yf.Ticker(tk).history(period="5d")["Close"]
+            if len(hist) >= 1:
+                entry_price = float(hist.iloc[-1])
+        except Exception:
+            logger.debug("yfinance price fetch failed for %s in auto-create plan", tk)
+
+    if entry_price <= 0:
+        logger.debug("auto-create plan: no entry price for %s — skipping", tk)
+        return
+
+    note = f"auto-created on autonomous buy {_now_iso()}"
+    plan = PositionPlan(
+        ticker=tk,
+        entry_price=entry_price,
+        strategy=sleeve if sleeve in ("core", "catalyst") else "core",
+        entry_date=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        catalyst_date=catalyst_date or "",
+        notes=note,
+    )
+    upsert_position_plan(cfg, plan)
 
 
 def _paper_reduce(
@@ -284,11 +404,17 @@ def _paper_reduce(
         return f"skipped {tk} {act}: not held in paper book"
 
     fraction = 1.0
+    mv = abs(float(pos.market_value or 0))
     if act == "trim":
         fraction = _TRIM_DEFAULT_FRACTION
         usd = float(proposal.get("approx_usd") or 0)
-        mv = abs(float(pos.market_value or 0))
         if usd > 0 and mv > 0:
+            fraction = min(1.0, max(0.05, usd * _scale_factor(cfg, equity) / mv))
+    elif act == "sell":
+        # A sell with an explicit approx_usd strictly less than 95% of the
+        # current market value is a fractional close, not a full liquidation.
+        usd = float(proposal.get("approx_usd") or 0)
+        if usd > 0 and mv > 0 and usd < 0.95 * mv:
             fraction = min(1.0, max(0.05, usd * _scale_factor(cfg, equity) / mv))
 
     if fraction >= 0.999:
@@ -371,16 +497,27 @@ def _latest_buys_from_ledger(cfg: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
 
 
 def enforce_paper_exits(cfg: Dict[str, Any]) -> int:
-    """Deterministic exits for paper positions the eToro watchdog can NOT see.
+    """Deterministic exits for paper positions every watchdog tick.
 
-    The watchdog computes triggers from the LIVE ETORO BOOK, so a paper position
-    for a name the human never bought on eToro would otherwise have no stop
-    enforcement at all. This applies the sleeve rules (recorded at buy time in
-    the ledger) directly to the Alpaca book every watchdog tick:
-      catalyst: close at ≤ -8% unrealized, or past max-hold days (default 30)
-      core:     close at ≤ -40% unrealized
-    Trailing stops and pre-earnings trims stay watchdog/PM-driven — this is the
-    hard floor only. Idempotent; never raises. Returns positions closed.
+    Sleeve rules applied each tick:
+      catalyst: close at ≤ -8% unrealized (hard stop); trailing stop once peak
+                >= entry*1.10 and price falls 8%+ from peak; time stop 3d after
+                catalyst_date when the expected move did not happen; max-hold
+                fallback when no catalyst_date is set.
+      core:     close at ≤ -40% unrealized (hard stop); close 50% once when
+                price >= entry*2.0 (trim-half rule), keyed by plan
+                double_trim_done_at so it only fires once.
+
+    Sleeve resolution order (plan-first):
+      1. position_plans.json (set at buy time by _auto_create_position_plan)
+      2. alpaca_trades.jsonl ledger buy row sleeve field
+      3. If NEITHER source knows the position → one-time Telegram warning and
+         default to core floors.
+
+    Price for trailing-stop peak ratcheting comes from the Alpaca position
+    (market_value / qty) — no yfinance call per tick.
+
+    Idempotent; never raises. Returns number of close actions taken.
     """
     if not enabled(cfg):
         return 0
@@ -390,32 +527,151 @@ def enforce_paper_exits(cfg: Dict[str, Any]) -> int:
         if not positions:
             return 0
         buys = _latest_buys_from_ledger(cfg)
+        try:
+            from tradingagents.portfolio_advisor.position_plans import (
+                load_position_plans,
+                save_position_plans,
+                catalyst_rules_from_cfg,
+                eval_catalyst_exit,
+                update_catalyst_peak,
+            )
+            plans = load_position_plans(cfg)
+        except Exception:
+            plans = {}
+        catalyst_rules = None
+        try:
+            catalyst_rules = catalyst_rules_from_cfg(cfg)
+        except Exception:
+            pass
         max_hold = int(cfg.get("portfolio_advisor_catalyst_max_hold_days", 30) or 30)
         now = datetime.now(timezone.utc)
         closed = 0
+        plans_dirty = False  # track whether we need to save plans
+
         for pos in positions:
             tk = str(pos.symbol).upper()
             try:
                 plpc = float(pos.unrealized_plpc or 0)
             except (TypeError, ValueError):
                 continue
+
+            # Derive current price from Alpaca position — no yfinance needed per tick.
+            current_price: Optional[float] = None
+            try:
+                mv = float(pos.market_value or 0)
+                qty = float(pos.qty or 0)
+                if qty != 0:
+                    current_price = abs(mv) / abs(qty)
+            except (TypeError, ValueError, ZeroDivisionError):
+                pass
+            # Fallback: check for current_price attribute directly
+            if current_price is None:
+                try:
+                    current_price = float(pos.current_price or 0) or None
+                except (TypeError, ValueError, AttributeError):
+                    pass
+
+            # Plan-first sleeve resolution.
+            plan = plans.get(tk)
             buy = buys.get(tk, {})
-            sleeve = str(buy.get("sleeve") or "core").lower()
-            rule = None
+
+            if plan is not None:
+                # Trust the plan — it was set at buy time and captures the intent.
+                sleeve = plan.strategy
+                catalyst_date = plan.catalyst_date or ""
+            elif buy:
+                sleeve = str(buy.get("sleeve") or "core").lower()
+                catalyst_date = str(buy.get("catalyst_date") or "").strip()
+            else:
+                # Neither source knows this position — warn once and default safe.
+                if tk not in _warned_no_plan_tickers:
+                    _warned_no_plan_tickers.add(tk)
+                    _notify(
+                        cfg,
+                        f"Unknown sleeve for {tk}",
+                        f"[PAPER] {tk} is open in the paper book but has no position plan "
+                        f"and no ledger buy row. Defaulting to core hard-stop floors. "
+                        f"Set a plan via: advisor portfolio position-plan set {tk} --entry PRICE",
+                    )
+                    logger.warning(
+                        "enforce_paper_exits: %s has no plan or ledger row — defaulting to core floors", tk
+                    )
+                sleeve = "core"
+                catalyst_date = ""
+
+            rule: Optional[str] = None
+            trim_fraction = 1.0  # default: full close
+
             if sleeve == "catalyst":
-                if plpc <= -0.08:
-                    rule = "paper_catalyst_hard_stop_-8pct"
+                hard_stop_pct = float(cfg.get("portfolio_advisor_catalyst_hard_stop_pct", 0.08) or 0.08)
+                if plpc <= -hard_stop_pct:
+                    rule = f"paper_catalyst_hard_stop_{-hard_stop_pct*100:.0f}pct"
                 else:
-                    try:
-                        opened = datetime.fromisoformat(str(buy.get("ts") or "").replace("Z", "+00:00"))
-                        if (now - opened).days >= max_hold:
-                            rule = f"paper_catalyst_max_hold_{max_hold}d"
-                    except (TypeError, ValueError):
-                        pass
-            elif plpc <= -0.40:
-                rule = "paper_core_hard_stop_-40pct"
-            if rule and close_for_watchdog(cfg, tk, 1.0, rule):
-                closed += 1
+                    # F6: Ratchet peak from Alpaca price and evaluate trailing/time stops.
+                    if plan is not None and current_price is not None and catalyst_rules is not None:
+                        # update_catalyst_peak saves to disk — do it in-memory to batch saves.
+                        entry = plan.entry_price
+                        old_peak = plan.peak_price
+                        new_peak = current_price if (old_peak is None or current_price > old_peak) else old_peak
+                        if new_peak != old_peak:
+                            plan.peak_price = new_peak
+                            plan.last_updated = datetime.now(timezone.utc).isoformat()
+                            plans[tk] = plan
+                            plans_dirty = True
+                        # Evaluate trailing stop and time stop via shared helper.
+                        rule = eval_catalyst_exit(plan, current_price, catalyst_rules)
+                    else:
+                        # No plan — fall back to legacy time-stop logic from ledger.
+                        time_stop_days = int(cfg.get("portfolio_advisor_catalyst_time_stop_days", 3) or 3)
+                        if catalyst_date:
+                            try:
+                                from datetime import timedelta
+                                cat_dt = datetime.fromisoformat(catalyst_date[:10])
+                                cat_dt = cat_dt.replace(tzinfo=timezone.utc)
+                                if (now - cat_dt).days >= time_stop_days:
+                                    rule = f"paper_catalyst_time_stop_{time_stop_days}d_post_catalyst"
+                            except (TypeError, ValueError):
+                                pass
+                        if not rule:
+                            try:
+                                opened = datetime.fromisoformat(str(buy.get("ts") or "").replace("Z", "+00:00"))
+                                if (now - opened).days >= max_hold:
+                                    rule = f"paper_catalyst_max_hold_{max_hold}d"
+                            except (TypeError, ValueError):
+                                pass
+
+            elif sleeve == "core":
+                if plpc <= -0.40:
+                    rule = "paper_core_hard_stop_-40pct"
+                elif (
+                    plan is not None
+                    and current_price is not None
+                    and plan.entry_price > 0
+                    and current_price >= plan.entry_price * 2.0
+                    and not plan.double_trim_done_at  # one-shot: not yet consumed
+                ):
+                    # F5.3: +100% trim-half — close 50% once.
+                    rule = "paper_core_double_trim"
+                    trim_fraction = 0.5
+
+            if rule:
+                result = close_for_watchdog(cfg, tk, trim_fraction, rule)
+                if result is not None:
+                    closed += 1
+                    if rule == "paper_core_double_trim" and plan is not None:
+                        # Persist the consumption flag so this rule never re-fires.
+                        plan.double_trim_done_at = datetime.now(timezone.utc).isoformat()
+                        plan.last_updated = plan.double_trim_done_at
+                        plans[tk] = plan
+                        plans_dirty = True
+
+        # Batch-save position plans if peaks or consumption flags changed.
+        if plans_dirty:
+            try:
+                save_position_plans(cfg, plans)
+            except Exception:
+                logger.debug("enforce_paper_exits: failed to save plans", exc_info=True)
+
         return closed
     except Exception:
         logger.debug("enforce_paper_exits skipped", exc_info=True)
