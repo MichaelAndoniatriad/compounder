@@ -32,7 +32,7 @@ In `tradingagents/integrations/alpaca/executor.py`:
 
 Accept: unit tests for spread-reject, limit-price math, bracket params for catalyst, closed-market catalyst skip, slippage row. Mock all Alpaca clients.
 
-## R2 — Wire the measurement loop (the learning system is dead code in production)
+## R2 — Wire the measurement loop ✅ f7e8944 (the learning system is dead code in production)
 
 Audit-confirmed: `outcomes.jsonl` does not exist; recommendation_log has ~5 rows ever; the shadow book referenced in `candidates.py` has never been written.
 1. Find the LaunchAgent/cron that should measure outcomes (`grep -r measure-outcomes ~/Library/LaunchAgents scripts/ cli/`). Point it at `outcome_tracker.compute_recommendation_outcomes` (currently test-only); replace any legacy logic in `cli/advisor_cmd.py` (~line 485).
