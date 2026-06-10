@@ -261,6 +261,82 @@ def compute_recommendation_outcomes(
     return summary
 
 
+def _nav_history_path(cfg: Dict[str, Any]) -> "Path":
+    from tradingagents.portfolio_advisor import state as pa_state
+    return pa_state.advisor_dir(cfg) / "nav_history.jsonl"
+
+
+def record_daily_nav(cfg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Append one NAV snapshot per calendar day to nav_history.jsonl.
+
+    Reads equity/cash/positions from the Alpaca executor's client (only when
+    executor is enabled). Fetches SPY close via yfinance. If today already has
+    a row, or if the executor is disabled, or on any error: silently returns None.
+
+    Returns the row dict written, or None if skipped.
+    """
+    import json as _json
+    from pathlib import Path as _Path
+    from datetime import date as _date, datetime as _dt, timezone as _tz
+
+    today_str = _date.today().isoformat()
+    nav_path = _nav_history_path(cfg)
+
+    try:
+        # Check if today already has a row.
+        if nav_path.is_file():
+            for line in nav_path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    existing = _json.loads(line)
+                    if str(existing.get("date", ""))[:10] == today_str:
+                        return None  # already recorded today
+                except (ValueError, _json.JSONDecodeError):
+                    continue
+    except Exception:
+        return None
+
+    try:
+        from tradingagents.integrations.alpaca import executor as _alpaca
+        if not _alpaca.enabled(cfg):
+            return None
+
+        client = _alpaca._client()
+        account = client.get_account()
+        equity = float(account.equity)
+        cash = float(account.cash)
+        positions_count = len(client.get_all_positions())
+    except Exception:
+        return None
+
+    spy_close: Optional[float] = None
+    try:
+        import yfinance as yf  # type: ignore
+        hist = yf.Ticker("SPY").history(period="5d", interval="1d", auto_adjust=False)
+        if hist is not None and len(hist) > 0:
+            spy_close = float(hist["Close"].iloc[-1])
+    except Exception:
+        pass
+
+    row: Dict[str, Any] = {
+        "date": today_str,
+        "ts": _dt.now(_tz.utc).isoformat(),
+        "equity": round(equity, 2),
+        "cash": round(cash, 2),
+        "positions_count": positions_count,
+        "spy_close": round(spy_close, 4) if spy_close is not None else None,
+    }
+    try:
+        nav_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(nav_path, "a", encoding="utf-8") as f:
+            f.write(_json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception:
+        return None
+    return row
+
+
 def rule_performance_summary(
     cfg: Dict[str, Any],
     *,

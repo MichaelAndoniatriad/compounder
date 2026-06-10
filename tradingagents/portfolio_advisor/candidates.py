@@ -605,6 +605,192 @@ def shadow_book_summary(cfg: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def shadow_book_add(
+    cfg: Dict[str, Any],
+    *,
+    ticker: str,
+    source: str = "unknown",
+    reason: str = "",
+    strategy: str = "core",
+    catalyst_date: str = "",
+    gates_passed: Optional[List[str]] = None,
+    entry_price: Optional[float] = None,
+    status: str = "watch",
+) -> Optional[Dict[str, Any]]:
+    """Write one 'open' row to shadow_book.jsonl for a candidate that passed
+    mechanical gates but was NOT selected as a live proposal.
+
+    Fetches the entry price from yfinance if not supplied. Returns the written
+    row dict, or None when skipped (duplicate open position, missing price, etc.).
+
+    This is the canonical public writer helper used by external callers (e.g.
+    ep_scanner) that want to insert a specific shadow-book entry rather than
+    going through the full candidate-evaluation pipeline.
+    """
+    tk = (ticker or "").strip().upper()
+    if not tk:
+        return None
+
+    path = shadow_book_path(cfg)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    open_positions, _ = _shadow_state(path)
+    if tk in open_positions:
+        return None  # already tracking this name
+
+    price = entry_price
+    if price is None or price <= 0:
+        try:
+            import yfinance as yf  # type: ignore
+
+            hist = yf.Ticker(tk).history(period="5d")
+            if hist is None or len(hist) == 0:
+                return None
+            price = float(hist["Close"].iloc[-1])
+        except Exception:
+            return None
+
+    if not price or price <= 0:
+        return None
+
+    notional = float(cfg.get("portfolio_advisor_shadow_notional", 500) or 500)
+    shares = round(notional / price, 6)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    entry: Dict[str, Any] = {
+        "ts": now_iso,
+        "ticker": tk,
+        "side": "open",
+        "entry_price": round(price, 4),
+        "shares": shares,
+        "notional": notional,
+        "status": status,
+        "strategy": strategy,
+        "source": source,
+        "reason": (reason or "")[:200],
+        "catalyst_date": (catalyst_date or "").strip() or None,
+        "gates_passed": list(gates_passed or []),
+    }
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError:
+        return None
+    return entry
+
+
+def shadow_outcomes(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Score shadow-book open rows that are ≥30 days old without an outcome.
+
+    For each eligible row, fetches the 30-day forward return via yfinance and
+    computes the SPY return over the same window. Results are appended to
+    ``<advisor_dir>/shadow_outcomes.jsonl`` (separate file so the open-position
+    ledger stays clean). Already-scored rows are skipped (idempotent).
+
+    Returns a summary dict: {scored, skipped_too_young, skipped_no_price, total_open}.
+    """
+    path = shadow_book_path(cfg)
+    outcomes_path = state.advisor_dir(cfg) / "shadow_outcomes.jsonl"
+    outcomes_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Build a set of already-scored tickers+ts to stay idempotent.
+    already_scored: set = set()
+    if outcomes_path.is_file():
+        for line in outcomes_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+                already_scored.add((row.get("ticker", ""), row.get("entry_ts", "")))
+            except (json.JSONDecodeError, ValueError):
+                continue
+
+    open_positions, _ = _shadow_state(path)
+    summary = {
+        "total_open": len(open_positions),
+        "scored": 0,
+        "skipped_too_young": 0,
+        "skipped_no_price": 0,
+    }
+    if not open_positions:
+        return summary
+
+    now = datetime.now(timezone.utc)
+    min_age_days = 30
+
+    for tk, row in open_positions.items():
+        entry_ts = str(row.get("ts") or "")
+        try:
+            opened = datetime.fromisoformat(entry_ts.replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            summary["skipped_too_young"] += 1
+            continue
+
+        age_days = (now - opened).days
+        if age_days < min_age_days:
+            summary["skipped_too_young"] += 1
+            continue
+
+        if (tk, entry_ts) in already_scored:
+            # Already written an outcome for this exact open row.
+            continue
+
+        start_date = opened.date().isoformat()
+        from datetime import timedelta as _td
+        end_date = (opened + _td(days=min_age_days + 2)).date().isoformat()
+
+        try:
+            import yfinance as yf  # type: ignore
+
+            hist = yf.Ticker(tk).history(start=start_date, end=end_date,
+                                         interval="1d", auto_adjust=False)
+            if hist is None or len(hist) < 2:
+                summary["skipped_no_price"] += 1
+                continue
+            start_price = float(hist["Close"].iloc[0])
+            end_price = float(hist["Close"].iloc[-1])
+            if start_price <= 0:
+                summary["skipped_no_price"] += 1
+                continue
+            raw_return = (end_price - start_price) / start_price
+
+            spy_hist = yf.Ticker("SPY").history(start=start_date, end=end_date,
+                                                 interval="1d", auto_adjust=False)
+            spy_return: Optional[float] = None
+            if spy_hist is not None and len(spy_hist) >= 2:
+                spy_start = float(spy_hist["Close"].iloc[0])
+                spy_end = float(spy_hist["Close"].iloc[-1])
+                if spy_start > 0:
+                    spy_return = (spy_end - spy_start) / spy_start
+        except Exception:
+            summary["skipped_no_price"] += 1
+            continue
+
+        alpha = (raw_return - spy_return) if spy_return is not None else None
+        outcome_row: Dict[str, Any] = {
+            "scored_at": now.isoformat(),
+            "ticker": tk,
+            "entry_ts": entry_ts,
+            "start_date": start_date,
+            "end_date": end_date,
+            "start_price": round(start_price, 4),
+            "end_price": round(end_price, 4),
+            "raw_return": round(raw_return, 4),
+            "spy_return": round(spy_return, 4) if spy_return is not None else None,
+            "alpha_vs_spy": round(alpha, 4) if alpha is not None else None,
+            "source": row.get("source"),
+            "strategy": row.get("strategy"),
+            "gates_passed": row.get("gates_passed"),
+        }
+        try:
+            with open(outcomes_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(outcome_row, ensure_ascii=False) + "\n")
+            summary["scored"] += 1
+        except OSError:
+            pass
+
+    return summary
+
+
 def append_candidate_records(cfg: Dict[str, Any], records: Iterable[CandidateRecord]) -> None:
     rows = list(records)
     path = candidate_log_path(cfg)

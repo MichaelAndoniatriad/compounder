@@ -337,6 +337,13 @@ def run_watchdog(cfg: Dict[str, Any], *, ignore_market_hours: bool = False, supp
         logger.info("watchdog skipped (market closed: weekend, US holiday, or outside hours)")
         return 0
 
+    # R2: daily NAV snapshot — runs once per calendar day, swallows all errors.
+    try:
+        from tradingagents.portfolio_advisor.outcome_tracker import record_daily_nav
+        record_daily_nav(cfg)
+    except Exception:
+        logger.debug("watchdog: record_daily_nav skipped", exc_info=True)
+
     # Paper-book hard floor — runs EVERY tick, before any eToro-dependent early
     # return: positions held only on Alpaca (advice the human didn't take on
     # eToro) are invisible to the eToro trigger logic below, so their -8%/-40%

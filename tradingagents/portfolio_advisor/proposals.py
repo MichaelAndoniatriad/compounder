@@ -210,6 +210,22 @@ def add(
                     # "disabled" leaves status as "proposed" (human-advisory mode)
                     break
             save_all(cfg, rows_fresh)
+
+            # R2: log every autonomous execution to the recommendation log so
+            # every trade is scoreable by the outcome tracker.
+            if ex_status == "executed":
+                try:
+                    from tradingagents.portfolio_advisor import recommendation_log as _rl
+                    _rl.log_recommendation(
+                        cfg,
+                        trigger="autonomous_execution",
+                        type="ep_entry" if (entry.get("sleeve") or "") == "catalyst" else "sizing",
+                        action=entry.get("action", ""),
+                        ticker=entry.get("ticker"),
+                        rationale=(entry.get("reason") or "")[:600],
+                    )
+                except Exception:
+                    pass  # log failure must never break the proposal path
         except Exception:
             pass
     return entry
