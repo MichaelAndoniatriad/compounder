@@ -578,3 +578,83 @@ class TestDeadZoneConfigKeys:
 
         assert "portfolio_advisor_reentry_cooldown_days" in DEFAULT_CONFIG
         assert DEFAULT_CONFIG["portfolio_advisor_reentry_cooldown_days"] == 5
+
+
+class TestDuplicateBuyGuards:
+    """Regression: 2026-06-10 three pre-market PM cycles each bought DKNG $2.5k.
+
+    Queued DAY orders are not positions, so the already-held check passed; the
+    ledger cooldown only covered 'add'. Plain buys must respect both the
+    open-order check and the buy/add cooldown.
+    """
+
+    def _cfg(self, tmp_path):
+        return {"portfolio_advisor_dir": str(tmp_path)}
+
+    def test_plain_buy_blocked_by_recent_submitted_buy(self, tmp_path):
+        import json as _json
+        from datetime import datetime, timezone
+        from tradingagents.integrations.alpaca import executor
+
+        cfg = self._cfg(tmp_path)
+        ledger = executor._ledger_path(cfg)
+        ledger.parent.mkdir(parents=True, exist_ok=True)
+        ledger.write_text(_json.dumps({
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "ticker": "DKNG", "action": "buy", "status": "submitted",
+        }) + "\n", encoding="utf-8")
+
+        class _NoPosClient:
+            def get_open_position(self, tk):
+                raise RuntimeError("no position")
+            def get_orders(self, req):
+                return []
+
+        msg = executor._paper_buy(
+            cfg, _NoPosClient(), 100_000.0, "DKNG",
+            {"ticker": "DKNG", "action": "buy", "approx_usd": 2500.0},
+        )
+        assert "cooldown" in msg
+
+    def test_plain_buy_blocked_by_queued_open_order(self, tmp_path):
+        from tradingagents.integrations.alpaca import executor
+
+        cfg = self._cfg(tmp_path)
+
+        class _Order:
+            side = "OrderSide.BUY"
+
+        class _QueuedClient:
+            def get_open_position(self, tk):
+                raise RuntimeError("no position")
+            def get_orders(self, req):
+                return [_Order()]
+
+        msg = executor._paper_buy(
+            cfg, _QueuedClient(), 100_000.0, "DKNG",
+            {"ticker": "DKNG", "action": "buy", "approx_usd": 2500.0},
+        )
+        assert "queued" in msg
+
+    def test_fresh_buy_unaffected(self, tmp_path):
+        from tradingagents.integrations.alpaca import executor
+
+        cfg = self._cfg(tmp_path)
+        submitted = {}
+
+        class _FreshClient:
+            def get_open_position(self, tk):
+                raise RuntimeError("no position")
+            def get_orders(self, req):
+                return []
+            def submit_order(self, req):
+                submitted["notional"] = float(req.notional)
+                class _O: id = "test-order"
+                return _O()
+
+        msg = executor._paper_buy(
+            cfg, _FreshClient(), 100_000.0, "NVDA",
+            {"ticker": "NVDA", "action": "buy", "approx_usd": 2500.0},
+        )
+        assert "submitted" in msg.lower() or "buy" in msg.lower()
+        assert submitted.get("notional", 0) > 0

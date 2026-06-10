@@ -243,23 +243,31 @@ def _paper_buy(
         return f"skipped {tk}: {reentry_skip}"
 
     # A plain "buy" of a name the paper book already holds is the PM restating
-    # itself — only an explicit "add" increases an existing position.
+    # itself — only an explicit "add" increases an existing position. A queued
+    # not-yet-filled buy order counts as held: outside market hours DAY orders
+    # sit ACCEPTED until the open, during which the position check sees nothing
+    # (2026-06-10: three PM cycles each bought DKNG $2.5k pre-market this way).
     if act == "buy":
         try:
             client.get_open_position(tk)
             _log_row(cfg, {"ticker": tk, "action": "buy", "status": "skipped", "note": "already held"})
             return f"skipped {tk}: already held in paper book"
         except Exception:
-            pass  # no position — proceed
+            pass  # no position — check in-flight orders next
+        if _open_buy_order_exists(client, tk):
+            _log_row(cfg, {"ticker": tk, "action": "buy", "status": "skipped", "note": "buy order already queued"})
+            return f"skipped {tk}: buy order already queued (unfilled)"
 
-    # Restatement double-buy protection for "add": skip if a same-ticker
-    # buy/add executed within portfolio_advisor_add_cooldown_days (default 5).
-    if act == "add":
-        cooldown = int(cfg.get("portfolio_advisor_add_cooldown_days", 5) or 5)
-        skip_reason = _cooldown_skip_reason(cfg, tk, cooldown)
-        if skip_reason:
-            _log_row(cfg, {"ticker": tk, "action": "add", "status": "skipped", "note": skip_reason})
-            return f"skipped {tk}: {skip_reason}"
+    # Restatement double-buy protection: skip if a same-ticker buy/add was
+    # submitted within portfolio_advisor_add_cooldown_days (default 5). Applies
+    # to plain "buy" too — the position check alone misses queued orders, and
+    # independent PM cycles (ep_scan, batch_complete, morning_checkin) can each
+    # restate the same entry within minutes.
+    cooldown = int(cfg.get("portfolio_advisor_add_cooldown_days", 5) or 5)
+    skip_reason = _cooldown_skip_reason(cfg, tk, cooldown)
+    if skip_reason:
+        _log_row(cfg, {"ticker": tk, "action": act, "status": "skipped", "note": skip_reason})
+        return f"skipped {tk}: {skip_reason}"
 
     scale = _scale_factor(cfg, equity)
     cap = float(cfg.get("portfolio_advisor_alpaca_max_position_pct", 0.10) or 0.10)
@@ -310,6 +318,21 @@ def _paper_buy(
         msg = f"BUY {tk} ~${notional:,.0f} ({sleeve_display}) submitted to Alpaca paper (scaled from ~${usd:,.0f} eToro-size{conf_note})."
     _notify(cfg, f"BUY {tk}", msg + "\nFills at next market open if currently closed.")
     return msg
+
+
+def _open_buy_order_exists(client, tk: str) -> bool:
+    """True if an unfilled buy order for tk is queued on the paper account."""
+    try:
+        from alpaca.trading.enums import QueryOrderStatus
+        from alpaca.trading.requests import GetOrdersRequest
+
+        orders = client.get_orders(
+            GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[tk], limit=10)
+        )
+        return any(str(getattr(o, "side", "")).lower().endswith("buy") for o in orders or [])
+    except Exception:
+        logger.debug("open-order check failed for %s", tk, exc_info=True)
+        return False  # fail open: the ledger cooldown still guards restatements
 
 
 def _cooldown_skip_reason(cfg: Dict[str, Any], tk: str, cooldown_days: int) -> str:
