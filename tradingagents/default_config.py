@@ -213,6 +213,13 @@ DEFAULT_CONFIG = _apply_env_overrides({
     "portfolio_advisor_alpaca_high_conviction_pct": 0.15,             # per-position cap of book for granted HC buys
     "portfolio_advisor_alpaca_high_conviction_min_confidence": 0.85,  # stated confidence floor to qualify
     "portfolio_advisor_alpaca_high_conviction_max_positions": 2,      # concurrent HC slots across the whole book
+    # --- Marketable-limit entry quality controls (R1) ---
+    # Max bid-ask spread in basis-points to allow a limit order; wider spreads are skipped
+    # (market order would give away too much to the spread). 100 bps = 1% of price.
+    "portfolio_advisor_max_spread_bps": 100,
+    # Extra slippage buffer added to the ask when computing the limit price, in bps.
+    # Ensures the limit is high enough to fill immediately at the ask rather than missing.
+    "portfolio_advisor_limit_slip_bps": 10,
     # Dip-watch (quality-on-a-dip): watch CORE watchlist names for a SHALLOW pullback
     # into a buy zone, then let the PM judge (value-trap check) + propose a staged entry.
     # Bounds are config because the research found exact thresholds are indicative, not

@@ -34,6 +34,43 @@ logger = logging.getLogger(__name__)
 
 _TRIM_DEFAULT_FRACTION = 0.5
 
+
+# ---------------------------------------------------------------------------
+# R1 — Marketable-limit entry helpers
+# ---------------------------------------------------------------------------
+
+
+def _latest_quote(tk: str) -> Optional[Dict[str, Any]]:
+    """Fetch the latest NBBO quote for tk via the Alpaca IEX free feed.
+
+    Returns {"bid": float, "ask": float} or None on ANY failure (missing keys,
+    no environment, pytest, network error, zero prices). Callers treat None as
+    "quote unavailable" and fall back to market-order behaviour.
+    """
+    if "PYTEST_CURRENT_TEST" in os.environ:
+        return None
+    try:
+        from alpaca.data.historical import StockHistoricalDataClient
+        from alpaca.data.requests import StockLatestQuoteRequest
+
+        key = (os.environ.get("ALPACA_API_KEY") or "").strip()
+        sec = (os.environ.get("ALPACA_SECRET_KEY") or "").strip()
+        if not key or not sec:
+            return None
+        data_client = StockHistoricalDataClient(key, sec)
+        resp = data_client.get_stock_latest_quote(StockLatestQuoteRequest(symbol_or_symbols=tk))
+        quote = resp.get(tk) if isinstance(resp, dict) else None
+        if quote is None:
+            return None
+        bid = float(getattr(quote, "bid_price", 0) or 0)
+        ask = float(getattr(quote, "ask_price", 0) or 0)
+        if bid <= 0 or ask <= 0 or ask < bid:
+            return None
+        return {"bid": bid, "ask": ask}
+    except Exception:
+        logger.debug("_latest_quote failed for %s", tk, exc_info=True)
+        return None
+
 # Track tickers for which a "no plan, defaulting to core floors" warning has
 # already been sent this process lifetime — avoids one Telegram per tick.
 _warned_no_plan_tickers: set = set()
@@ -253,7 +290,6 @@ def _paper_buy(
     proposal: Dict[str, Any],
 ) -> str:
     from alpaca.trading.enums import OrderSide, TimeInForce
-    from alpaca.trading.requests import MarketOrderRequest
 
     usd = float(proposal.get("approx_usd") or 0)
     if usd <= 0:
@@ -324,11 +360,88 @@ def _paper_buy(
         _log_row(cfg, {"ticker": tk, "action": "buy", "status": "skipped", "note": f"notional {notional} < $1"})
         return f"skipped {tk}: scaled notional under $1"
 
-    order = client.submit_order(
-        MarketOrderRequest(symbol=tk, notional=notional, side=OrderSide.BUY, time_in_force=TimeInForce.DAY)
-    )
     sleeve = (proposal.get("sleeve") or "").lower() or "core"
     catalyst_date = (proposal.get("catalyst_date") or "").strip() or None
+
+    # R1.3 — No overnight queuing for catalyst entries.
+    # If the market is confirmed closed and this is a catalyst buy, skip it.
+    # None means "unknown" (no keys, pytest) — treat as "allow" per instructions.
+    if sleeve == "catalyst":
+        clock = market_clock()
+        if clock is not None and not clock.get("is_open"):
+            _log_row(cfg, {"ticker": tk, "action": act, "status": "skipped",
+                           "note": "market closed — catalyst entries only execute live"})
+            return f"skipped {tk}: market closed — catalyst entries only execute live"
+
+    # R1.1 — Marketable-limit entry: fetch quote, check spread, build limit order.
+    # Falls back to market order when quote is unavailable.
+    max_spread_bps = int(cfg.get("portfolio_advisor_max_spread_bps", 100) or 100)
+    limit_slip_bps = int(cfg.get("portfolio_advisor_limit_slip_bps", 10) or 10)
+
+    quote = _latest_quote(tk)
+    use_limit = False
+    limit_price: Optional[float] = None
+    intended_price: Optional[float] = None
+
+    if quote is not None:
+        bid = quote["bid"]
+        ask = quote["ask"]
+        spread_bps = round((ask - bid) / ask * 10000, 1)
+        if spread_bps > max_spread_bps:
+            _log_row(cfg, {"ticker": tk, "action": act, "status": "skipped",
+                           "note": f"spread {spread_bps:.1f}bps > max {max_spread_bps}bps",
+                           "bid": bid, "ask": ask, "spread_bps": spread_bps})
+            return f"skipped {tk}: spread {spread_bps:.1f}bps exceeds limit {max_spread_bps}bps"
+        # Marketable limit: ask × (1 + slip_bps/10000), round to 4 dp
+        limit_price = round(ask * (1 + limit_slip_bps / 10_000), 4)
+        intended_price = limit_price
+        # qty = floor(notional / limit_price × 1000) / 1000  (3 decimal fractional)
+        import math
+        qty = math.floor(notional / limit_price * 1000) / 1000
+        if qty > 0:
+            use_limit = True
+        # If qty rounds to 0, fall back to market (notional path)
+
+    if use_limit and limit_price is not None:
+        # R1.2 — Catalyst buys get a broker-resident bracket stop.
+        if sleeve == "catalyst":
+            from alpaca.trading.enums import OrderClass
+            from alpaca.trading.requests import LimitOrderRequest, StopLossRequest
+
+            hard_stop_pct = float(cfg.get("portfolio_advisor_catalyst_hard_stop_pct", 0.08) or 0.08)
+            stop_px = round(limit_price * (1 - hard_stop_pct), 4)
+            order = client.submit_order(
+                LimitOrderRequest(
+                    symbol=tk,
+                    qty=qty,
+                    side=OrderSide.BUY,
+                    time_in_force=TimeInForce.DAY,
+                    limit_price=limit_price,
+                    order_class=OrderClass.BRACKET,
+                    stop_loss=StopLossRequest(stop_price=stop_px),
+                )
+            )
+        else:
+            from alpaca.trading.requests import LimitOrderRequest
+
+            order = client.submit_order(
+                LimitOrderRequest(
+                    symbol=tk,
+                    qty=qty,
+                    side=OrderSide.BUY,
+                    time_in_force=TimeInForce.DAY,
+                    limit_price=limit_price,
+                )
+            )
+    else:
+        # Fallback: market order (notional-based, as before)
+        from alpaca.trading.requests import MarketOrderRequest as _MOR
+
+        order = client.submit_order(
+            _MOR(symbol=tk, notional=notional, side=OrderSide.BUY, time_in_force=TimeInForce.DAY)
+        )
+        intended_price = None  # market order — no specific intended price
+
     _log_row(
         cfg,
         {
@@ -346,8 +459,28 @@ def _paper_buy(
             "high_conviction": hc_granted,
             "hc_note": hc_note or None,
             "proposal_ts": proposal.get("ts"),
+            "intended_price": intended_price,
+            "fill_check_pending": True,
         },
     )
+
+    # R1.4 — Schedule a fill check ~2s post-submit (best-effort; watchdog
+    # reconcile_fills back-fills any missed checks on the next tick).
+    try:
+        import threading
+
+        def _deferred_fill_check():
+            import time as _time
+            _time.sleep(2)
+            try:
+                _check_order_fill(cfg, str(order.id), intended_price)
+            except Exception:
+                pass  # reconcile_fills will catch it next tick
+
+        t = threading.Thread(target=_deferred_fill_check, daemon=True)
+        t.start()
+    except Exception:
+        pass  # non-fatal: reconcile_fills is the backstop
 
     # Auto-create a PositionPlan so exit rules (trailing stop, time stop,
     # hard stops) actually run for autonomous buys. Wraps in try/except so a
@@ -368,6 +501,138 @@ def _paper_buy(
         msg += f"\nHigh-conviction size-up DENIED: {hc_note}. Sized normally."
     _notify(cfg, f"BUY {tk}", msg + "\nFills at next market open if currently closed.")
     return msg
+
+
+def _check_order_fill(cfg: Dict[str, Any], order_id: str, intended_price: Optional[float]) -> None:
+    """Write a fill_check ledger row for a submitted order. Silent on any failure.
+
+    Called ~2s post-submit from a daemon thread, and by reconcile_fills for any
+    orders still flagged fill_check_pending in the ledger. Does NOT raise.
+    """
+    try:
+        c = _client()
+        order = c.get_order_by_id(order_id)
+        status = str(getattr(order, "status", "")).lower()
+        filled_avg = None
+        slippage_bps = None
+        try:
+            raw = getattr(order, "filled_avg_price", None)
+            if raw is not None and raw != "":
+                filled_avg = float(raw)
+        except (TypeError, ValueError):
+            pass
+        if filled_avg and intended_price and intended_price > 0:
+            slippage_bps = round((filled_avg - intended_price) / intended_price * 10_000, 1)
+        _log_row(
+            cfg,
+            {
+                "action": "fill_check",
+                "order_id": order_id,
+                "status": status,
+                "filled_avg_price": filled_avg,
+                "intended_price": intended_price,
+                "slippage_bps": slippage_bps,
+            },
+        )
+    except Exception:
+        logger.debug("_check_order_fill failed for order %s", order_id, exc_info=True)
+
+
+def reconcile_fills(cfg: Dict[str, Any]) -> None:
+    """Back-fill fill_check rows for any submitted buy orders not yet reconciled.
+
+    Reads the last 24h of closed orders from Alpaca once (cheap: one API call)
+    and matches against ledger rows that have fill_check_pending=True and no
+    corresponding fill_check row. Called from enforce_paper_exits top. Silent
+    on any failure — never raises into the watchdog.
+    """
+    if not enabled(cfg):
+        return
+    try:
+        from datetime import timedelta
+        from alpaca.trading.enums import QueryOrderStatus
+        from alpaca.trading.requests import GetOrdersRequest
+
+        p = _ledger_path(cfg)
+        if not p.is_file():
+            return
+
+        # Collect order_ids that need a fill check (have fill_check_pending but no fill_check row).
+        pending_ids: Dict[str, Optional[float]] = {}  # order_id → intended_price
+        reconciled_ids: set = set()
+
+        for line in p.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if row.get("action") == "fill_check":
+                reconciled_ids.add(str(row.get("order_id") or ""))
+            elif row.get("fill_check_pending") and row.get("order_id"):
+                oid = str(row["order_id"])
+                if oid not in pending_ids:
+                    intended = None
+                    try:
+                        v = row.get("intended_price")
+                        if v is not None:
+                            intended = float(v)
+                    except (TypeError, ValueError):
+                        pass
+                    pending_ids[oid] = intended
+
+        unreconciled = {oid: ip for oid, ip in pending_ids.items() if oid not in reconciled_ids}
+        if not unreconciled:
+            return
+
+        # Fetch last-24h closed orders once.
+        c = _client()
+        after_dt = datetime.now(timezone.utc) - timedelta(hours=24)
+        try:
+            closed_orders = c.get_orders(
+                GetOrdersRequest(status=QueryOrderStatus.CLOSED, after=after_dt, limit=100)
+            ) or []
+        except Exception:
+            logger.debug("reconcile_fills: get_orders failed", exc_info=True)
+            return
+
+        filled_map: Dict[str, Any] = {}
+        for o in closed_orders:
+            oid = str(getattr(o, "id", ""))
+            if oid:
+                filled_map[oid] = o
+
+        for oid, intended in unreconciled.items():
+            order_obj = filled_map.get(oid)
+            if order_obj is None:
+                # Not in closed list — may still be open; skip for now
+                continue
+            status = str(getattr(order_obj, "status", "")).lower()
+            filled_avg = None
+            slippage_bps = None
+            try:
+                raw = getattr(order_obj, "filled_avg_price", None)
+                if raw is not None and raw != "":
+                    filled_avg = float(raw)
+            except (TypeError, ValueError):
+                pass
+            if filled_avg and intended and intended > 0:
+                slippage_bps = round((filled_avg - intended) / intended * 10_000, 1)
+            _log_row(
+                cfg,
+                {
+                    "action": "fill_check",
+                    "order_id": oid,
+                    "status": status,
+                    "filled_avg_price": filled_avg,
+                    "intended_price": intended,
+                    "slippage_bps": slippage_bps,
+                    "source": "reconcile_fills",
+                },
+            )
+    except Exception:
+        logger.debug("reconcile_fills failed", exc_info=True)
 
 
 def _high_conviction_grant(
@@ -744,6 +1009,8 @@ def enforce_paper_exits(cfg: Dict[str, Any]) -> int:
     """
     if not enabled(cfg):
         return 0
+    # R1.4 — Back-fill any submitted orders not yet reconciled.
+    reconcile_fills(cfg)
     try:
         client = _client()
         positions = client.get_all_positions()
