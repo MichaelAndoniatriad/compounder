@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -122,9 +123,59 @@ def _pull_news_yahoo_rss(today: date, look_back_days: int, limit: int) -> List[D
         return []
 
 
+def _pull_news_edgar(today: date, look_back_days: int, limit: int) -> List[Dict[str, Any]]:
+    """Pull recent 8-K filings from SEC EDGAR. Returns a feed-compatible list.
+
+    Each 8-K item is normalised to the same dict shape as Alpha Vantage / Yahoo
+    RSS feed items so it flows through the existing _bucket_by_ticker / hint-regex
+    pipeline unchanged. Title is "8-K item <item>: <filing title>" so the
+    Tier1/Tier2 hint regexes can match on their normal vocabulary if the filing
+    title includes catalyst keywords.
+
+    Empty list on any failure (EDGAR is optional enrichment, not a hard dep).
+    """
+    try:
+        from tradingagents.dataflows.edgar import fetch_recent_8k_items
+        hours = look_back_days * 24
+        filings = fetch_recent_8k_items(hours=hours)
+        out: List[Dict[str, Any]] = []
+        for f in filings[:limit]:
+            ticker = f.get("ticker") or ""
+            if not ticker:
+                continue
+            title = f.get("title") or ""
+            item = f.get("item") or ""
+            headline = f"8-K item {item}: {title}"
+            out.append({
+                "title": headline,
+                "summary": "",
+                "source": "edgar_8k",
+                "url": f.get("url") or "",
+                "time_published": f.get("filed_at") or "",
+                # Build a synthetic ticker_sentiment list so _bucket_by_ticker
+                # can pick it up; relevance_score 1.0 (direct filing = relevant).
+                "ticker_sentiment": [
+                    {
+                        "ticker": ticker,
+                        "relevance_score": "1.0",
+                        "ticker_sentiment_label": "Neutral",
+                    }
+                ],
+            })
+        return out
+    except Exception as e:
+        logger.warning("EDGAR 8-K fetch failed: %s", e)
+        return []
+
+
+# ep_scanner_news_sources registry. Default list in default_config.py uses
+# ["alpha_vantage", "yahoo_finance_rss"]. "edgar" is intentionally NOT in
+# the default list — enable by adding "edgar" to ep_scanner_news_sources in
+# your config once the EDGAR module has been validated in production.
 _NEWS_SOURCE_REGISTRY = {
     "alpha_vantage": _pull_news_alpha_vantage,
     "yahoo_finance_rss": _pull_news_yahoo_rss,
+    "edgar": _pull_news_edgar,
 }
 
 
@@ -229,7 +280,14 @@ def _bucket_by_ticker(feed: List[Dict[str, Any]]) -> Tuple[Dict[str, Dict[str, A
 
 
 def _yf_quote(ticker: str) -> Optional[Dict[str, Any]]:
-    """Pull current and prior-close price via yfinance. None on failure."""
+    """Pull current and prior-close price + volume data via yfinance. None on failure.
+
+    Returns a dict with price fields plus:
+      - volume_today: today's session volume (shares)
+      - avg_volume_20d: 20-day average daily volume (shares)
+      - close_price_for_dollar_vol: close price used to compute dollar volume
+    These are consumed by the RVOL gate.
+    """
     try:
         import yfinance as yf
         t = yf.Ticker(ticker)
@@ -238,6 +296,10 @@ def _yf_quote(ticker: str) -> Optional[Dict[str, Any]]:
             return None
         last = hist.iloc[-1]
         prev = hist.iloc[-2]
+        # Volume: use last 20 sessions for average (up to 20 available)
+        vol_series = hist["Volume"].dropna()
+        vol_today = float(last["Volume"]) if "Volume" in hist.columns else 0.0
+        avg_vol_20d = float(vol_series.tail(20).mean()) if len(vol_series) >= 2 else 0.0
         return {
             "open": float(last["Open"]),
             "close": float(last["Close"]),
@@ -248,9 +310,56 @@ def _yf_quote(ticker: str) -> Optional[Dict[str, Any]]:
                 float(last["Close"]) >= float(hist["Close"].tail(50).mean())
                 if len(hist) >= 50 else None
             ),
+            "volume_today": vol_today,
+            "avg_volume_20d": avg_vol_20d,
         }
     except Exception as e:
         logger.debug("yf_quote(%s) failed: %s", ticker, e)
+        return None
+
+
+def _alpaca_live_price(ticker: str) -> Optional[float]:
+    """Fetch a live price for pre-market use via Alpaca IEX free feed.
+
+    Tries latest trade first (last sale price); falls back to mid of latest
+    quote bid/ask. Returns None on any failure (no keys, pytest, network).
+    This is intentionally thin — callers treat None as "no live data".
+    """
+    if "PYTEST_CURRENT_TEST" in os.environ:
+        return None
+    try:
+        from alpaca.data.historical import StockHistoricalDataClient
+        from alpaca.data.requests import StockLatestTradeRequest, StockLatestQuoteRequest
+
+        key = (os.environ.get("ALPACA_API_KEY") or "").strip()
+        sec = (os.environ.get("ALPACA_SECRET_KEY") or "").strip()
+        if not key or not sec:
+            return None
+        client = StockHistoricalDataClient(key, sec)
+        # Try latest trade first
+        try:
+            resp = client.get_stock_latest_trade(StockLatestTradeRequest(symbol_or_symbols=ticker))
+            trade = resp.get(ticker) if isinstance(resp, dict) else None
+            if trade is not None:
+                price = float(getattr(trade, "price", 0) or 0)
+                if price > 0:
+                    return price
+        except Exception:
+            pass
+        # Fall back to mid of latest quote
+        try:
+            resp = client.get_stock_latest_quote(StockLatestQuoteRequest(symbol_or_symbols=ticker))
+            quote = resp.get(ticker) if isinstance(resp, dict) else None
+            if quote is not None:
+                bid = float(getattr(quote, "bid_price", 0) or 0)
+                ask = float(getattr(quote, "ask_price", 0) or 0)
+                if bid > 0 and ask > 0:
+                    return (bid + ask) / 2.0
+        except Exception:
+            pass
+        return None
+    except Exception:
+        logger.debug("_alpaca_live_price(%s) failed", ticker, exc_info=True)
         return None
 
 
@@ -280,6 +389,45 @@ def _market_disqualifiers() -> Dict[str, Any]:
     return out
 
 
+def _is_pre_market_window() -> bool:
+    """Return True when the US market is closed AND we are before next open (pre-market window).
+
+    Uses the Alpaca market clock. Returns False on any error or when under
+    pytest (so regular-hours test paths are unaffected).
+    """
+    if "PYTEST_CURRENT_TEST" in os.environ:
+        return False
+    try:
+        from tradingagents.integrations.alpaca.executor import market_clock
+        clk = market_clock()
+        if clk is None:
+            return False
+        if clk.get("is_open"):
+            return False
+        # Market is closed. We are "pre-market" if current UTC time is before next_open.
+        next_open_str = clk.get("next_open") or ""
+        if not next_open_str:
+            return False
+        # next_open is an ISO string; parse it.
+        try:
+            if next_open_str.endswith("Z"):
+                next_open_str = next_open_str[:-1] + "+00:00"
+            next_open_dt = datetime.fromisoformat(next_open_str)
+            if next_open_dt.tzinfo is None:
+                next_open_dt = next_open_dt.replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            return False
+        now_utc = datetime.now(timezone.utc)
+        return now_utc < next_open_dt
+    except Exception:
+        return False
+
+
+# RVOL gate thresholds (Section 4.2 / roadmap R4).
+_RVOL_MIN_MULTIPLE = 2.0     # day volume must be >= 2x 20d average
+_RVOL_MIN_DOLLAR_VOL = 5_000_000.0  # day dollar volume must be >= $5M
+
+
 def scan_for_ep_candidates(
     cfg: Dict[str, Any],
     *,
@@ -287,12 +435,23 @@ def scan_for_ep_candidates(
     news_limit: int = 200,
     max_candidates: int = 25,
     post_close: bool = False,
+    _market_clock_override: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Run the full pre-filter pipeline. Returns a dict suitable for PM context.
 
     When ``post_close`` is True, an additional gate requires that the
     close held above the 10% gap level (Section 5.2) — used by the
     post-close recommendation scan at 16:15 ET.
+
+    Pre-market honesty: when called during the pre-market window (market closed,
+    before next open), prices come from the Alpaca IEX latest trade/quote rather
+    than yfinance daily bars (which would show yesterday's stale close). If no
+    live Alpaca price is available for a ticker during pre-market, that ticker
+    is skipped. If Alpaca is entirely unreachable the scan is aborted early with
+    a single log line so the caller does not act on stale data.
+
+    ``_market_clock_override`` is a test seam: pass a dict matching the
+    market_clock() return shape to inject a synthetic clock state.
 
     Output:
         {
@@ -306,6 +465,51 @@ def scan_for_ep_candidates(
           "skipped": [{ticker, reason}, ...],
         }
     """
+    # --- Pre-market honesty check ---
+    # Determine whether we are in the pre-market window (closed, before next open).
+    in_pre_market = False
+    if _market_clock_override is not None:
+        clk = _market_clock_override
+        if not clk.get("is_open", True):
+            next_open_str = clk.get("next_open") or ""
+            if next_open_str:
+                try:
+                    if next_open_str.endswith("Z"):
+                        next_open_str = next_open_str[:-1] + "+00:00"
+                    next_open_dt = datetime.fromisoformat(next_open_str)
+                    if next_open_dt.tzinfo is None:
+                        next_open_dt = next_open_dt.replace(tzinfo=timezone.utc)
+                    in_pre_market = datetime.now(timezone.utc) < next_open_dt
+                except (ValueError, TypeError):
+                    pass
+    else:
+        in_pre_market = _is_pre_market_window()
+
+    # Pre-market scan abort: if we are in pre-market but Alpaca keys are absent
+    # (meaning _alpaca_live_price will always return None), skip the whole scan
+    # rather than silently scanning on stale yfinance daily closes.
+    if in_pre_market and "PYTEST_CURRENT_TEST" not in os.environ:
+        has_alpaca_keys = bool(
+            (os.environ.get("ALPACA_API_KEY") or "").strip()
+            and (os.environ.get("ALPACA_SECRET_KEY") or "").strip()
+        )
+        if not has_alpaca_keys:
+            logger.info(
+                "pre-market scan skipped: no live quote source (ALPACA_API_KEY / ALPACA_SECRET_KEY absent)"
+            )
+            return {
+                "scanned_at": datetime.now(timezone.utc).isoformat(),
+                "scan_mode": "pre_market",
+                "skipped_reason": "pre-market scan skipped: no live quote source",
+                "news_items": 0,
+                "ticker_hits": 0,
+                "hint_summary": {},
+                "market": {"spy_pct": None, "vix": None, "blocked": False, "reason": ""},
+                "candidates": [],
+                "skipped": [],
+                "gate_log": [],
+            }
+
     today = date.today()
     news_sources = cfg.get("ep_scanner_news_sources") or ["alpha_vantage"]
     if isinstance(news_sources, str):
@@ -350,6 +554,27 @@ def scan_for_ep_candidates(
             gate_log.append(gate)
             skipped.append({"ticker": tk, "reason": "no price data"})
             continue
+
+        # Pre-market honesty: replace yfinance close (stale yesterday's close) with
+        # Alpaca live price when the market is closed and we are before next open.
+        # If the live price is unavailable, skip this ticker rather than scanning
+        # on stale data that would produce misleading gap readings.
+        if in_pre_market:
+            live_px = _alpaca_live_price(tk)
+            if live_px is None:
+                gate["failed_at"] = "pre_market_no_live_price"
+                gate_log.append(gate)
+                skipped.append({
+                    "ticker": tk,
+                    "reason": "pre-market: no live Alpaca price available; skipping stale yfinance close",
+                })
+                continue
+            # Use live price as the "close" and "open" approximation for gap computation.
+            q = dict(q)
+            q["close"] = live_px
+            q["open"] = live_px
+            gate["pre_market_live_px"] = round(live_px, 2)
+
         gate["close"] = round(q["close"], 2)
         gate["open"] = round(q["open"], 2)
         gate["prev_close"] = round(q["prev_close"], 2)
@@ -377,6 +602,40 @@ def scan_for_ep_candidates(
                 "reason": f"gap {gap_pct:.1f}% / move {recent_move_pct:.1f}% < {_MIN_GAP_PCT}% (Section 4.1)",
             })
             continue
+        # Gate 4.5: RVOL gate (Section 4.2 / EP SOP volume condition).
+        # Day volume must be >= 2x 20d average AND day dollar volume >= $5M.
+        # Confirms institutional participation, not retail noise.
+        # Evaluated here (same location as gap gate) with full pass/fail logging.
+        vol_today = float(q.get("volume_today") or 0.0)
+        avg_vol_20d = float(q.get("avg_volume_20d") or 0.0)
+        rvol = (vol_today / avg_vol_20d) if avg_vol_20d > 0 else 0.0
+        # Dollar volume = today's volume × close price.
+        dollar_vol = vol_today * q["close"]
+        gate["rvol"] = round(rvol, 2)
+        gate["vol_today"] = int(vol_today)
+        gate["avg_vol_20d"] = int(avg_vol_20d)
+        gate["dollar_vol"] = round(dollar_vol, 0)
+        rvol_pass = (rvol >= _RVOL_MIN_MULTIPLE) and (dollar_vol >= _RVOL_MIN_DOLLAR_VOL)
+        if not rvol_pass:
+            reason_parts = []
+            if rvol < _RVOL_MIN_MULTIPLE:
+                reason_parts.append(
+                    f"RVOL {rvol:.1f}x < {_RVOL_MIN_MULTIPLE:.0f}x 20d avg "
+                    f"(vol {int(vol_today):,} vs avg {int(avg_vol_20d):,})"
+                )
+            if dollar_vol < _RVOL_MIN_DOLLAR_VOL:
+                reason_parts.append(
+                    f"dollar vol ${dollar_vol/1e6:.1f}M < ${_RVOL_MIN_DOLLAR_VOL/1e6:.0f}M"
+                )
+            gate["failed_at"] = "rvol"
+            gate["rvol_pass"] = False
+            gate_log.append(gate)
+            skipped.append({
+                "ticker": tk,
+                "reason": "RVOL gate fail: " + "; ".join(reason_parts) + " (Section 4.2)",
+            })
+            continue
+        gate["rvol_pass"] = True
         # Gate 5: extended-run check (Section 10).
         if q.get("close_10d_ago"):
             run10 = (q["close"] / q["close_10d_ago"] - 1.0) * 100.0
@@ -417,6 +676,8 @@ def scan_for_ep_candidates(
             "gap_pct": round(gap_pct, 2),
             "today_move_pct": round(recent_move_pct, 2),
             "above_50dma": q.get("above_50dma"),
+            "rvol": round(rvol, 2),
+            "dollar_vol_m": round(dollar_vol / 1e6, 2),
         })
         if len(candidates) >= max_candidates:
             break
