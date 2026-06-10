@@ -173,9 +173,11 @@ def add(
     # Push a clean, executable ticket to the human ONLY when this is genuinely
     # new or materially changed — so a rule that re-fires every cycle (same side,
     # same size) doesn't re-spam. Action-only: no proposal, no message.
+    # In autonomous (alpaca) mode the executor + PM note already announce the
+    # trade; the full ticket is redundant FYI. Opt back in per-cfg if needed.
     if _proposal_is_new_or_changed(prior, entry) and bool(
         cfg.get("portfolio_advisor_action_tickets", True)
-    ):
+    ) and _should_send_action_ticket_for_mode(cfg):
         _send_action_ticket(cfg, entry)
     # Mirror onto the Alpaca PAPER book — only a genuinely NEW proposal trades;
     # a superseding restatement of an open proposal must not double the position.
@@ -211,6 +213,29 @@ def add(
         except Exception:
             pass
     return entry
+
+
+def _should_send_action_ticket_for_mode(cfg: Dict[str, Any]) -> bool:
+    """Return False in autonomous (alpaca) mode unless explicitly opted in.
+
+    The executor + PM push_note already announce every autonomous trade; the
+    full action ticket (staged-entry instructions, exit rules, etc.) is redundant
+    FYI noise for the human in that mode. eToro advisory mode MUST keep sending
+    tickets — there the human executes them manually.
+
+    Set cfg portfolio_advisor_action_tickets_autonomous=True to re-enable tickets
+    in alpaca mode (e.g. during initial setup or for auditing).
+
+    Any error reading the account mode defaults to sending (safe eToro behavior).
+    """
+    try:
+        from tradingagents.portfolio_advisor.etoro_scan import account_mode
+        mode = account_mode()
+    except Exception:
+        return True  # default to sending on any error
+    if mode == "alpaca":
+        return bool(cfg.get("portfolio_advisor_action_tickets_autonomous", False))
+    return True
 
 
 def _proposal_is_new_or_changed(prior: Optional[Dict[str, Any]], entry: Dict[str, Any]) -> bool:

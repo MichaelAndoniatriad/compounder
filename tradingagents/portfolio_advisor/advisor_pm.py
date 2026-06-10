@@ -123,8 +123,16 @@ your messages on a phone. You text like a friend — not a robot, not a report.
 - Never say a ticker "must" be cut by a date or "should" be trimmed by X% unless the human told you so.
 - Pending jobs in the queue are SCHEDULED research jobs. They do not mean the ticker lacks
   analysis. Do not frame a future scheduled job as "urgently awaiting thesis results."
-- Only flag urgency (push_note) when: (a) a stance materially changed since your last cycle,
-  (b) a catalyst is within 48h, or (c) the human explicitly asked for something and it hasn't run.
+- DEFAULT TO SILENCE: set push_note to "" unless at least one of: (a) a trade executed or
+  was proposed this cycle, (b) a risk trigger fired or a stop is close, (c) you need an
+  answer from the human, (d) this is the first cycle of the day (one short morning digest
+  is welcome). When in doubt, stay quiet — the human can ask anytime on Telegram and you
+  will answer with full detail. That is the contract: you stay quiet, they ask.
+- Never restate a trade the execution notice already announced — add only what is NEW (the
+  fill confirmation, the next decision point). Restating the same ticker + action the human
+  was already notified about is noise, not signal.
+- Never re-list unchanged positions or cash in push_note. The human can ask you anytime on
+  Telegram and you will answer with full detail. Silence IS the update when nothing changed.
 - If you recommend closing or trimming, name the exact ticker, share count, and dollar value
   from the portfolio snapshot. Don't say "reduce exposure" without naming the position.
 
@@ -1873,6 +1881,80 @@ def _broad_move_block(cfg: Dict[str, Any], portfolio_rows: List[Dict[str, Any]])
         return ""
 
 
+def _pm_note_throttled(cfg: Dict[str, Any], note: str) -> bool:
+    """Return True when the PM push_note should be suppressed (throttled).
+
+    Suppresses when ALL of the following hold:
+    1. No row in alpaca_trades.jsonl has status=="submitted" within the last 15 min
+       (i.e. no trade was just executed that warrants an announcement).
+    2. The note contains no "?" (PM is not asking the human a question).
+    3. The previous PM note was sent within portfolio_advisor_pm_note_min_gap_minutes
+       (tracked as last_pm_note_iso in pa_state).
+
+    Any file-read error defaults to NOT suppressing (safe default: send).
+    """
+    # Condition 2: note contains a question — never suppress
+    if "?" in (note or ""):
+        return False
+
+    # Condition 1: recent submitted trade in alpaca_trades.jsonl
+    try:
+        ledger_path = state.advisor_dir(cfg) / "alpaca_trades.jsonl"
+        if ledger_path.is_file():
+            now_utc = datetime.now(timezone.utc)
+            cutoff = now_utc - timedelta(minutes=15)
+            text = ledger_path.read_text(encoding="utf-8")
+            for raw_line in text.splitlines():
+                raw_line = raw_line.strip()
+                if not raw_line:
+                    continue
+                try:
+                    row = json.loads(raw_line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                if str(row.get("status", "")).strip().lower() != "submitted":
+                    continue
+                ts_raw = str(row.get("ts") or "").strip()
+                if not ts_raw:
+                    continue
+                try:
+                    ts_dt = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+                    if ts_dt.tzinfo is None:
+                        ts_dt = ts_dt.replace(tzinfo=timezone.utc)
+                    if ts_dt >= cutoff:
+                        return False  # recent trade — don't throttle
+                except (ValueError, TypeError):
+                    continue
+    except Exception:
+        return False  # safe default: send on any error
+
+    # Condition 3: gap since last PM note
+    try:
+        gap_minutes = int(cfg.get("portfolio_advisor_pm_note_min_gap_minutes", 60) or 60)
+    except (TypeError, ValueError):
+        gap_minutes = 60
+    if gap_minutes <= 0:
+        return False  # throttling disabled
+
+    try:
+        st = state.load_state(cfg)
+        last_iso = st.get("last_pm_note_iso")
+        if not last_iso:
+            return False  # no prior note recorded — don't suppress the first one
+        last_dt = datetime.fromisoformat(str(last_iso).replace("Z", "+00:00"))
+        if last_dt.tzinfo is None:
+            last_dt = last_dt.replace(tzinfo=timezone.utc)
+        elapsed_minutes = (datetime.now(timezone.utc) - last_dt).total_seconds() / 60.0
+        if elapsed_minutes < gap_minutes:
+            return True  # within gap — suppress
+    except Exception:
+        return False  # safe default: send on any error
+
+    return False
+
+
 def run_pm_cycle(
     cfg: Dict[str, Any],
     *,
@@ -2421,11 +2503,34 @@ the trigger, say that plainly and use append_jobs to send a new research layer t
 
     # Push note — only when it is not already included in the consolidated action alert.
     # push_note is the PM's own urgency signal and bypasses quiet hours.
+    # ntfy_question cycles are never throttled — the note IS the reply to the human's question.
     note = (result.push_note or "").strip()
     if note and not action_alert_sent and trigger_s != "ntfy_question":
         try:
             from tradingagents.portfolio_advisor import messaging
-            messaging.send_advisor_message(cfg, "PM", note, urgent=True)
+            if _pm_note_throttled(cfg, note):
+                logger.info("PM push_note throttled (no recent trade, no question, within gap): %s", note[:120])
+                messaging.append_message_record(
+                    cfg,
+                    subject="PM",
+                    body=note,
+                    webhook_ok=False,
+                    telegram_ok=False,
+                    smtp_ok=False,
+                    webhook_attempted=False,
+                    telegram_attempted=False,
+                    smtp_attempted=False,
+                    suppressed_duplicate=False,
+                )
+            else:
+                messaging.send_advisor_message(cfg, "PM", note, urgent=True)
+                # Track send time for gap throttle
+                try:
+                    st_now = state.load_state(cfg)
+                    st_now["last_pm_note_iso"] = datetime.now(timezone.utc).isoformat()
+                    state.save_state(cfg, st_now)
+                except Exception:
+                    pass
         except Exception as e:
             logger.debug("push_note send failed: %s", e)
 

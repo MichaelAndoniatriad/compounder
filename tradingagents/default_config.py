@@ -171,6 +171,13 @@ DEFAULT_CONFIG = _apply_env_overrides({
     "portfolio_advisor_pm_skip_if_all_hold": True,
     # Research older than this is considered stale for PM action stances unless refreshed.
     "portfolio_advisor_pm_evidence_stale_days": 30,
+    # In autonomous (alpaca) mode the executor already announces every trade; the full
+    # action ticket is redundant. Set True to re-enable tickets in alpaca mode anyway.
+    "portfolio_advisor_action_tickets_autonomous": False,
+    # Minimum gap (minutes) between PM push_notes in autonomous mode. Notes are suppressed
+    # when no trade was submitted recently, no "?" in the note, and last note was within
+    # this window. Set 0 to disable throttling.
+    "portfolio_advisor_pm_note_min_gap_minutes": 60,
     # When monthly lookout promotes a candidate, ask the PM council to compare it with current holdings.
     "portfolio_advisor_pm_candidate_comparison": True,
     # Best-effort yfinance enrichment for candidate liquidity gates when avg_daily_volume is not supplied.
