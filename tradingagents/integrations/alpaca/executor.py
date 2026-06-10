@@ -337,6 +337,78 @@ def close_for_watchdog(cfg: Dict[str, Any], ticker: str, fraction: float, rule: 
         return None
 
 
+def _latest_buys_from_ledger(cfg: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """ticker → most recent submitted buy/add row from alpaca_trades.jsonl."""
+    out: Dict[str, Dict[str, Any]] = {}
+    p = _ledger_path(cfg)
+    if not p.is_file():
+        return out
+    for line in p.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if row.get("status") == "submitted" and str(row.get("action") or "").lower() in ("buy", "add"):
+            tk = str(row.get("ticker") or "").upper()
+            if tk:
+                out[tk] = row
+    return out
+
+
+def enforce_paper_exits(cfg: Dict[str, Any]) -> int:
+    """Deterministic exits for paper positions the eToro watchdog can NOT see.
+
+    The watchdog computes triggers from the LIVE ETORO BOOK, so a paper position
+    for a name the human never bought on eToro would otherwise have no stop
+    enforcement at all. This applies the sleeve rules (recorded at buy time in
+    the ledger) directly to the Alpaca book every watchdog tick:
+      catalyst: close at ≤ -8% unrealized, or past max-hold days (default 30)
+      core:     close at ≤ -40% unrealized
+    Trailing stops and pre-earnings trims stay watchdog/PM-driven — this is the
+    hard floor only. Idempotent; never raises. Returns positions closed.
+    """
+    if not enabled(cfg):
+        return 0
+    try:
+        client = _client()
+        positions = client.get_all_positions()
+        if not positions:
+            return 0
+        buys = _latest_buys_from_ledger(cfg)
+        max_hold = int(cfg.get("portfolio_advisor_catalyst_max_hold_days", 30) or 30)
+        now = datetime.now(timezone.utc)
+        closed = 0
+        for pos in positions:
+            tk = str(pos.symbol).upper()
+            try:
+                plpc = float(pos.unrealized_plpc or 0)
+            except (TypeError, ValueError):
+                continue
+            buy = buys.get(tk, {})
+            sleeve = str(buy.get("sleeve") or "core").lower()
+            rule = None
+            if sleeve == "catalyst":
+                if plpc <= -0.08:
+                    rule = "paper_catalyst_hard_stop_-8pct"
+                else:
+                    try:
+                        opened = datetime.fromisoformat(str(buy.get("ts") or "").replace("Z", "+00:00"))
+                        if (now - opened).days >= max_hold:
+                            rule = f"paper_catalyst_max_hold_{max_hold}d"
+                    except (TypeError, ValueError):
+                        pass
+            elif plpc <= -0.40:
+                rule = "paper_core_hard_stop_-40pct"
+            if rule and close_for_watchdog(cfg, tk, 1.0, rule):
+                closed += 1
+        return closed
+    except Exception:
+        logger.debug("enforce_paper_exits skipped", exc_info=True)
+        return 0
+
+
 def build_scoreboard_block(cfg: Dict[str, Any]) -> str:
     """Compact paper-book-vs-SPY block for the weekly digest and PM prompt.
     Empty string when disabled or unreachable."""

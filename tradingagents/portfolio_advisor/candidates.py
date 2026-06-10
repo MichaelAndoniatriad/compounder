@@ -341,6 +341,35 @@ def shadow_book_path(cfg: Dict[str, Any]) -> Path:
     return state.advisor_dir(cfg) / "shadow_book.jsonl"
 
 
+def _shadow_state(path: Path) -> tuple:
+    """Replay the append-only ledger into (open_positions, closes).
+
+    A ticker is open iff its latest event is an 'open' row — a later 'close'
+    row closes it (rows are appended in time order). Returns
+    ({ticker: open_row}, [close_rows]).
+    """
+    opens: Dict[str, Dict[str, Any]] = {}
+    closes: List[Dict[str, Any]] = []
+    if not path.is_file():
+        return opens, closes
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        tk = str(row.get("ticker") or "").upper()
+        if not tk:
+            continue
+        if row.get("side") == "open":
+            opens[tk] = row
+        elif row.get("side") == "close":
+            opens.pop(tk, None)
+            closes.append(row)
+    return opens, closes
+
+
 def _mirror_gate_passers_to_shadow_book(cfg: Dict[str, Any], rows: List[CandidateRecord]) -> None:
     """§6.2 Compounder 2.0 shadow book: open a small paper position for every candidate
     that cleared the hard gates (status != 'rejected'). Equal-notional sizing so no
@@ -364,17 +393,8 @@ def _mirror_gate_passers_to_shadow_book(cfg: Dict[str, Any], rows: List[Candidat
     # Load existing shadow positions to avoid duplicates
     path = shadow_book_path(cfg)
     path.parent.mkdir(parents=True, exist_ok=True)
-    open_tickers: set = set()
-    if path.is_file():
-        for line in path.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            try:
-                row = json.loads(line)
-                if row.get("side") == "open" and not row.get("closed_at"):
-                    open_tickers.add(str(row.get("ticker") or "").upper())
-            except (json.JSONDecodeError, ValueError):
-                continue
+    open_positions, _ = _shadow_state(path)
+    open_tickers = set(open_positions)
 
     now_iso = datetime.now(timezone.utc).isoformat()
     new_entries = []
@@ -431,23 +451,9 @@ def close_shadow_position(cfg: Dict[str, Any], ticker: str, reason: str = "") ->
     Returns the outcome dict or None if no open position found.
     """
     path = shadow_book_path(cfg)
-    if not path.is_file():
-        return None
-
     tk = ticker.strip().upper()
-    lines = path.read_text(encoding="utf-8").splitlines()
-    open_pos: Optional[Dict[str, Any]] = None
-    for line in reversed(lines):
-        if not line.strip():
-            continue
-        try:
-            row = json.loads(line)
-            if row.get("ticker") == tk and row.get("side") == "open" and not row.get("closed_at"):
-                open_pos = row
-                break
-        except (json.JSONDecodeError, ValueError):
-            continue
-
+    open_positions, _ = _shadow_state(path)
+    open_pos = open_positions.get(tk)
     if open_pos is None:
         return None
 
@@ -496,24 +502,37 @@ def close_shadow_position(cfg: Dict[str, Any], ticker: str, reason: str = "") ->
     return outcome
 
 
+def close_due_shadow_positions(cfg: Dict[str, Any], max_hold_days: Optional[int] = None) -> int:
+    """Time-stop: close every open shadow position past its hold horizon.
+
+    The shadow book measures the PIPELINE at a fixed horizon (default 30d,
+    config portfolio_advisor_shadow_hold_days) — without this, positions never
+    resolve and the book produces zero outcomes. Run from the weekly check.
+    Returns the number of positions closed.
+    """
+    days = int(max_hold_days or cfg.get("portfolio_advisor_shadow_hold_days", 30) or 30)
+    open_positions, _ = _shadow_state(shadow_book_path(cfg))
+    if not open_positions:
+        return 0
+    now = datetime.now(timezone.utc)
+    n = 0
+    for tk, row in open_positions.items():
+        try:
+            opened = datetime.fromisoformat(str(row.get("ts") or "").replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            continue
+        if (now - opened).days >= days:
+            if close_shadow_position(cfg, tk, reason=f"time-stop {days}d") is not None:
+                n += 1
+    return n
+
+
 def shadow_book_summary(cfg: Dict[str, Any]) -> str:
     """Compact text block for the weekly digest: shadow book P&L vs QQQ."""
     path = shadow_book_path(cfg)
     if not path.is_file():
         return ""
-    opens: Dict[str, Dict[str, Any]] = {}
-    closes: List[Dict[str, Any]] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        try:
-            row = json.loads(line)
-        except (json.JSONDecodeError, ValueError):
-            continue
-        if row.get("side") == "open" and not row.get("closed_at"):
-            opens[str(row.get("ticker") or "")] = row
-        elif row.get("side") == "close":
-            closes.append(row)
+    opens, closes = _shadow_state(path)
 
     lines = ["--- Shadow book (pipeline gate-passers, not PM picks) ---"]
     if closes:

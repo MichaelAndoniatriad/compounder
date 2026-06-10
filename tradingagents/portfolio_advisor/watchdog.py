@@ -313,6 +313,17 @@ def run_watchdog(cfg: Dict[str, Any], *, ignore_market_hours: bool = False, supp
         logger.info("watchdog skipped (outside US equity watch window UTC)")
         return 0
 
+    # Paper-book hard floor — runs EVERY tick, before any eToro-dependent early
+    # return: positions held only on Alpaca (advice the human didn't take on
+    # eToro) are invisible to the eToro trigger logic below, so their -8%/-40%
+    # stops are enforced directly from Alpaca's own P&L here.
+    try:
+        from tradingagents.integrations.alpaca import executor as _alpaca_exec
+
+        _alpaca_exec.enforce_paper_exits(cfg)
+    except Exception:
+        logger.debug("paper exit enforcement skipped", exc_info=True)
+
     rows: List[Dict[str, Any]] = []
     try:
         _payload, _text, _tickers, rows = etoro_scan.fetch_portfolio_rows()

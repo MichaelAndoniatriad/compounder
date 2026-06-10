@@ -147,6 +147,11 @@ def load_measured(cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
     return [r for r in rows if r.get("was_correct") is not None]
 
 
+def load_all(cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Return every recommendation entry regardless of status (public wrapper)."""
+    return _load_all(cfg)
+
+
 def load_due_for_measurement(
     cfg: Dict[str, Any],
     *,

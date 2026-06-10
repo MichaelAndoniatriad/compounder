@@ -173,8 +173,14 @@ def run_weekly_quick_check(cfg: Dict[str, Any]) -> Tuple[str, bool, Set[str]]:
         logger.debug("alpaca scoreboard block skipped", exc_info=True)
 
     try:
-        from tradingagents.portfolio_advisor.candidates import shadow_book_summary
+        from tradingagents.portfolio_advisor.candidates import (
+            close_due_shadow_positions,
+            shadow_book_summary,
+        )
 
+        closed_n = close_due_shadow_positions(cfg)
+        if closed_n:
+            logger.info("weekly check: closed %d shadow positions at time-stop", closed_n)
         shadow_block = shadow_book_summary(cfg)
         if shadow_block:
             lines.extend(["", shadow_block])

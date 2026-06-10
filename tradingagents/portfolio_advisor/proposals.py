@@ -117,6 +117,7 @@ def add(
     sleeve: Optional[str] = None,
     reason: str = "",
     catalyst_date: str = "",
+    confidence: float = 0.0,
 ) -> Dict[str, Any]:
     """Record a proposal, superseding any existing OPEN proposal for the same
     ticker+side.
@@ -154,6 +155,8 @@ def add(
         "sleeve": (str(sleeve).strip().lower() or None) if sleeve else None,
         "catalyst_date": (catalyst_date or "").strip() or None,
         "reason": (reason or "").strip()[:500],
+        # 0.0 means "not stated" — the paper executor sizes mid-range for it.
+        "confidence": float(confidence) if confidence else None,
         "status": "proposed",
     }
     rows.append(entry)

@@ -266,6 +266,7 @@ def build_pm_tools(cfg: Dict[str, Any], live_tickers: set) -> List[Any]:
         sleeve: str = "",
         reason: str = "",
         catalyst_date: str = "",
+        confidence: float = 0.0,
     ) -> str:
         """Log a PROPOSED trade for the human to review and execute manually on eToro.
 
@@ -278,6 +279,12 @@ def build_pm_tools(cfg: Dict[str, Any], live_tickers: set) -> List[Any]:
         or event date) — it drives the concrete exit day on the ticket (exit
         time_stop_days after it). Omit it for core names. target_price = your
         intended entry; it lets the ticket print exact stop / +100% / -40% levels.
+
+        confidence (0.5–1.0) is your honest conviction in this trade. It drives
+        the PAPER book's position size (0.5 → smallest, 0.9+ → largest), so your
+        stated conviction is measured against outcomes — miscalibration shows up
+        as paper P&L. Be honest, not uniformly high: your calibration record is
+        injected into future cycles.
 
         reason is REQUIRED — explain WHY (what changed, the catalyst, the rule that
         fired, the thesis read). A proposal with no reason is rejected. For a held
@@ -324,6 +331,7 @@ def build_pm_tools(cfg: Dict[str, Any], live_tickers: set) -> List[Any]:
                 sleeve=sleeve,
                 reason=reason_clean,
                 catalyst_date=catalyst_date,
+                confidence=confidence,
             )
             # Mirror the decision + WHY into the position plan's history so the
             # rationale travels with the holding (held names; new buys stay in
