@@ -104,9 +104,35 @@ Both share the same `paper_portfolio.py` plumbing (second state file). The diver
 - **Weekly scoreboard message** (Sat, with existing weekly cron): both books vs QQQ since start, hit rate, alpha, open positions, calibration line. This is the human's entire time cost.
 
 ### 6.4 Kill criterion (written now, before the test — non-negotiable)
-> **At 30 resolved recommendations or 6 months (whichever first): if advisor-book alpha vs QQQ ≤ 0, the discovery pipeline gets redesigned, not patched.** If shadow-book alpha > 0 but advisor-book ≤ 0, the PM layer is the problem and gets redesigned instead.
+> **At 30 resolved recommendations or 6 months (whichever first): if mean per-recommendation call-alpha ≤ 0 (and/or <50% of calls alpha-positive), the discovery pipeline gets redesigned, not patched.** If shadow-book call-alpha > 0 but advisor call-alpha ≤ 0, the PM layer is the problem and gets redesigned instead.
 
 No moving the goalposts after the fact. The criterion lives here so it can't be quietly forgotten.
+
+### 6.5 Structural divergence between the books (known, accepted)
+The paper book executes EVERY recommendation; the human executes some. The PM's
+advice is conditioned on the ETORO book (its sleeves, cash, holdings) — so as the
+books drift apart, paper-book *portfolio-level* metrics (sleeve mix, concentration,
+equity curve) increasingly reflect eToro-conditioned advice applied to a different
+portfolio. This is accepted, not fixed, because the metric hierarchy makes it harmless:
+
+1. **Primary: per-recommendation call-alpha** (recommendation_log → outcome_tracker).
+   Each call is measured independently — ticker return vs QQQ over the call's own
+   horizon, sign-flipped for sell/trim calls. Immune to book divergence. This drives
+   the kill criterion, the calibration block, and rule flagging.
+2. **Secondary: Alpaca equity curve vs SPY.** Directional color on "advice followed
+   literally," confounded by the conditioning mismatch — never the deciding metric.
+3. **Tertiary: human_override_analysis.** eToro-vs-paper divergence is itself the
+   measurement of whether the human's filter adds value.
+
+Paper-only positions (advice the human didn't take) get hard-floor exits only
+(catalyst −8%/max-hold, core −40% via enforce_paper_exits) — cruder than the
+watchdog/PM management eToro names get. Acceptable for the same reason: those
+positions inform metric 2, not metric 1.
+
+Possible Phase-3 upgrade (NOT now): a separate autonomous PM pass that manages the
+Alpaca book as a first-class portfolio (own sleeve targets, own cash logic). That
+answers a different question — "can the system run a portfolio end-to-end?" — and
+only becomes worth asking if metric 1 survives the kill criterion.
 
 ## 7. Success metrics
 

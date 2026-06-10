@@ -178,20 +178,28 @@ def compute_recommendation_outcomes(
 
             return_pct = (end_price - start_price) / start_price
 
+            # Direction: a SELL/TRIM call is correct when the stock subsequently
+            # UNDERPERFORMS the benchmark — score the CALL, not the stock.
+            action = str(rec.get("action") or "").lower()
+            is_reduce = any(k in action for k in ("sell", "trim", "exit", "close", "reduce"))
+
             # §5.2 Compounder 2.0: alpha-relative classification
             qqq_return = _fetch_qqq_return(start_date, end_date)
             if qqq_return is not None:
                 alpha = return_pct - qqq_return
-                classification = classify_outcome(alpha)
+                call_alpha = -alpha if is_reduce else alpha
+                classification = classify_outcome(call_alpha)
             else:
                 # Fallback to absolute if QQQ fetch fails — log it so we notice
                 logger.warning("outcome tracker: QQQ benchmark unavailable for %s [%s, %s]; "
                                "falling back to absolute return", ticker, start_date, end_date)
                 alpha = None
+                call_alpha = None
+                signed = -return_pct if is_reduce else return_pct
                 # Absolute fallback: ±5% (old thresholds)
-                if return_pct >= 0.05:
+                if signed >= 0.05:
                     classification = "good"
-                elif return_pct <= -0.05:
+                elif signed <= -0.05:
                     classification = "bad"
                 else:
                     classification = "neutral"
@@ -207,6 +215,9 @@ def compute_recommendation_outcomes(
                 "realised_return": round(return_pct, 4),
                 "qqq_return": round(qqq_return, 4) if qqq_return is not None else None,
                 "alpha_vs_qqq": round(alpha, 4) if alpha is not None else None,
+                "direction": "reduce" if is_reduce else "increase",
+                # call_alpha = direction-adjusted alpha of the CALL (what gets classified)
+                "call_alpha": round(call_alpha, 4) if call_alpha is not None else None,
                 "classification": classification,
                 "measured_at": datetime.now(timezone.utc).isoformat(),
                 "rule_ref": rec.get("rule_ref"),
@@ -234,13 +245,13 @@ def compute_recommendation_outcomes(
             except (TypeError, ValueError):
                 pnl_impact_est = None
 
-            alpha_str = f", alpha {alpha:+.2%}" if alpha is not None else ""
+            alpha_str = f", call-alpha {call_alpha:+.2%}" if call_alpha is not None else ""
             recommendation_log.update_outcome(
                 cfg,
                 rec.get("id"),
                 was_correct=was_correct,
                 pnl_impact_est=pnl_impact_est,
-                note=f"horizon {horizon}d return {return_pct:+.2%}{alpha_str} -> {classification}",
+                note=f"horizon {horizon}d return {return_pct:+.2%}{alpha_str} ({'reduce' if is_reduce else 'increase'}) -> {classification}",
             )
 
             summary["measured"] += 1
@@ -294,7 +305,8 @@ def rule_performance_summary(
         except (TypeError, ValueError):
             pass
         try:
-            alpha = row.get("alpha_vs_qqq")
+            # Prefer direction-adjusted call_alpha; fall back for pre-fix rows.
+            alpha = row.get("call_alpha", row.get("alpha_vs_qqq"))
             if alpha is not None:
                 rec["sum_alpha"] += float(alpha)
         except (TypeError, ValueError):
