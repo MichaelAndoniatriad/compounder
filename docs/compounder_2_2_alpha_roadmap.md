@@ -118,6 +118,23 @@ Deterministic sizing overlay enforced in code (never via LLM judgment). Two fail
 
 Suite: **816 tests + 93 subtests, all green**.
 
+### T2 ✅ 70130de — R-based catalyst sizing + PM veto gate — 2026-06-11
+
+Catalyst sleeve's alpha bounded by mechanical components; LLM judgment can only subtract via familiarity bias. Closed two systematic failure modes:
+
+| Component | Detail |
+|-----------|--------|
+| `executor._paper_buy` | Catalyst sleeve now R-based sizing: notional = equity × risk_pct / hard_stop_pct (1%/8% = 12.5× risk budget). Confidence and HC no longer affect size. Ledger rows gain `sizing_method: "r_based_1pct"` |
+| `_high_conviction_grant` | Denies with "core-sleeve only" when sleeve=="catalyst". HC tier has no meaning with a hard stop — size up, same stop = catalyst R-math already does that |
+| `proposals.add` | Scanner-sourced catalyst proposals (ep_scanner, pead_scanner) filed with `pm_veto_window_until = now + 45m`. NOT auto-executed. PM-originated proposals keep immediate path |
+| `execute_unvetoed_candidates` | New function in executor, called from enforce_paper_exits, fires proposals whose veto window expired un-vetoed (all guards re-checked live) |
+| `pm_tools.veto_candidate` | New PM tool: blocks scanner candidate within window. Writes shadow row (source=`pm_vetoed_<orig>`) for forward-return scoring |
+| `outcome_tracker.veto_scorecard` | New helper: vetoed vs executed cohort avg 30d returns + pm_veto_lift metric; wired into measure-outcomes CLI |
+| PM prompt | Veto contract stated: "execute automatically after N minutes unless you veto_candidate(ticker, reason). Veto only on disqualifying evidence — vetoes are scored" |
+| Tests | 26 new tests in `test_catalyst_r_sizing_and_veto.py`; 1 pre-existing test updated for R-sizing |
+
+Suite: **842 tests + 93 subtests, all green**.
+
 ---
 
 ## Explicitly rejected (do not build)
