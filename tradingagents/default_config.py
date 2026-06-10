@@ -18,6 +18,7 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_MAX_RISK_ROUNDS":      "max_risk_discuss_rounds",
     "TRADINGAGENTS_DEBATE_ENABLED":       "debate_enabled",
     "TRADINGAGENTS_RISK_DEBATE_ENABLED":  "risk_debate_enabled",
+    "TRADINGAGENTS_ACCOUNT_MODE":         "account_mode",
     "TRADINGAGENTS_CHECKPOINT_ENABLED":   "checkpoint_enabled",
     "TRADINGAGENTS_BENCHMARK_TICKER":     "benchmark_ticker",
     "TRADINGAGENTS_ANALYST_LLM":          "analyst_llm",
@@ -392,6 +393,13 @@ DEFAULT_CONFIG = _apply_env_overrides({
     # minimum viable graph (analysts → R&E → PM) once scoreboard data shows
     # debates don't improve alpha.
     "risk_debate_enabled": True,
+    # Which account the advisor manages. "etoro": advisory-only — human executes
+    # on eToro, paper book mirrors advice. "alpaca": AUTONOMOUS — the PM manages
+    # the Alpaca PAPER book as the first-class portfolio (snapshot, watchdog,
+    # sleeves all read Alpaca; proposals auto-execute there; Telegram messages
+    # are decision notices, not action requests). Real-money execution does not
+    # exist in either mode. Override with TRADINGAGENTS_ACCOUNT_MODE.
+    "account_mode": "etoro",
     # News / data fetching parameters
     # Increase for longer lookback strategies or to broaden macro coverage;
     # decrease to reduce token usage in agent prompts.

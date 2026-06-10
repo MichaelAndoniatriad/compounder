@@ -2080,10 +2080,15 @@ def run_pm_cycle(
         logger.debug("portfolio risk block failed: %s", e)
         portfolio_risk_blk = ""
 
-    # Paper portfolio — simulated returns from following PM advice.
+    # Paper portfolio — simulated returns from following PM advice. Redundant in
+    # autonomous mode, where the Alpaca book IS the live portfolio snapshot.
     try:
-        from tradingagents.portfolio_advisor.paper_portfolio import build_paper_portfolio_block
-        paper_blk = build_paper_portfolio_block(cfg)
+        from tradingagents.portfolio_advisor.etoro_scan import account_mode as _am
+        if _am() == "alpaca":
+            paper_blk = ""
+        else:
+            from tradingagents.portfolio_advisor.paper_portfolio import build_paper_portfolio_block
+            paper_blk = build_paper_portfolio_block(cfg)
     except Exception as e:
         logger.debug("paper portfolio block failed: %s", e)
         paper_blk = ""
@@ -2140,20 +2145,59 @@ def run_pm_cycle(
     # Show the model "manual" for chat too; keep trigger_s as "ntfy_question" so
     # post-processing gates (alert send, action-log sync mode) remain correct.
     trigger_label = "manual" if trigger_s == "ntfy_question" else trigger_s
-    prompt = f"""{claude_block}You are the portfolio manager for a research stack. Advisory only: no trade orders, no claims that trades executed.
+
+    # Autonomous mode (account_mode="alpaca"): the PM RUNS the Alpaca paper book;
+    # proposals execute automatically there and Telegram is informational. The
+    # advisory framing below would gaslight the model, so swap it wholesale.
+    try:
+        from tradingagents.portfolio_advisor.etoro_scan import account_mode as _acct_mode
+        _autonomous = _acct_mode() == "alpaca"
+    except Exception:
+        _autonomous = False
+    if _autonomous:
+        role_line = (
+            "You are the portfolio manager RUNNING a real-time PAPER portfolio on Alpaca, autonomously. "
+            "Your propose_trade calls EXECUTE on the paper book automatically — no human approval step. "
+            "No real money is ever involved."
+        )
+        authority_blk = (
+            "Authority: you own every paper-book decision end-to-end, inside the deterministic rules "
+            "(sleeve targets, stops, gates — enforced in code). The human trades their own eToro account "
+            "separately and only OBSERVES this book: your Telegram messages are decision notices — what you "
+            "did and why, your plan, the executions — never requests for action. Anywhere instructions below "
+            "say a proposal is 'for the human to execute on eToro', read instead: your proposal executes "
+            "automatically on the Alpaca paper book. Sizes you propose are in THIS book's dollars."
+        )
+        snapshot_blk = (
+            "The portfolio snapshot below is fetched live from your Alpaca paper account on every PM cycle — "
+            "it is always current as of this run, including your own past executions."
+        )
+    else:
+        role_line = (
+            "You are the portfolio manager for a research stack. Advisory only: no trade orders, "
+            "no claims that trades executed."
+        )
+        authority_blk = (
+            "Authority: the human controls the real portfolio and every execution decision. LangGraph and "
+            "lighter single-model passes are research tools — treat their outputs as inputs, not as orders or fills."
+        )
+        snapshot_blk = (
+            "The portfolio snapshot below is fetched live from eToro on every PM cycle — it is always current as of this run.\n"
+            'If the human asks you to "refresh" or "check eToro", you already have done so: the snapshot above is the result.\n'
+            "If a position the human says they closed still appears in the snapshot, tell them it still shows open in eToro's\n"
+            "live data (likely an eToro API lag) — do not say you cannot refresh or that you need a sync."
+        )
+    prompt = f"""{claude_block}{role_line}
 
 Today's date (UTC): {today_utc}
 
-Authority: the human controls the real portfolio and every execution decision. LangGraph and lighter single-model passes are research tools — treat their outputs as inputs, not as orders or fills.
+{authority_blk}
 
 For direct human questions, answer from the live portfolio snapshot, latest completed evidence, pending jobs,
 and the explicit question only. Do not echo prior PM prose or repeated old notifications. If old memory conflicts
 with the live snapshot or latest evidence, say what changed and prefer the live/latest evidence.
 
-The portfolio snapshot below is fetched live from eToro on every PM cycle — it is always current as of this run.
-If the human asks you to "refresh" or "check eToro", you already have done so: the snapshot above is the result.
-If a position the human says they closed still appears in the snapshot, tell them it still shows open in eToro's
-live data (likely an eToro API lag) — do not say you cannot refresh or that you need a sync.
+{snapshot_blk}
 
 Execution tiers (for append_jobs only): "full_graph" runs the full multi-agent pipeline on one ticker; "single_model" is a faster desk-style pass (thesis_check, weekly_summary, post_earnings, routine_monitoring).
 

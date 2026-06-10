@@ -50,12 +50,13 @@ def _fake_price_fetcher(returns_by_ticker: Dict[str, float]):
 
 
 def test_classify_outcome_thresholds():
+    # Compounder 2.0 §5.2: input is ALPHA vs QQQ (not absolute return); ±2% thresholds.
     assert outcome_tracker.classify_outcome(0.10) == "good"
-    assert outcome_tracker.classify_outcome(0.05) == "good"
-    assert outcome_tracker.classify_outcome(0.049) == "neutral"
+    assert outcome_tracker.classify_outcome(0.02) == "good"
+    assert outcome_tracker.classify_outcome(0.019) == "neutral"
     assert outcome_tracker.classify_outcome(0.0) == "neutral"
-    assert outcome_tracker.classify_outcome(-0.04) == "neutral"
-    assert outcome_tracker.classify_outcome(-0.05) == "bad"
+    assert outcome_tracker.classify_outcome(-0.019) == "neutral"
+    assert outcome_tracker.classify_outcome(-0.02) == "bad"
     assert outcome_tracker.classify_outcome(-0.30) == "bad"
 
 
@@ -257,5 +258,5 @@ def test_format_pm_prompt_block_renders_when_outcomes_exist(tmp_advisor_dir: Pat
     }) + "\n")
 
     block = outcome_tracker.format_rule_performance_for_pm_prompt(cfg, top_n=3)
-    assert "[RULE PERFORMANCE]" in block
+    assert "[RULE PERFORMANCE — alpha-relative]" in block
     assert "rule_a" in block

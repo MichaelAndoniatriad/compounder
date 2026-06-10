@@ -94,7 +94,17 @@ def _notify(cfg: Dict[str, Any], subject: str, body: str) -> None:
 
 def _scale_factor(cfg: Dict[str, Any], paper_equity: float) -> float:
     """eToro-dollars → paper-dollars. 1.0 when the eToro total is unknown
-    (under-sizes on a larger paper book — the conservative direction)."""
+    (under-sizes on a larger paper book — the conservative direction).
+
+    In autonomous mode (account_mode="alpaca") the PM sizes against the Alpaca
+    snapshot directly, so proposal dollars ARE paper dollars: no scaling."""
+    try:
+        from tradingagents.portfolio_advisor.etoro_scan import account_mode
+
+        if account_mode() == "alpaca":
+            return 1.0
+    except Exception:
+        pass
     try:
         st = pa_state.load_state(cfg)
         etoro_total = float(st.get("last_total_value") or 0)
@@ -251,7 +261,10 @@ def _paper_buy(
         },
     )
     conf_note = f", conf {conf:.2f}→{conf_mult:.0%} of cap" if conf is not None else ""
-    msg = f"BUY {tk} ~${notional:,.0f} ({sleeve}) submitted to Alpaca paper (scaled from ~${usd:,.0f} eToro-size{conf_note})."
+    if abs(scale - 1.0) < 1e-9:
+        msg = f"BUY {tk} ~${notional:,.0f} ({sleeve}) executed on Alpaca paper{conf_note}."
+    else:
+        msg = f"BUY {tk} ~${notional:,.0f} ({sleeve}) submitted to Alpaca paper (scaled from ~${usd:,.0f} eToro-size{conf_note})."
     _notify(cfg, f"BUY {tk}", msg + "\nFills at next market open if currently closed.")
     return msg
 

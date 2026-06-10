@@ -246,7 +246,15 @@ def format_action_ticket(cfg: Dict[str, Any], p: Dict[str, Any]) -> str:
                 lines.append("Sell: +100% trim half · −40% exit · thesis-break · else 3–5 yr hold")
     if reason:
         lines.append(f"Why: {reason[:220]}")
-    lines.append("advisory — you execute on eToro")
+    try:
+        from tradingagents.portfolio_advisor.etoro_scan import account_mode
+
+        if account_mode() == "alpaca":
+            lines.append("autonomous — executing on Alpaca paper book; FYI only")
+        else:
+            lines.append("advisory — you execute on eToro")
+    except Exception:
+        lines.append("advisory — you execute on eToro")
     return "\n".join(lines)
 
 
