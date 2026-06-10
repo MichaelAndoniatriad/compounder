@@ -104,6 +104,20 @@ Also fixed a pre-existing test isolation leak in test_pm_catalyst_guard.py (dire
 
 Suite after hardening: **784 tests + 93 subtests, all green** (19 new tests added).
 
+### T1 ✅ 2715496 — Regime overlay + circuit breaker — 2026-06-11
+
+Deterministic sizing overlay enforced in code (never via LLM judgment). Two failure modes from the 17-agent edge analysis closed:
+
+| Component | Detail |
+|-----------|--------|
+| `regime.py` | `compute_regime()` (SPY 200DMA + 20d vol, 6h cache, caution fallback), `drawdown_breaker()` (HWM ratchet, −10% halve / −15% halt), one-shot Telegram on transitions |
+| `executor._paper_buy` | Regime multiplier (1.0 / 0.75 / 0.5) + breaker applied post-sizing; halt skips buy; all failures degrade to 1.0; ledger rows gain regime + breaker_level fields |
+| `advisor_pm.py` | "MUST deploy" → neutral framing; all-cash path no longer demands re-entry; regime block injected into PM prompt (informational) |
+| `default_config.py` | 4 new keys: regime_enabled, regime_vol_threshold, breaker_halve_pct, breaker_halt_pct |
+| Tests | 32 new tests in `test_regime_overlay.py`; pre-existing HC test updated with `regime_enabled=False` |
+
+Suite: **816 tests + 93 subtests, all green**.
+
 ---
 
 ## Explicitly rejected (do not build)
