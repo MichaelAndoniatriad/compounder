@@ -172,7 +172,8 @@ def answer_text(cfg: Dict[str, Any], text: str) -> str:
         "Put your conversational answer in executive_summary — text them like a "
         "friend per your standing instructions, end with a question if there's a "
         "real decision. Keep doing the rest of the cycle normally: stances, "
-        "candidate_comparisons, append_jobs, push_note when warranted."
+        "candidate_comparisons, append_jobs, push_note when warranted. "
+        "Plain text only: no markdown tables/bold/headers — Telegram shows raw symbols."
     )
 
     # The model occasionally returns an empty/None response in chat mode despite

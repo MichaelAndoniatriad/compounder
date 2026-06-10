@@ -168,9 +168,109 @@ def telegram_ready(cfg: Dict[str, Any]) -> bool:
     )
 
 
+def _strip_markdown_for_telegram(text: str) -> str:
+    """Remove markdown formatting so Telegram (plain text mode) shows clean prose.
+
+    Rules applied line-by-line — conservative; normal prose is never mangled:
+    1. Table separator rows  (``|---|---|``) — dropped entirely.
+    2. Table data/header rows — cells joined as ``cell0: cell1 — cell2 — …``.
+       If the NEXT line is a separator row, the header row is also dropped.
+    3. Horizontal rules (``---``, ``***``, ``___``) — dropped; blank-line runs
+       collapsed to at most one blank line.
+    4. ATX headers (``# Title``) — leading ``#``+space stripped, text kept.
+    5. Bold markers (``**`` and ``__`` pairs) — removed globally.
+    6. Whole-line italic markers — outer ``_`` stripped when a line starts AND
+       ends with ``_`` (length > 2). Mid-word underscores (identifiers) untouched.
+    7. Backticks — removed globally.
+    Multi-line code fences (``` lines) — fence lines dropped, content kept.
+    """
+    _TABLE_SEP_RE = re.compile(r"^\|[\s\-:|]+\|$")
+    _TABLE_ROW_RE = re.compile(r"^\|.*\|$")
+    _HR_RE = re.compile(r"^[\s\-*_]{3,}$")
+    _ATX_RE = re.compile(r"^#{1,6}\s+")
+
+    lines = text.splitlines()
+    out: list[str] = []
+    in_code_fence = False
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+
+        # Multi-line code fence toggle
+        if stripped.startswith("```"):
+            in_code_fence = not in_code_fence
+            i += 1
+            continue
+
+        if in_code_fence:
+            out.append(line)
+            i += 1
+            continue
+
+        # Rule 1: table separator rows — drop
+        if _TABLE_SEP_RE.match(stripped):
+            i += 1
+            continue
+
+        # Rule 2: table data/header rows
+        if _TABLE_ROW_RE.match(stripped):
+            # Look ahead: if next non-blank line is a separator, drop this header row too
+            next_i = i + 1
+            while next_i < len(lines) and not lines[next_i].strip():
+                next_i += 1
+            if next_i < len(lines) and _TABLE_SEP_RE.match(lines[next_i].strip()):
+                i += 1
+                continue
+            cells = [c.strip() for c in stripped.split("|")]
+            cells = [c for c in cells if c]
+            if len(cells) == 1:
+                out.append(cells[0])
+            elif len(cells) >= 2:
+                out.append(f"{cells[0]}: {' — '.join(cells[1:])}")
+            i += 1
+            continue
+
+        # Rule 3: horizontal rules — drop, collapse blanks later
+        if _HR_RE.match(stripped) and stripped:
+            i += 1
+            continue
+
+        # Rule 4: ATX headers — strip leading #s
+        line = _ATX_RE.sub("", line)
+        stripped = line.strip()
+
+        # Rule 5: bold markers
+        line = line.replace("**", "").replace("__", "")
+
+        # Rule 6: whole-line italics (starts and ends with single _)
+        s2 = line.strip()
+        if len(s2) > 2 and s2.startswith("_") and s2.endswith("_") and not s2.startswith("__"):
+            line = line.replace(s2, s2[1:-1], 1)
+
+        # Rule 7: backticks
+        line = line.replace("`", "")
+
+        out.append(line)
+        i += 1
+
+    # Collapse runs of blank lines to at most one
+    result_lines: list[str] = []
+    prev_blank = False
+    for line in out:
+        is_blank = not line.strip()
+        if is_blank and prev_blank:
+            continue
+        result_lines.append(line)
+        prev_blank = is_blank
+
+    return "\n".join(result_lines)
+
+
 def _telegram_text(subject: str, body: str) -> str:
     title = str(subject or "TradingAgents").strip() or "TradingAgents"
-    text = f"{title}\n\n{body or ''}".strip()
+    clean_body = _strip_markdown_for_telegram(body or "")
+    text = f"{title}\n\n{clean_body}".strip()
     if len(text) <= _TELEGRAM_MAX_TEXT:
         return text
     suffix = "\n\n[truncated - see dashboard for full text]"
