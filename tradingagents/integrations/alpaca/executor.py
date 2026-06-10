@@ -273,8 +273,11 @@ def execute_proposal(cfg: Dict[str, Any], proposal: Dict[str, Any]) -> Dict[str,
         else:
             detail = _paper_reduce(cfg, client, tk, act, proposal, equity)
         # _paper_buy/_paper_reduce prefix "skipped" for non-executing outcomes.
+        # "deferred" is a distinct outcome: the entry will be retried at open.
         if detail.startswith("skipped"):
             return {"status": "skipped", "detail": detail}
+        if detail.startswith("deferred"):
+            return {"status": "deferred", "detail": detail}
         return {"status": "executed", "detail": detail}
     except Exception as e:
         _log_row(cfg, {"ticker": tk, "action": act, "status": "error", "error": str(e)[:300]})
@@ -364,14 +367,16 @@ def _paper_buy(
     catalyst_date = (proposal.get("catalyst_date") or "").strip() or None
 
     # R1.3 — No overnight queuing for catalyst entries.
-    # If the market is confirmed closed and this is a catalyst buy, skip it.
-    # None means "unknown" (no keys, pytest) — treat as "allow" per instructions.
+    # If the market is confirmed closed and this is a catalyst buy, defer it.
+    # The deferred row (status="deferred_market_closed" in proposed_trades.jsonl)
+    # will be retried by execute_deferred_entries() at the next watchdog tick
+    # during market hours.  None means "unknown" (no keys, pytest) → allow.
     if sleeve == "catalyst":
         clock = market_clock()
         if clock is not None and not clock.get("is_open"):
-            _log_row(cfg, {"ticker": tk, "action": act, "status": "skipped",
-                           "note": "market closed — catalyst entries only execute live"})
-            return f"skipped {tk}: market closed — catalyst entries only execute live"
+            _log_row(cfg, {"ticker": tk, "action": act, "status": "deferred",
+                           "note": "market closed — catalyst entry deferred for open-market execution"})
+            return f"deferred {tk}: market closed — catalyst entry deferred for open-market execution"
 
     # R1.1 — Marketable-limit entry: fetch quote, check spread, build limit order.
     # Falls back to market order when quote is unavailable.
@@ -392,47 +397,45 @@ def _paper_buy(
                            "note": f"spread {spread_bps:.1f}bps > max {max_spread_bps}bps",
                            "bid": bid, "ask": ask, "spread_bps": spread_bps})
             return f"skipped {tk}: spread {spread_bps:.1f}bps exceeds limit {max_spread_bps}bps"
-        # Marketable limit: ask × (1 + slip_bps/10000), round to 4 dp
-        limit_price = round(ask * (1 + limit_slip_bps / 10_000), 4)
-        intended_price = limit_price
-        # qty = floor(notional / limit_price × 1000) / 1000  (3 decimal fractional)
+        # Marketable limit: ask × (1 + slip_bps/10000).
+        # Sub-penny rule (SEC Rule 612): stocks ≥ $1 require $0.01-increment prices.
+        # Use ceil to keep the buy limit marketable (rounding up keeps us ≥ ask).
         import math
-        qty = math.floor(notional / limit_price * 1000) / 1000
+        raw_limit = ask * (1 + limit_slip_bps / 10_000)
+        limit_price = math.ceil(raw_limit * 100) / 100  # round UP to nearest cent
+        intended_price = limit_price
+        if sleeve == "catalyst":
+            # Catalyst entries MUST be whole-share simple DAY limit orders.
+            # Alpaca rejects bracket/OTO with fractional qty (422 "fractional orders
+            # must be simple orders") and the bracket class itself requires take_profit
+            # (400 "bracket orders require take_profit.limit_price").  Empirically
+            # confirmed against live Alpaca paper API — review finding verified.
+            # A standalone GTC stop is submitted after fill confirmation instead.
+            qty = int(notional // limit_price)
+            if qty < 1:
+                _log_row(cfg, {"ticker": tk, "action": act, "status": "skipped",
+                               "note": "position too small for whole-share catalyst entry",
+                               "notional": notional, "limit_price": limit_price})
+                return f"skipped {tk}: position too small for whole-share catalyst entry"
+        else:
+            # Core buys: 3-decimal fractional ok on simple limit orders
+            qty = math.floor(notional / limit_price * 1000) / 1000
         if qty > 0:
             use_limit = True
         # If qty rounds to 0, fall back to market (notional path)
 
     if use_limit and limit_price is not None:
-        # R1.2 — Catalyst buys get a broker-resident bracket stop.
-        if sleeve == "catalyst":
-            from alpaca.trading.enums import OrderClass
-            from alpaca.trading.requests import LimitOrderRequest, StopLossRequest
+        from alpaca.trading.requests import LimitOrderRequest
 
-            hard_stop_pct = float(cfg.get("portfolio_advisor_catalyst_hard_stop_pct", 0.08) or 0.08)
-            stop_px = round(limit_price * (1 - hard_stop_pct), 4)
-            order = client.submit_order(
-                LimitOrderRequest(
-                    symbol=tk,
-                    qty=qty,
-                    side=OrderSide.BUY,
-                    time_in_force=TimeInForce.DAY,
-                    limit_price=limit_price,
-                    order_class=OrderClass.BRACKET,
-                    stop_loss=StopLossRequest(stop_price=stop_px),
-                )
+        order = client.submit_order(
+            LimitOrderRequest(
+                symbol=tk,
+                qty=qty,
+                side=OrderSide.BUY,
+                time_in_force=TimeInForce.DAY,
+                limit_price=limit_price,
             )
-        else:
-            from alpaca.trading.requests import LimitOrderRequest
-
-            order = client.submit_order(
-                LimitOrderRequest(
-                    symbol=tk,
-                    qty=qty,
-                    side=OrderSide.BUY,
-                    time_in_force=TimeInForce.DAY,
-                    limit_price=limit_price,
-                )
-            )
+        )
     else:
         # Fallback: market order (notional-based, as before)
         from alpaca.trading.requests import MarketOrderRequest as _MOR
@@ -461,6 +464,9 @@ def _paper_buy(
             "proposal_ts": proposal.get("ts"),
             "intended_price": intended_price,
             "fill_check_pending": True,
+            # Catalyst entries need a standalone GTC stop submitted post-fill.
+            # reconcile_fills detects this flag and submits the stop after confirming fill.
+            "catalyst_stop_pending": sleeve == "catalyst" and use_limit,
         },
     )
 
@@ -538,13 +544,119 @@ def _check_order_fill(cfg: Dict[str, Any], order_id: str, intended_price: Option
         logger.debug("_check_order_fill failed for order %s", order_id, exc_info=True)
 
 
-def reconcile_fills(cfg: Dict[str, Any]) -> None:
-    """Back-fill fill_check rows for any submitted buy orders not yet reconciled.
+_TERMINAL_FILL_STATUSES = frozenset({"filled", "canceled", "cancelled", "expired", "rejected"})
+_PENDING_FILL_STATUSES = frozenset({"new", "accepted", "pending_new", "partially_filled",
+                                     "accepted_for_bidding", "stopped", "suspended", "calculated"})
 
-    Reads the last 24h of closed orders from Alpaca once (cheap: one API call)
-    and matches against ledger rows that have fill_check_pending=True and no
-    corresponding fill_check row. Called from enforce_paper_exits top. Silent
-    on any failure — never raises into the watchdog.
+
+def _pending_order_ids_from_state(cfg: Dict[str, Any]) -> set:
+    """Load the set of order_ids still pending reconciliation from alpaca_state.json."""
+    try:
+        p = _state_path(cfg)
+        if not p.is_file():
+            return set()
+        raw = json.loads(p.read_text(encoding="utf-8"))
+        return set(raw.get("pending_order_ids") or [])
+    except Exception:
+        return set()
+
+
+def _save_pending_order_ids(cfg: Dict[str, Any], ids: set) -> None:
+    """Persist the pending-order-ids set to alpaca_state.json."""
+    try:
+        p = _state_path(cfg)
+        raw: Dict[str, Any] = {}
+        if p.is_file():
+            try:
+                raw = json.loads(p.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        raw["pending_order_ids"] = sorted(ids)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(json.dumps(raw, indent=2), encoding="utf-8")
+        tmp.replace(p)
+    except Exception:
+        logger.debug("_save_pending_order_ids failed", exc_info=True)
+
+
+def _submit_gtc_stop_for_catalyst(
+    cfg: Dict[str, Any],
+    client,
+    tk: str,
+    filled_qty: int,
+    fill_price: float,
+    hard_stop_pct: float,
+) -> Optional[str]:
+    """Submit a standalone GTC stop-market sell order anchored to actual fill price.
+
+    Returns the stop order id on success, None on any failure.
+    The stop price is fill_price × (1 − hard_stop_pct), rounded DOWN to nearest
+    cent per SEC Rule 612.
+    """
+    import math as _math
+    try:
+        from alpaca.trading.enums import OrderSide, TimeInForce
+        from alpaca.trading.requests import StopOrderRequest
+
+        raw_stop = fill_price * (1 - hard_stop_pct)
+        stop_px = _math.floor(raw_stop * 100) / 100  # round DOWN for stop (more conservative)
+        if stop_px <= 0:
+            return None
+        order = client.submit_order(
+            StopOrderRequest(
+                symbol=tk,
+                qty=filled_qty,
+                side=OrderSide.SELL,
+                time_in_force=TimeInForce.GTC,
+                stop_price=stop_px,
+            )
+        )
+        stop_oid = str(order.id)
+        _log_row(cfg, {
+            "ticker": tk,
+            "action": "catalyst_stop_submitted",
+            "status": "submitted",
+            "order_id": stop_oid,
+            "stop_price": stop_px,
+            "fill_price": fill_price,
+            "qty": filled_qty,
+            "hard_stop_pct": hard_stop_pct,
+        })
+        _notify(cfg, f"GTC stop {tk}", (
+            f"GTC stop-market sell {tk} {filled_qty}sh @ ${stop_px:.2f} "
+            f"({hard_stop_pct*100:.0f}% below fill ${fill_price:.2f}) submitted."
+        ))
+        return stop_oid
+    except Exception:
+        logger.debug("_submit_gtc_stop_for_catalyst failed for %s", tk, exc_info=True)
+        return None
+
+
+def reconcile_fills(cfg: Dict[str, Any]) -> None:
+    """Back-fill fill_check rows for submitted buy orders not yet reconciled.
+
+    Robustness design (fixes review findings):
+    - Only TERMINAL status rows (filled/canceled/expired/rejected) are added to
+      reconciled_ids — partial/new/accepted rows stay pending so the real fill
+      price is captured when the order eventually settles.
+    - Lookback widened to 7 days to survive weekend gaps.
+    - Orders that left the OPEN set but are not in the 7-day closed window get
+      one final direct get_order_by_id check, then are marked terminal either
+      way (no forever-pending).
+    - Pending order_ids are persisted in alpaca_state.json so the full ledger
+      does not need to be re-scanned every tick (cheap: maintain a small set).
+    - After confirming a catalyst fill, submit a standalone GTC stop-market sell
+      anchored to the actual fill price (not the limit price).
+
+    Phantom-state unwind:
+    - When a DAY limit order terminates unfilled (canceled/expired/rejected) AND
+      the filled qty is 0, write a ledger row action="entry_expired", mark the
+      originating proposal row status="cancelled" (note "entry expired unfilled"),
+      and delete the auto-created PositionPlan if no Alpaca position exists for
+      the ticker.
+
+    Called from enforce_paper_exits top. Silent on any failure — never raises.
     """
     if not enabled(cfg):
         return
@@ -557,8 +669,10 @@ def reconcile_fills(cfg: Dict[str, Any]) -> None:
         if not p.is_file():
             return
 
-        # Collect order_ids that need a fill check (have fill_check_pending but no fill_check row).
-        pending_ids: Dict[str, Optional[float]] = {}  # order_id → intended_price
+        # --- Pass 1: scan ledger to build pending / reconciled maps ---
+        # pending_rows: order_id → full ledger row (for ticker, sleeve, proposal_ts, etc.)
+        # reconciled_ids: order_ids that already have a TERMINAL fill_check row
+        pending_rows: Dict[str, Dict[str, Any]] = {}
         reconciled_ids: set = set()
 
         for line in p.read_text(encoding="utf-8").splitlines():
@@ -569,56 +683,86 @@ def reconcile_fills(cfg: Dict[str, Any]) -> None:
             except (json.JSONDecodeError, ValueError):
                 continue
             if row.get("action") == "fill_check":
-                reconciled_ids.add(str(row.get("order_id") or ""))
+                # Only TERMINAL fill_check rows count as reconciled.
+                # Rows with non-terminal status (new/accepted/partially_filled) were
+                # written by the 2s deferred check too early — they do NOT close the loop.
+                fc_status = str(row.get("status") or "").lower()
+                if fc_status in _TERMINAL_FILL_STATUSES:
+                    reconciled_ids.add(str(row.get("order_id") or ""))
             elif row.get("fill_check_pending") and row.get("order_id"):
                 oid = str(row["order_id"])
-                if oid not in pending_ids:
-                    intended = None
-                    try:
-                        v = row.get("intended_price")
-                        if v is not None:
-                            intended = float(v)
-                    except (TypeError, ValueError):
-                        pass
-                    pending_ids[oid] = intended
+                if oid not in pending_rows:
+                    pending_rows[oid] = row
 
-        unreconciled = {oid: ip for oid, ip in pending_ids.items() if oid not in reconciled_ids}
+        unreconciled = {oid: row for oid, row in pending_rows.items() if oid not in reconciled_ids}
         if not unreconciled:
+            # Persist empty pending set to clear stale state
+            _save_pending_order_ids(cfg, set())
             return
 
-        # Fetch last-24h closed orders once.
+        # --- Pass 2: fetch last-7d closed orders ---
         c = _client()
-        after_dt = datetime.now(timezone.utc) - timedelta(hours=24)
+        after_dt = datetime.now(timezone.utc) - timedelta(days=7)
         try:
             closed_orders = c.get_orders(
-                GetOrdersRequest(status=QueryOrderStatus.CLOSED, after=after_dt, limit=100)
+                GetOrdersRequest(status=QueryOrderStatus.CLOSED, after=after_dt, limit=500)
             ) or []
         except Exception:
             logger.debug("reconcile_fills: get_orders failed", exc_info=True)
-            return
+            closed_orders = []
 
-        filled_map: Dict[str, Any] = {}
-        for o in closed_orders:
-            oid = str(getattr(o, "id", ""))
-            if oid:
-                filled_map[oid] = o
+        filled_map: Dict[str, Any] = {str(getattr(o, "id", "")): o for o in closed_orders
+                                       if str(getattr(o, "id", ""))}
 
-        for oid, intended in unreconciled.items():
+        hard_stop_pct = float(cfg.get("portfolio_advisor_catalyst_hard_stop_pct", 0.08) or 0.08)
+        still_pending: set = set()
+
+        for oid, ledger_row in unreconciled.items():
             order_obj = filled_map.get(oid)
+
+            # Orders not in the 7d closed window: do one direct check then finalize.
             if order_obj is None:
-                # Not in closed list — may still be open; skip for now
-                continue
+                try:
+                    order_obj = c.get_order_by_id(oid)
+                except Exception:
+                    # API error — keep pending and try next tick
+                    still_pending.add(oid)
+                    continue
+
             status = str(getattr(order_obj, "status", "")).lower()
+
+            # Non-terminal: stay pending
+            if status not in _TERMINAL_FILL_STATUSES:
+                still_pending.add(oid)
+                continue
+
             filled_avg = None
-            slippage_bps = None
+            filled_qty_raw = None
             try:
                 raw = getattr(order_obj, "filled_avg_price", None)
                 if raw is not None and raw != "":
                     filled_avg = float(raw)
             except (TypeError, ValueError):
                 pass
+            try:
+                qr = getattr(order_obj, "filled_qty", None)
+                if qr is not None and qr != "":
+                    filled_qty_raw = float(qr)
+            except (TypeError, ValueError):
+                pass
+
+            intended = None
+            try:
+                v = ledger_row.get("intended_price")
+                if v is not None:
+                    intended = float(v)
+            except (TypeError, ValueError):
+                pass
+
+            slippage_bps = None
             if filled_avg and intended and intended > 0:
                 slippage_bps = round((filled_avg - intended) / intended * 10_000, 1)
+
             _log_row(
                 cfg,
                 {
@@ -626,11 +770,99 @@ def reconcile_fills(cfg: Dict[str, Any]) -> None:
                     "order_id": oid,
                     "status": status,
                     "filled_avg_price": filled_avg,
+                    "filled_qty": filled_qty_raw,
                     "intended_price": intended,
                     "slippage_bps": slippage_bps,
                     "source": "reconcile_fills",
                 },
             )
+
+            tk = str(ledger_row.get("ticker") or "").upper()
+            sleeve = str(ledger_row.get("sleeve") or "").lower()
+            proposal_ts = ledger_row.get("proposal_ts")
+
+            # --- Post-fill GTC stop for catalyst entries ---
+            if (
+                status == "filled"
+                and sleeve == "catalyst"
+                and bool(ledger_row.get("catalyst_stop_pending"))
+                and filled_avg
+                and filled_avg > 0
+                and filled_qty_raw
+                and filled_qty_raw >= 1
+            ):
+                filled_qty_int = int(filled_qty_raw)
+                stop_oid = _submit_gtc_stop_for_catalyst(
+                    cfg, c, tk, filled_qty_int, filled_avg, hard_stop_pct
+                )
+                if stop_oid and tk:
+                    # Record stop_order_id on the PositionPlan
+                    try:
+                        from tradingagents.portfolio_advisor.position_plans import (
+                            load_position_plans, save_position_plans,
+                        )
+                        plans = load_position_plans(cfg)
+                        plan = plans.get(tk)
+                        if plan is not None:
+                            plan.stop_order_id = stop_oid
+                            plan.last_updated = _now_iso()
+                            plans[tk] = plan
+                            save_position_plans(cfg, plans)
+                    except Exception:
+                        logger.debug("reconcile_fills: could not save stop_order_id for %s", tk, exc_info=True)
+
+            # --- Phantom-state unwind: entry expired unfilled ---
+            unfilled = (
+                status in ("canceled", "cancelled", "expired", "rejected")
+                and (filled_qty_raw is None or filled_qty_raw == 0)
+                and tk
+            )
+            if unfilled:
+                # Write an entry_expired ledger row
+                _log_row(cfg, {
+                    "action": "entry_expired",
+                    "ticker": tk,
+                    "order_id": oid,
+                    "status": status,
+                    "sleeve": sleeve,
+                    "proposal_ts": proposal_ts,
+                    "note": "entry expired unfilled — unwinding phantom state",
+                })
+                _notify(cfg, f"Entry expired {tk}", (
+                    f"[PAPER] {tk} DAY limit order {oid} expired/cancelled unfilled. "
+                    "Phantom plan + proposal cancelled."
+                ))
+
+                # Cancel the originating proposal row
+                if proposal_ts:
+                    try:
+                        from tradingagents.portfolio_advisor import proposals as _prop
+                        rows = _prop.load_all(cfg)
+                        now_iso = _now_iso()
+                        for r in rows:
+                            if r.get("ts") == proposal_ts and (r.get("ticker") or "").upper() == tk:
+                                r["status"] = "cancelled"
+                                r["status_set_at"] = now_iso
+                                r["status_note"] = "entry expired unfilled"
+                                break
+                        _prop.save_all(cfg, rows)
+                    except Exception:
+                        logger.debug("reconcile_fills: proposal unwind failed for %s", tk, exc_info=True)
+
+                # Delete the PositionPlan if no Alpaca position exists
+                try:
+                    c.get_open_position(tk)
+                    # Position exists — don't delete the plan
+                except Exception:
+                    # No position — safe to delete the phantom plan
+                    try:
+                        from tradingagents.portfolio_advisor.position_plans import remove_position_plan
+                        remove_position_plan(cfg, tk)
+                        logger.info("reconcile_fills: removed phantom plan for %s (entry expired unfilled)", tk)
+                    except Exception:
+                        logger.debug("reconcile_fills: remove_position_plan failed for %s", tk, exc_info=True)
+
+        _save_pending_order_ids(cfg, still_pending)
     except Exception:
         logger.debug("reconcile_fills failed", exc_info=True)
 
@@ -674,6 +906,39 @@ def _high_conviction_grant(
         logger.debug("high-conviction slot check failed for %s", tk, exc_info=True)
         return False, "slot check failed; sized normally"
     return True, f"high-conviction granted (confidence {float(confidence):.2f} >= floor {min_conf:.2f})"
+
+
+def _cancel_open_orders_for_symbol(client, tk: str) -> int:
+    """Cancel all open orders for a symbol before closing the position.
+
+    Alpaca rejects ``close_position`` with 403 'insufficient qty available'
+    when shares are reserved by an open child/sibling sell order (e.g. a
+    GTC stop placed after fill confirmation).  Call this before every
+    close_position call to avoid the deadlock.
+
+    Returns the count of orders cancelled (0 on any failure, always silent).
+    """
+    try:
+        from alpaca.trading.enums import QueryOrderStatus
+        from alpaca.trading.requests import GetOrdersRequest
+
+        orders = client.get_orders(
+            GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[tk], limit=50)
+        ) or []
+        cancelled = 0
+        for o in orders:
+            oid = str(getattr(o, "id", "") or "")
+            if not oid:
+                continue
+            try:
+                client.cancel_order_by_id(oid)
+                cancelled += 1
+            except Exception:
+                logger.debug("cancel_open_orders_for_symbol: cancel %s failed for %s", oid, tk, exc_info=True)
+        return cancelled
+    except Exception:
+        logger.debug("cancel_open_orders_for_symbol failed for %s", tk, exc_info=True)
+        return 0
 
 
 def _open_buy_order_exists(client, tk: str) -> bool:
@@ -852,6 +1117,10 @@ def _paper_reduce(
         if usd > 0 and mv > 0 and usd < 0.95 * mv:
             fraction = min(1.0, max(0.05, usd * _scale_factor(cfg, equity) / mv))
 
+    # Cancel any open orders (e.g. GTC stop) before closing the position.
+    # Alpaca rejects close_position with 403 when shares are reserved by an
+    # open order — cancel first to avoid the conflict.
+    _cancel_open_orders_for_symbol(client, tk)
     if fraction >= 0.999:
         order = client.close_position(tk)
         note = "closed 100%"
@@ -891,6 +1160,10 @@ def close_for_watchdog(cfg: Dict[str, Any], ticker: str, fraction: float, rule: 
             _log_row(cfg, {"ticker": tk, "action": "watchdog_exit", "status": "skipped",
                            "note": "not held in paper book", "rule": rule})
             return None
+        # Cancel any open orders (e.g. GTC stop) before closing the position.
+        # Alpaca rejects close_position with 403 when shares are reserved by an
+        # open order — cancel first to avoid the conflict.
+        _cancel_open_orders_for_symbol(client, tk)
         if fraction >= 0.999:
             client.close_position(tk)
             note = "closed 100%"
@@ -978,6 +1251,93 @@ def _sync_plan_entry_to_fill(
     return True
 
 
+def execute_deferred_entries(cfg: Dict[str, Any]) -> int:
+    """Re-attempt catalyst entries that were deferred because the market was closed.
+
+    Scans proposed_trades.jsonl for rows with status=="deferred_market_closed"
+    that are younger than 18h and re-runs execute_proposal on each.  All entry
+    guards (cooldown, open orders, spread, market clock) re-check live — if the
+    market is still closed the entry will be deferred again.
+
+    Rows older than 18h are expired (marked cancelled with note "deferred entry
+    expired") — too stale to enter.
+
+    Called from enforce_paper_exits top (which runs every watchdog tick during
+    market hours) so no additional scheduling is needed.
+
+    Never raises. Returns number of entries re-attempted (not necessarily filled).
+    """
+    if not enabled(cfg):
+        return 0
+    # Only run when market is open; if clock is unknown (None) proceed anyway.
+    clock = market_clock()
+    if clock is not None and not clock.get("is_open"):
+        return 0
+    try:
+        from datetime import timedelta
+        from tradingagents.portfolio_advisor import proposals as _prop
+
+        rows = _prop.load_all(cfg)
+        now = datetime.now(timezone.utc)
+        cutoff_18h = now - timedelta(hours=18)
+        attempted = 0
+        dirty = False
+
+        for r in rows:
+            if r.get("status") != "deferred_market_closed":
+                continue
+            ts_str = str(r.get("status_set_at") or r.get("ts") or "")
+            try:
+                deferred_at = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+            except (ValueError, TypeError):
+                deferred_at = now  # unknown age — treat as fresh
+
+            tk = (r.get("ticker") or "").upper()
+
+            if deferred_at < cutoff_18h:
+                # Entry too stale — expire it
+                r["status"] = "cancelled"
+                r["status_set_at"] = now.isoformat()
+                r["status_note"] = "deferred entry expired"
+                _log_row(cfg, {
+                    "action": "entry_expired",
+                    "ticker": tk,
+                    "note": "deferred catalyst entry expired (>18h)",
+                })
+                dirty = True
+                logger.info("execute_deferred_entries: expired deferred entry for %s", tk)
+                continue
+
+            # Re-run execute_proposal with the original proposal payload
+            proposal = dict(r)
+            result = execute_proposal(cfg, proposal)
+            ex_status = result.get("status", "error") if isinstance(result, dict) else "error"
+            ex_detail = result.get("detail", "") if isinstance(result, dict) else ""
+
+            now_iso = now.isoformat()
+            if ex_status == "executed":
+                r["status"] = "executed"
+                r["status_set_at"] = now_iso
+                r["status_note"] = f"deferred entry executed: {ex_detail}"[:300]
+            elif ex_status == "deferred":
+                # Still closed — keep deferred, update status_set_at so 18h clock refreshes
+                r["status_set_at"] = now_iso
+            elif ex_status in ("skipped", "error"):
+                r["status"] = "cancelled"
+                r["status_set_at"] = now_iso
+                r["status_note"] = f"deferred entry {ex_status}: {ex_detail}"[:300]
+            # disabled → leave as deferred
+            dirty = True
+            attempted += 1
+
+        if dirty:
+            _prop.save_all(cfg, rows)
+        return attempted
+    except Exception:
+        logger.debug("execute_deferred_entries failed", exc_info=True)
+        return 0
+
+
 def enforce_paper_exits(cfg: Dict[str, Any]) -> int:
     """Deterministic exits for paper positions every watchdog tick.
 
@@ -1011,6 +1371,8 @@ def enforce_paper_exits(cfg: Dict[str, Any]) -> int:
         return 0
     # R1.4 — Back-fill any submitted orders not yet reconciled.
     reconcile_fills(cfg)
+    # Re-attempt any catalyst entries that were deferred at market-close time.
+    execute_deferred_entries(cfg)
     try:
         client = _client()
         positions = client.get_all_positions()

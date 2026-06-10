@@ -28,7 +28,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from tradingagents.portfolio_advisor import state as pa_state
 
-_STATUSES = ("proposed", "approved", "rejected", "executed", "cancelled")
+_STATUSES = ("proposed", "approved", "rejected", "executed", "cancelled", "deferred_market_closed")
 
 # A fired rule (e.g. DOUBLE_FROM_ENTRY) often gets re-proposed as either "sell"
 # or "trim" cycle after cycle. Both express the same intent — reduce the
@@ -188,7 +188,7 @@ def add(
             from tradingagents.integrations.alpaca import executor as _alpaca
 
             result = _alpaca.execute_proposal(cfg, entry)
-            # result is {"status": "executed"|"skipped"|"error"|"disabled", "detail": str}
+            # result is {"status": "executed"|"skipped"|"error"|"disabled"|"deferred", "detail": str}
             ex_status = result.get("status", "disabled") if isinstance(result, dict) else "disabled"
             ex_detail = result.get("detail", "") if isinstance(result, dict) else str(result or "")
             now = datetime.now(timezone.utc).isoformat()
@@ -199,6 +199,12 @@ def add(
                 if r.get("ts") == entry["ts"] and r.get("ticker") == entry["ticker"]:
                     if ex_status == "executed":
                         r["status"] = "executed"
+                        r["status_set_at"] = now
+                        r["status_note"] = ex_detail[:300]
+                    elif ex_status == "deferred":
+                        # Catalyst entry deferred (market closed) — will be retried at open.
+                        # Distinct from "cancelled" so execute_deferred_entries can pick it up.
+                        r["status"] = "deferred_market_closed"
                         r["status_set_at"] = now
                         r["status_note"] = ex_detail[:300]
                     elif ex_status in ("skipped", "error"):

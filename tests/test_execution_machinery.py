@@ -3,12 +3,17 @@
 Covers:
 - Spread > 100 bps → skip with reason logged
 - Quote unavailable → market-order fallback (notional path)
-- Catalyst buy → bracket order with stop at entry × 0.92
-- Catalyst buy with market_clock {"is_open": False} → skipped
+- Catalyst buy → simple whole-share DAY limit (NOT bracket — bracket was verified-broken)
+- Catalyst buy: market closed → deferred (not cancelled); retried by execute_deferred_entries
 - Catalyst buy with market_clock {"is_open": True} → proceeds
 - Catalyst buy with market_clock returning None → proceeds (unknown = allow)
 - Core buy queues regardless of market-clock state
 - Slippage row math (intended 100, filled 100.5 → +50 bps)
+- Sub-penny rule: limit_price rounded to 2dp (SEC Rule 612)
+- GTC stop submitted post-fill in reconcile_fills at actual fill price × 0.92
+- cancel-before-close: _cancel_open_orders_for_symbol called in close_for_watchdog
+- Entry-expired unwind: proposal cancelled + plan deleted when DAY limit expires unfilled
+- Deferred flow: closed market → deferred_market_closed → execute_deferred_entries at open
 """
 
 from __future__ import annotations
@@ -256,18 +261,36 @@ class TestLimitPriceMath:
 
 
 # ---------------------------------------------------------------------------
-# Bracket order for catalyst buys
+# Catalyst order redesign (was: bracket order — now: simple whole-share DAY limit)
 # ---------------------------------------------------------------------------
+#
+# The OLD design submitted catalyst buys as OrderClass.BRACKET with only stop_loss.
+# Alpaca rejects this on TWO grounds (empirically verified against live Alpaca paper
+# account in the adversarial review):
+#   (1) bracket orders require BOTH take_profit AND stop_loss legs
+#       → 400 {"code":40010001,"message":"bracket orders require take_profit.limit_price"}
+#   (2) fractional qty (3-decimal) is rejected on advanced order classes
+#       → 422 {"code":42210000,"message":"fractional orders must be simple orders"}
+# So every catalyst entry silently failed from day one.  The new design:
+#   • qty = int(notional // limit_price) — whole shares only
+#   • simple DAY LimitOrderRequest (no order_class, no stop leg)
+#   • standalone GTC stop-market sell submitted by reconcile_fills after fill confirmation,
+#     anchored to actual fill price × (1 − hard_stop_pct)
 
 
-class TestCatalystBracketOrder:
-    """Catalyst sleeve → bracket order with stop at entry × (1 - 0.08)."""
+class TestCatalystOrderRedesign:
+    """Catalyst sleeve → simple whole-share DAY limit (not bracket).
+
+    The old bracket design was verified-broken by the adversarial review:
+    Alpaca rejects bracket with stop_loss-only AND rejects fractional qty on
+    advanced order classes — so every catalyst entry failed silently.
+    """
 
     @patch("tradingagents.integrations.alpaca.executor._latest_quote")
     @patch("tradingagents.integrations.alpaca.executor.market_clock", return_value={"is_open": True})
     @patch("tradingagents.integrations.alpaca.executor.enabled", return_value=True)
-    def test_catalyst_buy_submits_bracket(self, mock_enabled, mock_clock, mock_quote, tmp_path):
-        """Catalyst + tight spread → submit bracket order with stop_loss."""
+    def test_catalyst_buy_submits_simple_limit_not_bracket(self, mock_enabled, mock_clock, mock_quote, tmp_path):
+        """Catalyst + tight spread → simple LimitOrderRequest, NO bracket/OTO."""
         from alpaca.trading.enums import OrderClass
         from alpaca.trading.requests import LimitOrderRequest
 
@@ -281,31 +304,60 @@ class TestCatalystBracketOrder:
 
         req = client.submit_order.call_args[0][0]
         assert isinstance(req, LimitOrderRequest), "Catalyst limit order must be LimitOrderRequest"
-        assert req.order_class == OrderClass.BRACKET, "Catalyst buy must use bracket order class"
-        assert req.stop_loss is not None, "Bracket order must include stop_loss"
+        # Must NOT use bracket (empirically confirmed as broken by review)
+        assert getattr(req, "order_class", None) not in (OrderClass.BRACKET,), \
+            "Catalyst buy MUST NOT use bracket (Alpaca rejects stop_loss-only bracket)"
+        assert getattr(req, "stop_loss", None) is None, \
+            "Catalyst entry must not carry a stop leg — stop is submitted post-fill by reconcile_fills"
 
     @patch("tradingagents.integrations.alpaca.executor._latest_quote")
     @patch("tradingagents.integrations.alpaca.executor.market_clock", return_value={"is_open": True})
     @patch("tradingagents.integrations.alpaca.executor.enabled", return_value=True)
-    def test_catalyst_bracket_stop_at_entry_times_0_92(self, mock_enabled, mock_clock, mock_quote, tmp_path):
-        """Bracket stop_price = limit_price × (1 - 0.08) = limit × 0.92."""
-        from alpaca.trading.requests import LimitOrderRequest
+    def test_catalyst_buy_uses_whole_share_qty(self, mock_enabled, mock_clock, mock_quote, tmp_path):
+        """Catalyst buy qty = int(notional // limit_price) — whole shares only.
 
+        Alpaca rejects fractional qty on advanced order classes (422).  The new
+        design uses whole-share simple limit orders so both the qty and order
+        class constraints are satisfied.
+        """
+        # ask=100, slip=10bps → limit=100.10 (ceil), notional≈5000 → qty=int(5000//100.10)=49
         mock_quote.return_value = _quote(99.9, 100.0)
-        cfg = _cfg(tmp_path, portfolio_advisor_catalyst_hard_stop_pct=0.08)
-        client = _make_client()
+        cfg = _cfg(tmp_path)
+        client = _make_client(equity=100_000.0)
 
+        from alpaca.trading.requests import LimitOrderRequest
         from tradingagents.integrations.alpaca import executor as ex
 
-        ex._paper_buy(cfg, client, 100_000.0, "SMCI", _catalyst_proposal("SMCI"))
+        ex._paper_buy(cfg, client, 100_000.0, "SMCI", _catalyst_proposal("SMCI", usd=5000.0))
 
         req = client.submit_order.call_args[0][0]
         assert isinstance(req, LimitOrderRequest)
-        limit_price = req.limit_price
-        expected_stop = round(limit_price * (1 - 0.08), 4)
-        actual_stop = req.stop_loss.stop_price
-        assert abs(actual_stop - expected_stop) < 0.001, \
-            f"Expected stop_price ≈ {expected_stop}, got {actual_stop}"
+        qty = req.qty
+        assert qty is not None
+        # Must be whole-share (integer value)
+        assert qty == int(qty), f"Catalyst qty must be whole shares, got {qty}"
+        assert qty >= 1, "Catalyst qty must be >= 1"
+
+    @patch("tradingagents.integrations.alpaca.executor._latest_quote")
+    @patch("tradingagents.integrations.alpaca.executor.market_clock", return_value={"is_open": True})
+    @patch("tradingagents.integrations.alpaca.executor.enabled", return_value=True)
+    def test_catalyst_skip_when_qty_zero(self, mock_enabled, mock_clock, mock_quote, tmp_path):
+        """Catalyst buy is skipped with a clear reason when whole-share qty would be 0."""
+        # Expensive stock: ask=1000, notional=500 → int(500//1001)=0 → skip
+        mock_quote.return_value = _quote(999.0, 1000.0)
+        cfg = _cfg(tmp_path)
+        # tiny notional to force qty=0
+        client = _make_client(equity=100_000.0)
+
+        from tradingagents.integrations.alpaca import executor as ex
+
+        result = ex._paper_buy(cfg, client, 100_000.0, "SMCI",
+                               {"ticker": "SMCI", "action": "buy", "approx_usd": 500.0,
+                                "sleeve": "catalyst", "catalyst_date": "2026-09-15"})
+
+        assert "skipped" in result.lower()
+        assert "too small" in result.lower() or "whole-share" in result.lower()
+        client.submit_order.assert_not_called()
 
     @patch("tradingagents.integrations.alpaca.executor._latest_quote")
     @patch("tradingagents.integrations.alpaca.executor.market_clock", return_value={"is_open": True})
@@ -334,15 +386,25 @@ class TestCatalystBracketOrder:
 # ---------------------------------------------------------------------------
 
 
-class TestMarketClosedCatalystSkip:
-    """Catalyst buy: closed market → skip; open or None → proceed."""
+class TestMarketClosedCatalystDeferred:
+    """Catalyst buy: closed market → deferred (not cancelled); open or None → proceed.
+
+    Pre-redesign the closed-market path returned 'skipped' and proposals.py marked
+    the row 'cancelled', so the entry was permanently lost.  The new design returns
+    'deferred' so proposals.py sets status='deferred_market_closed' and
+    execute_deferred_entries() retries it at the next open-market watchdog tick.
+    """
 
     @patch("tradingagents.integrations.alpaca.executor._latest_quote", return_value=None)
     @patch("tradingagents.integrations.alpaca.executor.market_clock",
            return_value={"is_open": False, "next_open": "2026-06-11T13:30:00+00:00"})
     @patch("tradingagents.integrations.alpaca.executor.enabled", return_value=True)
-    def test_catalyst_skipped_when_market_closed(self, mock_enabled, mock_clock, mock_quote, tmp_path):
-        """Catalyst buy is skipped when market_clock returns is_open=False."""
+    def test_catalyst_deferred_when_market_closed(self, mock_enabled, mock_clock, mock_quote, tmp_path):
+        """Catalyst buy returns 'deferred' (not 'skipped') when market_clock is closed.
+
+        The old 'skipped' path permanently cancelled the entry — the pipeline could
+        never execute a trade.  'deferred' lets execute_deferred_entries() retry at open.
+        """
         cfg = _cfg(tmp_path)
         client = _make_client()
 
@@ -350,7 +412,7 @@ class TestMarketClosedCatalystSkip:
 
         result = ex._paper_buy(cfg, client, 100_000.0, "SMCI", _catalyst_proposal("SMCI"))
 
-        assert "skipped" in result.lower()
+        assert "deferred" in result.lower()
         assert "market closed" in result.lower()
         client.submit_order.assert_not_called()
 
@@ -630,3 +692,699 @@ class TestEnforcePaperExitsCallsReconcile:
         ex.enforce_paper_exits(cfg)
 
         mock_reconcile.assert_called_once_with(cfg)
+
+
+# ---------------------------------------------------------------------------
+# Sub-penny rule (SEC Rule 612): limit_price must be 2dp
+# ---------------------------------------------------------------------------
+
+
+class TestSubPennyRounding:
+    """limit_price and stop_price are rounded to 2 decimal places."""
+
+    @patch("tradingagents.integrations.alpaca.executor._latest_quote")
+    @patch("tradingagents.integrations.alpaca.executor.enabled", return_value=True)
+    def test_limit_price_is_2dp(self, mock_enabled, mock_quote, tmp_path):
+        """Core limit_price is ceil-rounded to 2dp (never sub-penny)."""
+        import math as _math
+        # ask=52.37, slip=10bps → raw=52.4224 → ceil to 2dp = 52.43
+        mock_quote.return_value = _quote(52.00, 52.37)
+        cfg = _cfg(tmp_path, portfolio_advisor_limit_slip_bps=10)
+        client = _make_client()
+
+        from alpaca.trading.requests import LimitOrderRequest
+        from tradingagents.integrations.alpaca import executor as ex
+
+        ex._paper_buy(cfg, client, 100_000.0, "AAPL", _core_proposal("AAPL", usd=5000.0))
+
+        req = client.submit_order.call_args[0][0]
+        assert isinstance(req, LimitOrderRequest)
+        lp = req.limit_price
+        # Must be a multiple of $0.01
+        assert abs(lp * 100 - round(lp * 100)) < 1e-6, \
+            f"limit_price {lp} must be a whole cent (2dp)"
+        # Must be ≥ ask (marketable)
+        assert lp >= 52.37, f"limit_price {lp} must be >= ask 52.37"
+
+    @patch("tradingagents.integrations.alpaca.executor._latest_quote")
+    @patch("tradingagents.integrations.alpaca.executor.enabled", return_value=True)
+    def test_stop_price_from_gtc_stop_is_2dp(self, mock_enabled, mock_quote, tmp_path):
+        """_submit_gtc_stop_for_catalyst rounds stop_price to 2dp (floor)."""
+        from tradingagents.integrations.alpaca import executor as ex
+
+        cfg = _cfg(tmp_path)
+        stop_orders = []
+
+        class _FakeClient:
+            def submit_order(self, req):
+                stop_orders.append(req)
+                r = MagicMock()
+                r.id = "stop-order-id"
+                return r
+
+        # fill_price=52.37, hard_stop=8% → raw_stop=48.1804 → floor to 2dp = 48.18
+        result = ex._submit_gtc_stop_for_catalyst(cfg, _FakeClient(), "AAPL", 50, 52.37, 0.08)
+        assert result == "stop-order-id"
+        assert len(stop_orders) == 1
+        sp = stop_orders[0].stop_price
+        # Must be 2dp
+        assert abs(sp * 100 - round(sp * 100)) < 1e-6, \
+            f"stop_price {sp} must be a whole cent"
+        # Must be floor (not above the -8% level)
+        assert sp <= 52.37 * 0.92 + 0.005, \
+            f"stop_price {sp} must be <= fill × 0.92"
+
+
+# ---------------------------------------------------------------------------
+# GTC stop submitted post-fill by reconcile_fills
+# ---------------------------------------------------------------------------
+
+
+class TestPostFillGTCStop:
+    """reconcile_fills submits a GTC stop after confirming a catalyst fill,
+    anchored to the actual fill price (not the limit price)."""
+
+    def _write_catalyst_pending(
+        self,
+        cfg: Dict[str, Any],
+        order_id: str,
+        intended_price: float,
+        proposal_ts: str = "2026-06-10T09:00:00+00:00",
+    ) -> None:
+        _pa_dir(cfg)
+        row = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "ticker": "SMCI",
+            "action": "buy",
+            "status": "submitted",
+            "order_id": order_id,
+            "notional_usd": 5000.0,
+            "intended_price": intended_price,
+            "fill_check_pending": True,
+            "catalyst_stop_pending": True,
+            "sleeve": "catalyst",
+            "proposal_ts": proposal_ts,
+        }
+        ledger = Path(cfg["portfolio_advisor_dir"]) / "alpaca_trades.jsonl"
+        with ledger.open("a") as fh:
+            fh.write(json.dumps(row) + "\n")
+
+    def test_gtc_stop_submitted_at_fill_times_0_92(self, tmp_path):
+        """reconcile_fills submits GTC stop at fill_price × (1 - 0.08)."""
+        import math as _math
+        from tradingagents.integrations.alpaca import executor as ex
+
+        cfg = _cfg(tmp_path, portfolio_advisor_catalyst_hard_stop_pct=0.08)
+        order_id = "catalyst-order-1"
+        fill_price = 102.50
+        self._write_catalyst_pending(cfg, order_id, 100.0)
+
+        stop_orders_submitted = []
+
+        closed_order = MagicMock()
+        closed_order.id = order_id
+        closed_order.status = "filled"
+        closed_order.filled_avg_price = str(fill_price)
+        closed_order.filled_qty = "49"
+
+        stop_order = MagicMock()
+        stop_order.id = "gtc-stop-id"
+
+        with patch.object(ex, "enabled", return_value=True), \
+             patch.object(ex, "_client") as mock_client_fn:
+            mock_c = MagicMock()
+            mock_c.get_orders.return_value = [closed_order]
+            # Capture the stop order submission
+            def submit_side_effect(req):
+                stop_orders_submitted.append(req)
+                return stop_order
+            mock_c.submit_order.side_effect = submit_side_effect
+            mock_client_fn.return_value = mock_c
+
+            ex.reconcile_fills(cfg)
+
+        assert len(stop_orders_submitted) == 1, "Exactly one stop order must be submitted"
+        from alpaca.trading.requests import StopOrderRequest
+        from alpaca.trading.enums import TimeInForce
+        req = stop_orders_submitted[0]
+        assert isinstance(req, StopOrderRequest)
+        assert req.time_in_force == TimeInForce.GTC, "Stop must be GTC not DAY"
+        # stop_price = floor(fill × 0.92 × 100) / 100
+        expected_stop = _math.floor(fill_price * 0.92 * 100) / 100
+        assert abs(req.stop_price - expected_stop) < 0.01, \
+            f"Stop anchored to fill: expected {expected_stop}, got {req.stop_price}"
+
+    def test_stop_order_id_saved_to_position_plan(self, tmp_path):
+        """reconcile_fills saves the stop_order_id to the PositionPlan."""
+        from tradingagents.integrations.alpaca import executor as ex
+        from tradingagents.portfolio_advisor.position_plans import (
+            PositionPlan, upsert_position_plan, load_position_plans,
+        )
+
+        cfg = _cfg(tmp_path, portfolio_advisor_catalyst_hard_stop_pct=0.08)
+        order_id = "catalyst-order-2"
+        fill_price = 50.0
+        self._write_catalyst_pending(cfg, order_id, 50.0)
+
+        # Create the position plan
+        _pa_dir(cfg)
+        plan = PositionPlan(ticker="SMCI", entry_price=50.0, strategy="catalyst")
+        upsert_position_plan(cfg, plan)
+
+        closed_order = MagicMock()
+        closed_order.id = order_id
+        closed_order.status = "filled"
+        closed_order.filled_avg_price = str(fill_price)
+        closed_order.filled_qty = "100"
+
+        stop_order = MagicMock()
+        stop_order.id = "the-stop-order-id"
+
+        with patch.object(ex, "enabled", return_value=True), \
+             patch.object(ex, "_client") as mock_client_fn:
+            mock_c = MagicMock()
+            mock_c.get_orders.return_value = [closed_order]
+            mock_c.submit_order.return_value = stop_order
+            mock_client_fn.return_value = mock_c
+
+            ex.reconcile_fills(cfg)
+
+        plans = load_position_plans(cfg)
+        assert "SMCI" in plans
+        assert plans["SMCI"].stop_order_id == "the-stop-order-id", \
+            "stop_order_id must be persisted to PositionPlan"
+
+    def test_no_gtc_stop_for_core_fill(self, tmp_path):
+        """reconcile_fills does NOT submit a stop for core-sleeve fills."""
+        from tradingagents.integrations.alpaca import executor as ex
+
+        cfg = _cfg(tmp_path)
+        _pa_dir(cfg)
+        order_id = "core-order-1"
+        row = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "ticker": "AAPL",
+            "action": "buy",
+            "status": "submitted",
+            "order_id": order_id,
+            "notional_usd": 5000.0,
+            "intended_price": 100.0,
+            "fill_check_pending": True,
+            "catalyst_stop_pending": False,
+            "sleeve": "core",
+        }
+        ledger = Path(cfg["portfolio_advisor_dir"]) / "alpaca_trades.jsonl"
+        with ledger.open("a") as fh:
+            fh.write(json.dumps(row) + "\n")
+
+        closed_order = MagicMock()
+        closed_order.id = order_id
+        closed_order.status = "filled"
+        closed_order.filled_avg_price = "100.5"
+        closed_order.filled_qty = "50"
+
+        with patch.object(ex, "enabled", return_value=True), \
+             patch.object(ex, "_client") as mock_client_fn:
+            mock_c = MagicMock()
+            mock_c.get_orders.return_value = [closed_order]
+            mock_client_fn.return_value = mock_c
+
+            ex.reconcile_fills(cfg)
+
+        # No stop order should be submitted for core fills
+        mock_c.submit_order.assert_not_called()
+
+    def test_pending_status_not_terminal_stays_pending(self, tmp_path):
+        """reconcile_fills does NOT write terminal fill_check for non-terminal status rows."""
+        from tradingagents.integrations.alpaca import executor as ex
+
+        cfg = _cfg(tmp_path)
+        order_id = "pending-order"
+        _pa_dir(cfg)
+        row = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "ticker": "AAPL",
+            "action": "buy",
+            "status": "submitted",
+            "order_id": order_id,
+            "intended_price": 100.0,
+            "fill_check_pending": True,
+            "catalyst_stop_pending": False,
+            "sleeve": "core",
+        }
+        ledger = Path(cfg["portfolio_advisor_dir"]) / "alpaca_trades.jsonl"
+        with ledger.open("a") as fh:
+            fh.write(json.dumps(row) + "\n")
+
+        # Simulate a fill_check row already written with non-terminal status (accepted)
+        # by the 2s deferred check — it should NOT count as reconciled
+        with ledger.open("a") as fh:
+            fh.write(json.dumps({
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "action": "fill_check",
+                "order_id": order_id,
+                "status": "accepted",  # NON-TERMINAL — must not close the loop
+                "filled_avg_price": None,
+                "slippage_bps": None,
+            }) + "\n")
+
+        # Now the order has "filled" in the closed list
+        closed_order = MagicMock()
+        closed_order.id = order_id
+        closed_order.status = "filled"
+        closed_order.filled_avg_price = "100.5"
+        closed_order.filled_qty = "50"
+
+        with patch.object(ex, "enabled", return_value=True), \
+             patch.object(ex, "_client") as mock_client_fn:
+            mock_c = MagicMock()
+            mock_c.get_orders.return_value = [closed_order]
+            mock_client_fn.return_value = mock_c
+
+            ex.reconcile_fills(cfg)
+
+        rows = [json.loads(l) for l in ledger.read_text().splitlines() if l.strip()]
+        terminal_fills = [
+            r for r in rows
+            if r.get("action") == "fill_check"
+            and str(r.get("status", "")).lower() == "filled"
+        ]
+        assert len(terminal_fills) == 1, \
+            "A terminal fill_check row should be written even when a non-terminal one exists"
+
+
+# ---------------------------------------------------------------------------
+# Cancel-before-close
+# ---------------------------------------------------------------------------
+
+
+class TestCancelBeforeClose:
+    """close_for_watchdog and _paper_reduce cancel open orders before close_position."""
+
+    def test_cancel_before_close_called_in_close_for_watchdog(self, tmp_path):
+        """close_for_watchdog calls _cancel_open_orders_for_symbol before close_position."""
+        from tradingagents.integrations.alpaca import executor as ex
+
+        cfg = _cfg(tmp_path)
+        call_order = []
+
+        class _TrackingClient:
+            def get_open_position(self, tk):
+                pos = MagicMock()
+                pos.market_value = "5000"
+                return pos
+            def get_orders(self, req):
+                call_order.append("get_orders")
+                return []
+            def cancel_order_by_id(self, oid):
+                call_order.append("cancel")
+            def close_position(self, tk, **kwargs):
+                call_order.append("close")
+                r = MagicMock()
+                r.id = "close-id"
+                return r
+
+        with patch.object(ex, "enabled", return_value=True), \
+             patch.object(ex, "_client", return_value=_TrackingClient()), \
+             patch.object(ex, "_notify"):
+            ex.close_for_watchdog(cfg, "SMCI", 1.0, "test_rule")
+
+        # get_orders must be called before close
+        assert "get_orders" in call_order
+        assert "close" in call_order
+        close_idx = call_order.index("close")
+        orders_idx = call_order.index("get_orders")
+        assert orders_idx < close_idx, "get_orders must be called before close_position"
+
+    def test_cancel_helper_silent_on_failure(self, tmp_path):
+        """_cancel_open_orders_for_symbol never raises on any failure."""
+        from tradingagents.integrations.alpaca import executor as ex
+
+        class _FailClient:
+            def get_orders(self, req):
+                raise Exception("network error")
+
+        result = ex._cancel_open_orders_for_symbol(_FailClient(), "AAPL")
+        assert result == 0
+
+
+# ---------------------------------------------------------------------------
+# Entry-expired phantom-state unwind
+# ---------------------------------------------------------------------------
+
+
+class TestEntryExpiredUnwind:
+    """reconcile_fills detects unfilled-terminal orders and unwinds phantom state."""
+
+    def _write_catalyst_entry(
+        self,
+        cfg: Dict[str, Any],
+        order_id: str,
+        proposal_ts: str,
+        ticker: str = "SMCI",
+    ) -> None:
+        _pa_dir(cfg)
+        row = {
+            "ts": proposal_ts,
+            "ticker": ticker,
+            "action": "buy",
+            "status": "submitted",
+            "order_id": order_id,
+            "notional_usd": 5000.0,
+            "intended_price": 100.0,
+            "fill_check_pending": True,
+            "catalyst_stop_pending": True,
+            "sleeve": "catalyst",
+            "proposal_ts": proposal_ts,
+        }
+        ledger = Path(cfg["portfolio_advisor_dir"]) / "alpaca_trades.jsonl"
+        with ledger.open("a") as fh:
+            fh.write(json.dumps(row) + "\n")
+
+    def test_entry_expired_writes_ledger_row(self, tmp_path):
+        """Expired unfilled DAY limit → entry_expired ledger row is written."""
+        from tradingagents.integrations.alpaca import executor as ex
+
+        cfg = _cfg(tmp_path)
+        order_id = "expired-order-1"
+        proposal_ts = "2026-06-10T09:00:00+00:00"
+        self._write_catalyst_entry(cfg, order_id, proposal_ts)
+
+        expired_order = MagicMock()
+        expired_order.id = order_id
+        expired_order.status = "expired"
+        expired_order.filled_avg_price = None
+        expired_order.filled_qty = "0"
+
+        with patch.object(ex, "enabled", return_value=True), \
+             patch.object(ex, "_client") as mock_client_fn:
+            mock_c = MagicMock()
+            mock_c.get_orders.return_value = [expired_order]
+            mock_c.get_open_position.side_effect = Exception("no position")
+            mock_client_fn.return_value = mock_c
+
+            ex.reconcile_fills(cfg)
+
+        ledger = Path(cfg["portfolio_advisor_dir"]) / "alpaca_trades.jsonl"
+        rows = [json.loads(l) for l in ledger.read_text().splitlines() if l.strip()]
+        expired_rows = [r for r in rows if r.get("action") == "entry_expired"]
+        assert len(expired_rows) == 1
+        assert expired_rows[0]["ticker"] == "SMCI"
+        assert expired_rows[0]["order_id"] == order_id
+
+    def test_entry_expired_cancels_proposal(self, tmp_path):
+        """Expired unfilled order → originating proposal row marked cancelled."""
+        from tradingagents.integrations.alpaca import executor as ex
+        from tradingagents.portfolio_advisor import proposals as prop
+
+        cfg = _cfg(tmp_path)
+        now_ts = "2026-06-10T09:00:00+00:00"
+        order_id = "expired-order-2"
+        self._write_catalyst_entry(cfg, order_id, now_ts, ticker="SMCI")
+
+        # Write a proposals row with matching ts
+        prop_rows = [{
+            "ts": now_ts,
+            "ticker": "SMCI",
+            "action": "buy",
+            "status": "executed",
+            "sleeve": "catalyst",
+        }]
+        prop.save_all(cfg, prop_rows)
+
+        expired_order = MagicMock()
+        expired_order.id = order_id
+        expired_order.status = "expired"
+        expired_order.filled_avg_price = None
+        expired_order.filled_qty = "0"
+
+        with patch.object(ex, "enabled", return_value=True), \
+             patch.object(ex, "_client") as mock_client_fn:
+            mock_c = MagicMock()
+            mock_c.get_orders.return_value = [expired_order]
+            mock_c.get_open_position.side_effect = Exception("no position")
+            mock_client_fn.return_value = mock_c
+
+            ex.reconcile_fills(cfg)
+
+        updated = prop.load_all(cfg)
+        smci_rows = [r for r in updated if r.get("ticker") == "SMCI"]
+        assert smci_rows, "SMCI proposal must still exist"
+        assert smci_rows[0]["status"] == "cancelled"
+        assert "entry expired" in (smci_rows[0].get("status_note") or "")
+
+    def test_entry_expired_deletes_plan_when_no_position(self, tmp_path):
+        """Expired unfilled order → PositionPlan deleted when no position exists."""
+        from tradingagents.integrations.alpaca import executor as ex
+        from tradingagents.portfolio_advisor.position_plans import (
+            PositionPlan, upsert_position_plan, load_position_plans,
+        )
+
+        cfg = _cfg(tmp_path)
+        _pa_dir(cfg)
+        order_id = "expired-order-3"
+        proposal_ts = "2026-06-10T09:00:00+00:00"
+        self._write_catalyst_entry(cfg, order_id, proposal_ts, ticker="SMCI")
+
+        # Create phantom plan
+        plan = PositionPlan(ticker="SMCI", entry_price=100.0, strategy="catalyst")
+        upsert_position_plan(cfg, plan)
+
+        expired_order = MagicMock()
+        expired_order.id = order_id
+        expired_order.status = "canceled"
+        expired_order.filled_avg_price = None
+        expired_order.filled_qty = "0"
+
+        with patch.object(ex, "enabled", return_value=True), \
+             patch.object(ex, "_client") as mock_client_fn:
+            mock_c = MagicMock()
+            mock_c.get_orders.return_value = [expired_order]
+            # No position exists
+            mock_c.get_open_position.side_effect = Exception("no position")
+            mock_client_fn.return_value = mock_c
+
+            ex.reconcile_fills(cfg)
+
+        plans = load_position_plans(cfg)
+        assert "SMCI" not in plans, \
+            "Phantom PositionPlan must be deleted when entry expired unfilled and no position exists"
+
+    def test_entry_expired_keeps_plan_when_position_exists(self, tmp_path):
+        """Plan is NOT deleted when a real position exists (rare: partial fill scenario)."""
+        from tradingagents.integrations.alpaca import executor as ex
+        from tradingagents.portfolio_advisor.position_plans import (
+            PositionPlan, upsert_position_plan, load_position_plans,
+        )
+
+        cfg = _cfg(tmp_path)
+        _pa_dir(cfg)
+        order_id = "canceled-order-with-pos"
+        proposal_ts = "2026-06-10T09:00:00+00:00"
+        self._write_catalyst_entry(cfg, order_id, proposal_ts, ticker="NVDA")
+
+        # Plan exists and so does an Alpaca position
+        plan = PositionPlan(ticker="NVDA", entry_price=100.0, strategy="catalyst")
+        upsert_position_plan(cfg, plan)
+
+        expired_order = MagicMock()
+        expired_order.id = order_id
+        expired_order.status = "canceled"
+        expired_order.filled_avg_price = None
+        expired_order.filled_qty = "0"
+
+        with patch.object(ex, "enabled", return_value=True), \
+             patch.object(ex, "_client") as mock_client_fn:
+            mock_c = MagicMock()
+            mock_c.get_orders.return_value = [expired_order]
+            # Position DOES exist
+            pos_mock = MagicMock()
+            pos_mock.symbol = "NVDA"
+            mock_c.get_open_position.return_value = pos_mock
+            mock_client_fn.return_value = mock_c
+
+            ex.reconcile_fills(cfg)
+
+        plans = load_position_plans(cfg)
+        assert "NVDA" in plans, "Plan must NOT be deleted when a real position still exists"
+
+
+# ---------------------------------------------------------------------------
+# Deferred catalyst entries flow
+# ---------------------------------------------------------------------------
+
+
+class TestDeferredCatalystEntries:
+    """Market closed → deferred_market_closed status → execute_deferred_entries at open."""
+
+    def test_closed_market_returns_deferred_not_skipped(self, tmp_path):
+        """_paper_buy returns 'deferred' string (not 'skipped') when market is closed."""
+        from tradingagents.integrations.alpaca import executor as ex
+
+        cfg = _cfg(tmp_path)
+        client = _make_client()
+
+        with patch.object(ex, "_latest_quote", return_value=None), \
+             patch.object(ex, "market_clock", return_value={"is_open": False}):
+            result = ex._paper_buy(cfg, client, 100_000.0, "SMCI", _catalyst_proposal("SMCI"))
+
+        assert result.startswith("deferred"), f"Expected 'deferred' prefix, got: {result!r}"
+        client.submit_order.assert_not_called()
+
+    def test_execute_proposal_maps_deferred_correctly(self, tmp_path):
+        """execute_proposal returns status='deferred' for closed-market catalyst."""
+        from tradingagents.integrations.alpaca import executor as ex
+
+        cfg = _cfg(tmp_path)
+
+        with patch.object(ex, "enabled", return_value=True), \
+             patch.object(ex, "_client") as mock_client_fn, \
+             patch.object(ex, "_latest_quote", return_value=None), \
+             patch.object(ex, "market_clock", return_value={"is_open": False}):
+            mock_c = _make_client()
+            mock_client_fn.return_value = mock_c
+
+            result = ex.execute_proposal(cfg, {
+                "ticker": "SMCI", "action": "buy",
+                "approx_usd": 5000.0, "sleeve": "catalyst",
+                "catalyst_date": "2026-09-15",
+            })
+
+        assert result["status"] == "deferred", \
+            f"execute_proposal must return status='deferred', got {result['status']!r}"
+
+    def test_proposals_add_sets_deferred_status(self, tmp_path):
+        """proposals.add sets status='deferred_market_closed' when executor returns deferred."""
+        from tradingagents.portfolio_advisor import proposals as prop
+
+        cfg = {
+            "portfolio_advisor_dir": str(tmp_path / "pa"),
+            "portfolio_advisor_alpaca_paper": True,
+        }
+        Path(cfg["portfolio_advisor_dir"]).mkdir(parents=True, exist_ok=True)
+
+        mock_result = {"status": "deferred", "detail": "market closed — catalyst entry deferred"}
+
+        from tradingagents.integrations.alpaca import executor as ex
+        with patch.object(ex, "execute_proposal", return_value=mock_result), \
+             patch.object(ex, "enabled", return_value=True):
+            entry = prop.add(
+                cfg,
+                ticker="SMCI",
+                action="buy",
+                approx_usd=5000.0,
+                sleeve="catalyst",
+                catalyst_date="2026-09-15",
+                reason="test deferred",
+            )
+
+        all_rows = prop.load_all(cfg)
+        smci = [r for r in all_rows if r.get("ticker") == "SMCI"]
+        assert smci, "SMCI proposal must exist"
+        assert smci[0]["status"] == "deferred_market_closed", \
+            f"Expected 'deferred_market_closed', got {smci[0]['status']!r}"
+
+    def test_execute_deferred_entries_retries_at_open(self, tmp_path):
+        """execute_deferred_entries re-attempts deferred rows when market is open."""
+        from tradingagents.integrations.alpaca import executor as ex
+        from tradingagents.portfolio_advisor import proposals as prop
+        from datetime import datetime, timezone
+
+        cfg = {
+            "portfolio_advisor_dir": str(tmp_path / "pa"),
+            "portfolio_advisor_alpaca_paper": True,
+        }
+        Path(cfg["portfolio_advisor_dir"]).mkdir(parents=True, exist_ok=True)
+
+        # Write a deferred row (fresh)
+        now_ts = datetime.now(timezone.utc).isoformat()
+        deferred_row = {
+            "ts": now_ts,
+            "ticker": "SMCI",
+            "action": "buy",
+            "approx_usd": 5000.0,
+            "sleeve": "catalyst",
+            "catalyst_date": "2026-09-15",
+            "status": "deferred_market_closed",
+            "status_set_at": now_ts,
+        }
+        prop.save_all(cfg, [deferred_row])
+
+        execute_calls = []
+
+        def mock_execute(cfg_, proposal):
+            execute_calls.append(proposal.get("ticker"))
+            return {"status": "executed", "detail": "buy executed"}
+
+        with patch.object(ex, "enabled", return_value=True), \
+             patch.object(ex, "market_clock", return_value={"is_open": True}), \
+             patch.object(ex, "execute_proposal", side_effect=mock_execute):
+            count = ex.execute_deferred_entries(cfg)
+
+        assert count == 1, f"Expected 1 attempted, got {count}"
+        assert "SMCI" in execute_calls, "SMCI deferred entry must be re-attempted"
+
+        # Verify proposal was marked executed
+        updated = prop.load_all(cfg)
+        smci = [r for r in updated if r.get("ticker") == "SMCI"]
+        assert smci[0]["status"] == "executed"
+
+    def test_execute_deferred_entries_expires_old_rows(self, tmp_path):
+        """execute_deferred_entries cancels deferred rows older than 18h."""
+        from tradingagents.integrations.alpaca import executor as ex
+        from tradingagents.portfolio_advisor import proposals as prop
+        from datetime import datetime, timezone, timedelta
+
+        cfg = {
+            "portfolio_advisor_dir": str(tmp_path / "pa"),
+            "portfolio_advisor_alpaca_paper": True,
+        }
+        Path(cfg["portfolio_advisor_dir"]).mkdir(parents=True, exist_ok=True)
+
+        # Write a deferred row that is 20h old (expired)
+        old_ts = (datetime.now(timezone.utc) - timedelta(hours=20)).isoformat()
+        deferred_row = {
+            "ts": old_ts,
+            "ticker": "AAPL",
+            "action": "buy",
+            "approx_usd": 5000.0,
+            "sleeve": "catalyst",
+            "catalyst_date": "2026-09-15",
+            "status": "deferred_market_closed",
+            "status_set_at": old_ts,
+        }
+        prop.save_all(cfg, [deferred_row])
+
+        execute_calls = []
+
+        with patch.object(ex, "enabled", return_value=True), \
+             patch.object(ex, "market_clock", return_value={"is_open": True}), \
+             patch.object(ex, "execute_proposal", side_effect=lambda c, p: execute_calls.append(p)):
+            count = ex.execute_deferred_entries(cfg)
+
+        # Should NOT have attempted execution (expired)
+        assert "AAPL" not in execute_calls, "Expired deferred entry must not be re-executed"
+
+        # Row must be cancelled
+        updated = prop.load_all(cfg)
+        aapl = [r for r in updated if r.get("ticker") == "AAPL"]
+        assert aapl[0]["status"] == "cancelled"
+        assert "expired" in (aapl[0].get("status_note") or "")
+
+    def test_execute_deferred_skips_when_market_still_closed(self, tmp_path):
+        """execute_deferred_entries does nothing when market is still closed."""
+        from tradingagents.integrations.alpaca import executor as ex
+
+        cfg = {
+            "portfolio_advisor_dir": str(tmp_path / "pa"),
+            "portfolio_advisor_alpaca_paper": True,
+        }
+
+        execute_calls = []
+        with patch.object(ex, "enabled", return_value=True), \
+             patch.object(ex, "market_clock", return_value={"is_open": False}), \
+             patch.object(ex, "execute_proposal", side_effect=lambda c, p: execute_calls.append(p)):
+            count = ex.execute_deferred_entries(cfg)
+
+        assert count == 0
+        assert execute_calls == []

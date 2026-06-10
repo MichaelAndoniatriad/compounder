@@ -125,6 +125,10 @@ class PositionPlan:
     # True when this position was sized under the high-conviction tier — counts
     # against the concurrent HC slot cap while the position is open.
     high_conviction: bool = False
+    # Order id of the standalone GTC stop-market sell submitted after fill confirmation
+    # for catalyst positions (set by reconcile_fills after entry_filled).  Empty string
+    # means no broker-resident stop is currently active for this plan.
+    stop_order_id: str = ""
 
     def __post_init__(self) -> None:
         self.strategy = (self.strategy or _DEFAULT_STRATEGY).strip().lower()
@@ -201,6 +205,7 @@ def load_position_plans(cfg: Dict[str, Any]) -> Dict[str, PositionPlan]:
                 double_trim_done_at=str(data.get("double_trim_done_at") or ""),
                 pre_event_flat_done_at=str(data.get("pre_event_flat_done_at") or ""),
                 high_conviction=bool(data.get("high_conviction")),
+                stop_order_id=str(data.get("stop_order_id") or ""),
             )
         except (TypeError, ValueError):
             continue
