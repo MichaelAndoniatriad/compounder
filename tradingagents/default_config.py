@@ -180,10 +180,21 @@ DEFAULT_CONFIG = _apply_env_overrides({
     "portfolio_advisor_sleeve_targets": {"core": 0.50, "catalyst": 0.40, "cash": 0.10},
     # How far actual sleeve weight may drift from target before the PM flags it (fraction of total).
     "portfolio_advisor_sleeve_drift_tolerance": 0.07,
+    # After a position is closed (watchdog_exit, sell, or trim in the ledger), a new BUY
+    # for the same ticker within this many days is blocked (wash-loop prevention).
+    # Applies to both 'buy' and 'add' actions; the existing add-cooldown covers only
+    # sequential adds, not re-entry after a stop-out.
+    "portfolio_advisor_reentry_cooldown_days": 5,
     # Catalyst-sleeve exit rules (fractions of entry/peak; days for time-based exits).
     "portfolio_advisor_catalyst_hard_stop_pct": 0.08,        # exit if down 8% from entry
-    "portfolio_advisor_catalyst_trailing_activate_pct": 0.10,  # trailing arms once up 10% from entry
-    "portfolio_advisor_catalyst_trailing_stop_pct": 0.08,    # then exit if down 8% from peak
+    # Trailing stop arm threshold: trailing activates once the position is up this much from entry.
+    # Arms at +5% (not +10%) so the +5..+10% "dead zone" (below the old arm, above time-stop) is covered.
+    "portfolio_advisor_catalyst_trail_arm_pct": 0.05,        # trailing arms once up 5% from entry
+    # Trailing stop distance: exit if price falls this far below the running peak.
+    "portfolio_advisor_catalyst_trail_dist_pct": 0.08,       # then exit if down 8% from peak
+    # Legacy keys kept for backward compatibility — prefer the new trail_arm/trail_dist keys above.
+    "portfolio_advisor_catalyst_trailing_activate_pct": 0.10,  # (legacy) trailing arms once up 10% from entry
+    "portfolio_advisor_catalyst_trailing_stop_pct": 0.08,    # (legacy) then exit if down 8% from peak
     "portfolio_advisor_catalyst_time_stop_days": 3,          # days after catalyst date to exit if move didn't happen
     "portfolio_advisor_catalyst_max_hold_days": 30,          # hard hold cap when no catalyst date is set
     # Dip-watch (quality-on-a-dip): watch CORE watchlist names for a SHALLOW pullback
@@ -446,10 +457,13 @@ DEFAULT_CONFIG = _apply_env_overrides({
         ".AX":  "^AXJO",    # Australia (ASX 200)
         "":     "SPY",      # default for US-listed tickers (no suffix)
     },
-    # EP scanner news sources. Default: Alpha Vantage only (current behaviour).
-    # Per docs/ep_gate_audit.md the structural fix is to add a second feed; once
-    # a Yahoo Finance RSS adapter exists, set this to ["alpha_vantage", "yahoo_finance_rss"]
-    # so the scanner deduplicates by title hash and unions the two feeds.
-    # Keep as a list so future sources can be added without breaking existing config.
-    "ep_scanner_news_sources": ["alpha_vantage"],
+    # EP scanner news sources. Yahoo Finance RSS is now enabled alongside Alpha
+    # Vantage per the Option B fix in docs/ep_gate_audit.md. The scanner deduplicates
+    # by URL (preferred) or (source, title) fallback, so overlap is harmless.
+    # Add future sources here without changing any other code.
+    "ep_scanner_news_sources": ["alpha_vantage", "yahoo_finance_rss"],
+    # How far out a catalyst date may be for an EP candidate or catalyst-sleeve proposal
+    # to be accepted. Beyond this window the thesis is speculative and the dated-event
+    # constraint loses meaning. Default 90 days. Must be a positive integer.
+    "portfolio_advisor_catalyst_max_days_out": 90,
 })

@@ -38,8 +38,9 @@ def _cfg(tmp_path: Path) -> Dict[str, Any]:
         "portfolio_advisor_catalyst_max_hold_days": 30,
         "portfolio_advisor_catalyst_time_stop_days": 3,
         "portfolio_advisor_catalyst_hard_stop_pct": 0.08,
-        "portfolio_advisor_catalyst_trailing_activate_pct": 0.10,
-        "portfolio_advisor_catalyst_trailing_stop_pct": 0.08,
+        # New configurable trailing-stop keys (default 0.05 arm, 0.08 dist).
+        "portfolio_advisor_catalyst_trail_arm_pct": 0.05,
+        "portfolio_advisor_catalyst_trail_dist_pct": 0.08,
     }
 
 
@@ -399,7 +400,10 @@ class TestF5CoreDoubleTrim:
 
 
 class TestF6CatalystTrailingStop:
-    """Trailing stop fires when peak >= entry*1.10 and price <= peak*0.92."""
+    """Trailing stop fires when peak >= entry*(1+trail_arm_pct) and price <= peak*(1-trail_dist_pct).
+
+    Default trail_arm_pct=0.05 (arms at +5%), trail_dist_pct=0.08 (exit at -8% from peak).
+    """
 
     @patch("tradingagents.integrations.alpaca.executor._client")
     @patch("tradingagents.integrations.alpaca.executor.enabled", return_value=True)
@@ -433,11 +437,16 @@ class TestF6CatalystTrailingStop:
     @patch("tradingagents.integrations.alpaca.executor._client")
     @patch("tradingagents.integrations.alpaca.executor.enabled", return_value=True)
     def test_trailing_stop_fires_when_armed_and_price_drops(self, mock_enabled, mock_client_fn, tmp_path):
-        """Trailing stop fires: peak >= entry*1.10 and price <= peak*0.92."""
+        """Trailing stop fires: peak >= entry*(1+trail_arm_pct) and price <= peak*(1-trail_dist_pct).
+
+        With defaults trail_arm_pct=0.05, trail_dist_pct=0.08:
+          entry=100, arm at 105; peak=115 >= 105 → armed; stop level = 115*0.92=105.8
+          price=105 <= 105.8 → trailing stop fires
+        """
         cfg = _cfg(tmp_path)
         from tradingagents.integrations.alpaca import executor as ex
 
-        # entry=100, peak=115 (>= 110 = entry*1.10 → armed), price=105 (< 115*0.92=105.8)
+        # entry=100, peak=115 (>= 105 = entry*(1+0.05) → armed), price=105 (< 115*(1-0.08)=105.8)
         _write_plan(cfg, "NVDA", entry_price=100.0, strategy="catalyst",
                     catalyst_date="2026-06-15", peak_price=115.0)
 
@@ -450,36 +459,45 @@ class TestF6CatalystTrailingStop:
         mock_client_fn.return_value = client
 
         closed = ex.enforce_paper_exits(cfg)
-        assert closed == 1, "Trailing stop should fire when price <= peak*0.92"
+        assert closed == 1, "Trailing stop should fire when price <= peak*(1-trail_dist_pct)"
 
     @patch("tradingagents.integrations.alpaca.executor._client")
     @patch("tradingagents.integrations.alpaca.executor.enabled", return_value=True)
     def test_trailing_stop_not_fire_before_arming(self, mock_enabled, mock_client_fn, tmp_path):
-        """Trailing stop must NOT fire when peak < entry*1.10 (not yet armed)."""
+        """Trailing stop must NOT fire when peak < entry*(1+trail_arm_pct) (not yet armed).
+
+        With default trail_arm_pct=0.05, arm threshold = entry*1.05 = 105.
+        Use peak=103 to be strictly below the arm threshold.
+        """
         cfg = _cfg(tmp_path)
         from tradingagents.integrations.alpaca import executor as ex
 
-        # entry=100, peak=105 (< 110 = entry*1.10 → NOT armed), price=96
+        # entry=100, peak=103 (< 105 = entry*(1+0.05) → NOT armed), price=96
         _write_plan(cfg, "AMD", entry_price=100.0, strategy="catalyst",
-                    catalyst_date="2026-06-15", peak_price=105.0)
+                    catalyst_date="2026-06-15", peak_price=103.0)
 
-        # price = 96 → would be below peak*0.92=96.6, but NOT armed (peak < 110)
+        # price = 96 → would be below peak*0.92=94.8 if armed, but NOT armed (peak 103 < 105)
         pos = _make_position("AMD", plpc=-0.04, market_value=4800.0, qty=50.0)  # price=96
         client = _make_client(positions=[pos])
         mock_client_fn.return_value = client
 
         closed = ex.enforce_paper_exits(cfg)
-        # -4% doesn't hit hard stop (-8%), trailing not armed, no time stop → no exit
-        assert closed == 0, "Trailing stop must not fire before peak crosses entry*1.10"
+        # -4% doesn't hit hard stop (-8%), trailing not armed (peak below arm threshold), no time stop → no exit
+        assert closed == 0, "Trailing stop must not fire before peak crosses entry*(1+trail_arm_pct)"
 
     @patch("tradingagents.integrations.alpaca.executor._client")
     @patch("tradingagents.integrations.alpaca.executor.enabled", return_value=True)
     def test_trailing_stop_not_fire_above_stop_level(self, mock_enabled, mock_client_fn, tmp_path):
-        """Trailing stop does not fire when price is still above the stop level."""
+        """Trailing stop does not fire when price is still above the stop level.
+
+        With default trail_arm_pct=0.05, trail_dist_pct=0.08:
+          entry=100, arm at 105; peak=120 >= 105 → armed; stop level = 120*(1-0.08)=110.4
+          price=115 > 110.4 → NO stop
+        """
         cfg = _cfg(tmp_path)
         from tradingagents.integrations.alpaca import executor as ex
 
-        # entry=100, peak=120 (armed), price=115 (> 120*0.92=110.4) → NO stop
+        # entry=100, peak=120 (armed at >=105), price=115 (> 120*0.92=110.4) → NO stop
         _write_plan(cfg, "SHOP", entry_price=100.0, strategy="catalyst",
                     catalyst_date="2026-06-15", peak_price=120.0)
 
@@ -534,9 +552,10 @@ class TestF6CatalystTimeStop:
         mock_client_fn.return_value = client
 
         closed = ex.enforce_paper_exits(cfg)
-        # No hard stop (-10% is above -8%... wait, +10% is above entry, no hard stop
-        # Trailing: peak=110 >= entry*1.10=110 → armed; price=110 > 110*0.92=101.2 → NO trailing
-        # Time stop: position has run (110 >= 105) → no time stop
+        # No hard stop (+10% is above entry, not a loss)
+        # Trailing: peak=110 >= entry*(1+0.05)=105 → armed; stop level = 110*(1-0.08)=101.2;
+        #   price=110 > 101.2 → NO trailing stop
+        # Time stop: position has run (110 >= entry*1.05=105) → no time stop
         assert closed == 0, "Time stop must not fire when position has run"
 
     @patch("tradingagents.integrations.alpaca.executor._client")
@@ -617,7 +636,11 @@ class TestF6PeakHelpers:
         assert result is None, "Core plans should not update catalyst peak"
 
     def test_eval_catalyst_exit_trailing_fires(self, tmp_path):
-        """eval_catalyst_exit returns trailing stop rule when conditions met."""
+        """eval_catalyst_exit returns trailing stop rule when conditions met.
+
+        Default trail_arm_pct=0.05: arms at entry*1.05=105.
+        peak=115 >= 105 → armed; stop level = 115*(1-0.08)=105.8; price=105 <= 105.8 → fires.
+        """
         from tradingagents.portfolio_advisor.position_plans import (
             PositionPlan, CatalystRules, eval_catalyst_exit,
         )
@@ -627,16 +650,20 @@ class TestF6PeakHelpers:
             entry_price=100.0,
             strategy="catalyst",
             catalyst_date="2026-06-15",
-            peak_price=115.0,  # >= entry*1.10=110 → armed
+            peak_price=115.0,  # >= entry*(1+0.05)=105 → armed with default trail_arm_pct=0.05
         )
-        rules = CatalystRules(trailing_activate_pct=0.10, trailing_stop_pct=0.08)
+        rules = CatalystRules(trailing_activate_pct=0.05, trailing_stop_pct=0.08)
 
         # price = 105 <= 115 * 0.92 = 105.8 → trailing fires
         result = eval_catalyst_exit(plan, 105.0, rules)
         assert result == "paper_catalyst_trailing_stop"
 
     def test_eval_catalyst_exit_trailing_not_fire_when_not_armed(self, tmp_path):
-        """eval_catalyst_exit returns None when peak < entry*1.10 (trailing not armed)."""
+        """eval_catalyst_exit returns None when peak < entry*(1+trail_arm_pct) (trailing not armed).
+
+        Default trail_arm_pct=0.05: arms at entry*1.05=105.
+        Use peak=103 (< 105) to be below the arm threshold.
+        """
         from tradingagents.portfolio_advisor.position_plans import (
             PositionPlan, CatalystRules, eval_catalyst_exit,
         )
@@ -646,9 +673,9 @@ class TestF6PeakHelpers:
             entry_price=100.0,
             strategy="catalyst",
             catalyst_date="2026-06-15",
-            peak_price=105.0,  # < entry*1.10=110 → NOT armed
+            peak_price=103.0,  # < entry*(1+0.05)=105 → NOT armed with default trail_arm_pct=0.05
         )
-        rules = CatalystRules(trailing_activate_pct=0.10, trailing_stop_pct=0.08)
+        rules = CatalystRules(trailing_activate_pct=0.05, trailing_stop_pct=0.08)
 
         # price = 96 → would be below stop IF armed, but arm threshold not reached
         result = eval_catalyst_exit(plan, 96.0, rules)
@@ -666,7 +693,7 @@ class TestF6PeakHelpers:
             entry_price=100.0,
             strategy="catalyst",
             catalyst_date=old_date,
-            peak_price=102.0,  # not armed (< 110)
+            peak_price=102.0,  # not armed (< 105 = entry*(1+0.05))
         )
         rules = CatalystRules(time_stop_days=3)
 
@@ -686,10 +713,10 @@ class TestF6PeakHelpers:
             entry_price=100.0,
             strategy="catalyst",
             catalyst_date=old_date,
-            peak_price=108.0,  # < 110 (not armed for trailing)
+            peak_price=108.0,  # >= entry*(1+0.05)=105 → trailing armed, but price > stop level
         )
         rules = CatalystRules(time_stop_days=3)
 
-        # price = 106 >= entry*1.05=105 → position ran → no time stop
+        # price = 106 >= entry*1.05=105 → position ran → no time stop (trailing: 108*0.92=99.36, 106>99.36 → no trail)
         result = eval_catalyst_exit(plan, 106.0, rules)
         assert result is None, "Time stop should not fire when position has run"

@@ -2306,7 +2306,7 @@ snapshot, do not create an action stance; queue follow-up research or ask for cl
 
 IMPORTANT — strategy sleeves: the portfolio runs two sleeves. core = long-term hold + growth (3-5yr: staged
 entry, +15% pre-earnings trim, -30%/-40% stops, thesis-break exit). catalyst = short-term event-driven (single
-entry before a dated catalyst, -8% hard stop, trailing stop after +10%, time-stop if the catalyst passes without
+entry before a dated catalyst, -8% hard stop, trailing stop after +5% (trail_arm_pct, configurable), time-stop if the catalyst passes without
 the move). The POSITION RULE STATUS block already applies the correct rules per position based on its sleeve.
 Treat a position's sleeve as fixed: never suggest reclassifying a losing catalyst trade as core to dodge its stop,
 or vice versa. If the human wants to keep a catalyst name long-term after the event, say that explicitly as a NEW

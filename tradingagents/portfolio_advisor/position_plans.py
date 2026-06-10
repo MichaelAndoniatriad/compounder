@@ -11,8 +11,9 @@ Each position is tagged with a strategy sleeve that determines which exit rules 
 
   catalyst (short-term, event-driven):
     - hard_stop: entry * (1 - catalyst_hard_stop_pct)   (default -8%)
-    - trailing_stop: once up trailing_activate_pct (default +10%), exit if down
-      trailing_stop_pct (default 8%) from the tracked peak
+    - trailing_stop: once up trail_arm_pct (default +5%), exit if down
+      trail_dist_pct (default 8%) from the tracked peak — arms earlier than the
+      old +10% threshold so the +5..+10% "dead zone" has a real exit rule
     - time_stop: exit time_stop_days after catalyst_date if the move didn't happen
     - max_hold: hard cap of max_hold_days when no catalyst_date is set
 
@@ -50,18 +51,32 @@ def _to_float(v: Any) -> Optional[float]:
 @dataclass
 class CatalystRules:
     hard_stop_pct: float = 0.08
-    trailing_activate_pct: float = 0.10
+    # Arms trailing stop once price is up trailing_activate_pct from entry.
+    # Config key: portfolio_advisor_catalyst_trail_arm_pct (default 0.05).
+    # The old key portfolio_advisor_catalyst_trailing_activate_pct (default 0.10)
+    # is accepted as a fallback for backward compatibility.
+    trailing_activate_pct: float = 0.05
+    # Exit when price falls trailing_stop_pct below the running peak.
+    # Config key: portfolio_advisor_catalyst_trail_dist_pct (default 0.08).
     trailing_stop_pct: float = 0.08
     time_stop_days: int = 3
     max_hold_days: int = 30
 
 
 def catalyst_rules_from_cfg(cfg: Dict[str, Any]) -> CatalystRules:
-    def _f(key: str, default: float) -> float:
+    def _f(key: str, default: float, *fallback_keys: str) -> float:
+        """Read key from cfg; try fallback_keys if key is absent; return default."""
         try:
-            return float(cfg.get(key, default))
+            v = cfg.get(key)
+            if v is not None:
+                return float(v)
+            for fk in fallback_keys:
+                fv = cfg.get(fk)
+                if fv is not None:
+                    return float(fv)
         except (TypeError, ValueError):
-            return default
+            pass
+        return default
 
     def _i(key: str, default: int) -> int:
         try:
@@ -71,8 +86,16 @@ def catalyst_rules_from_cfg(cfg: Dict[str, Any]) -> CatalystRules:
 
     return CatalystRules(
         hard_stop_pct=_f("portfolio_advisor_catalyst_hard_stop_pct", 0.08),
-        trailing_activate_pct=_f("portfolio_advisor_catalyst_trailing_activate_pct", 0.10),
-        trailing_stop_pct=_f("portfolio_advisor_catalyst_trailing_stop_pct", 0.08),
+        trailing_activate_pct=_f(
+            "portfolio_advisor_catalyst_trail_arm_pct",
+            0.05,
+            "portfolio_advisor_catalyst_trailing_activate_pct",
+        ),
+        trailing_stop_pct=_f(
+            "portfolio_advisor_catalyst_trail_dist_pct",
+            0.08,
+            "portfolio_advisor_catalyst_trailing_stop_pct",
+        ),
         time_stop_days=_i("portfolio_advisor_catalyst_time_stop_days", 3),
         max_hold_days=_i("portfolio_advisor_catalyst_max_hold_days", 30),
     )

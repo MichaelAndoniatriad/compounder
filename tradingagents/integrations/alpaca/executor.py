@@ -233,6 +233,15 @@ def _paper_buy(
 
     act = (proposal.get("action") or "").lower()
 
+    # Re-entry cooldown: if this ticker was recently closed (stop-out, sell, watchdog_exit),
+    # block a new buy for portfolio_advisor_reentry_cooldown_days (default 5) to prevent
+    # the PM from immediately re-entering a position it just stopped out of.
+    reentry_cooldown = int(cfg.get("portfolio_advisor_reentry_cooldown_days", 5) or 5)
+    reentry_skip = _reentry_cooldown_skip_reason(cfg, tk, reentry_cooldown)
+    if reentry_skip:
+        _log_row(cfg, {"ticker": tk, "action": act, "status": "skipped", "note": reentry_skip})
+        return f"skipped {tk}: {reentry_skip}"
+
     # A plain "buy" of a name the paper book already holds is the PM restating
     # itself — only an explicit "add" increases an existing position.
     if act == "buy":
@@ -328,6 +337,43 @@ def _cooldown_skip_reason(cfg: Dict[str, Any], tk: str, cooldown_days: int) -> s
                 ts = datetime.fromisoformat(str(row.get("ts") or "").replace("Z", "+00:00"))
                 if ts >= cutoff:
                     return f"cooldown: buy/add within last {cooldown_days}d"
+            except (TypeError, ValueError):
+                pass
+    return ""
+
+
+def _reentry_cooldown_skip_reason(cfg: Dict[str, Any], tk: str, cooldown_days: int) -> str:
+    """Return a non-empty skip reason if the same ticker was closed (watchdog_exit,
+    sell, or trim submitted) within cooldown_days in the alpaca ledger.
+
+    This is the buy-side re-entry guard: after a stop-out or manual exit the ticker
+    should not be re-bought for cooldown_days to prevent wash-loop churn.
+    Returns empty string when no recent close event is found.
+    """
+    from datetime import timedelta
+
+    p = _ledger_path(cfg)
+    if not p.is_file():
+        return ""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=cooldown_days)
+    _CLOSE_ACTIONS = ("sell", "trim", "watchdog_exit")
+    for line in p.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if (
+            row.get("status") == "submitted"
+            and str(row.get("ticker") or "").upper() == tk
+            and str(row.get("action") or "").lower() in _CLOSE_ACTIONS
+        ):
+            try:
+                ts = datetime.fromisoformat(str(row.get("ts") or "").replace("Z", "+00:00"))
+                days_ago = int((datetime.now(timezone.utc) - ts).days)
+                if ts >= cutoff:
+                    return f"re-entry cooldown: stopped out {days_ago}d ago"
             except (TypeError, ValueError):
                 pass
     return ""
@@ -496,12 +542,65 @@ def _latest_buys_from_ledger(cfg: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     return out
 
 
+def _sync_plan_entry_to_fill(
+    plan,
+    pos,
+    now_iso: str,
+) -> bool:
+    """Sync a position plan's entry_price to the Alpaca actual fill if they diverge.
+
+    Idempotent: only updates once (checks for 'entry synced to fill' in plan.notes).
+    Returns True if the plan was modified (caller must persist it).
+
+    The plan's entry_price may differ from the Alpaca avg_entry_price when the PM
+    proposed at a target price but the order filled at a gapped open. The divergence
+    causes phantom TRIGGERED stops in the PM prompt (plan shows stop at wrong level).
+    Fix: update plan.entry_price to the actual fill once, append an audit note.
+    """
+    # Idempotency guard: only sync once.
+    if "entry synced to fill" in (plan.notes or ""):
+        return False
+
+    fill_px: Optional[float] = None
+    try:
+        raw = getattr(pos, "avg_entry_price", None)
+        # Only accept numeric types or string representations; reject MagicMock etc.
+        if isinstance(raw, (int, float, str)) and raw not in ("", None):
+            fill_px = float(raw) or None
+    except (TypeError, ValueError):
+        pass
+    if fill_px is None or fill_px <= 0:
+        return False
+
+    entry = plan.entry_price
+    if entry <= 0:
+        return False
+
+    divergence = abs(fill_px - entry) / entry
+    if divergence <= 0.005:
+        return False
+
+    # Divergence exceeds 0.5% — update to fill price.
+    old_entry = entry
+    plan.entry_price = round(fill_px, 6)
+    note = f"entry synced to fill {fill_px:.4f} on {now_iso[:10]} (was {old_entry:.4f}, diverged {divergence*100:.2f}%)"
+    plan.notes = ((plan.notes or "").rstrip() + "\n" + note).strip()
+    plan.last_updated = now_iso
+    return True
+
+
 def enforce_paper_exits(cfg: Dict[str, Any]) -> int:
     """Deterministic exits for paper positions every watchdog tick.
 
+    At the top of each tick, auto-created plans whose entry_price diverges from
+    the Alpaca avg_entry_price by >0.5% are synced once to the actual fill price
+    (see _sync_plan_entry_to_fill). This prevents phantom TRIGGERED stops when
+    the PM proposed at target_price but the fill gapped.
+
     Sleeve rules applied each tick:
       catalyst: close at ≤ -8% unrealized (hard stop); trailing stop once peak
-                >= entry*1.10 and price falls 8%+ from peak; time stop 3d after
+                >= entry*(1+trail_arm_pct) (default +5%) and price falls
+                trail_dist_pct (default 8%) from peak; time stop 3d after
                 catalyst_date when the expected move did not happen; max-hold
                 fallback when no catalyst_date is set.
       core:     close at ≤ -40% unrealized (hard stop); close 50% once when
@@ -574,6 +673,19 @@ def enforce_paper_exits(cfg: Dict[str, Any]) -> int:
             # Plan-first sleeve resolution.
             plan = plans.get(tk)
             buy = buys.get(tk, {})
+
+            # Fix 2: Sync auto-created plan entry_price to actual Alpaca fill once.
+            # A gapped open can diverge plan.entry_price from avg_entry_price by >0.5%,
+            # causing phantom TRIGGERED stops in the PM prompt. Sync is idempotent.
+            if plan is not None:
+                try:
+                    now_iso = now.isoformat()
+                    if _sync_plan_entry_to_fill(plan, pos, now_iso):
+                        plans[tk] = plan
+                        plans_dirty = True
+                        logger.debug("enforce_paper_exits: synced entry_price for %s to fill", tk)
+                except Exception:
+                    logger.debug("enforce_paper_exits: fill sync failed for %s", tk, exc_info=True)
 
             if plan is not None:
                 # Trust the plan — it was set at buy time and captures the intent.

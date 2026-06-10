@@ -317,6 +317,15 @@ def build_pm_tools(cfg: Dict[str, Any], live_tickers: set) -> List[Any]:
                 "NOT the -8% catalyst stop. Don't file a name in 'catalyst' just to fill "
                 "the sleeve."
             )
+        # Guard: when a catalyst_date is supplied for a buy/add, it must be a valid
+        # future date within the max look-ahead window. A hallucinated or past date
+        # would drive a real autonomous entry on a stale thesis.
+        if (sleeve or "").strip().lower() == "catalyst" and act in ("buy", "add") \
+                and (catalyst_date or "").strip():
+            from tradingagents.portfolio_advisor.candidates import validate_catalyst_date
+            _valid, _err = validate_catalyst_date(catalyst_date, cfg)
+            if not _valid:
+                return f"error: {_err}"
         try:
             from tradingagents.portfolio_advisor import proposals as _proposals
             # add() supersedes any existing open proposal for the same ticker+side,
@@ -672,11 +681,19 @@ def build_pm_tools(cfg: Dict[str, Any], live_tickers: set) -> List[Any]:
         usd_position = round(shares * float(entry_price), 2)
 
         # Autonomous mode: file a buy proposal when a dated catalyst is present.
-        # Hard guard: no catalyst_date → advisory-only regardless of mode.
+        # Hard guards:
+        #   1. no catalyst_date → advisory-only regardless of mode.
+        #   2. catalyst_date is past or too far out → advisory-only, message says why.
         _dated_catalyst = (catalyst_date or "").strip()
         _mode = etoro_scan.account_mode()
         _proposal_filed = False
-        if _mode == "alpaca" and _dated_catalyst:
+        _date_advisory_reason = ""  # non-empty → date was invalid; stay advisory
+        if _dated_catalyst:
+            from tradingagents.portfolio_advisor.candidates import validate_catalyst_date
+            _date_ok, _date_err = validate_catalyst_date(_dated_catalyst, cfg)
+            if not _date_ok:
+                _date_advisory_reason = _date_err
+        if _mode == "alpaca" and _dated_catalyst and not _date_advisory_reason:
             try:
                 from tradingagents.portfolio_advisor import proposals as _proposals
                 _proposals.add(
@@ -702,6 +719,9 @@ def build_pm_tools(cfg: Dict[str, Any], live_tickers: set) -> List[Any]:
                     "emit_ep_candidate: failed to file proposal for %s", tk
                 )
 
+        _advisory_note = ""
+        if not _proposal_filed and _date_advisory_reason:
+            _advisory_note = f"ADVISORY-ONLY (catalyst date invalid: {_date_advisory_reason})\n"
         body = (
             f"EP {'PROPOSAL' if _proposal_filed else 'RECOMMENDATION'}: {tk} [{tier}]\n"
             f"Catalyst: {catalyst}\n"
@@ -714,6 +734,7 @@ def build_pm_tools(cfg: Dict[str, Any], live_tickers: set) -> List[Any]:
             + (
                 f"Action: AUTONOMOUS BUY QUEUED — proposal filed for auto-execution.\n"
                 if _proposal_filed else
+                _advisory_note +
                 f"Action: enter at next session open if gap held through close (Section 5.2).\n"
                 f"Reply: 'entered {tk} <shares>sh @ <price>' to log; 'skipped' to discard.\n"
             )
@@ -728,7 +749,12 @@ def build_pm_tools(cfg: Dict[str, Any], live_tickers: set) -> List[Any]:
             rec_ticker=tk,
             rec_rationale=f"{catalyst} | gap={gap_pct:+.1f}% | sector={sector or 'unknown'}",
         )
-        status = "proposal filed" if _proposal_filed else "advisory recommendation emitted"
+        if _proposal_filed:
+            status = "proposal filed"
+        elif _date_advisory_reason:
+            status = f"advisory-only (catalyst date invalid: {_date_advisory_reason})"
+        else:
+            status = "advisory recommendation emitted"
         return f"emitted EP {status} for {tk}: entry=${entry_price} stop=${stop_price} risk=${usd_risk} shares={shares}"
 
     @tool

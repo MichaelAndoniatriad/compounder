@@ -10,15 +10,59 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Literal, Optional
+from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple
 
 from tradingagents.agents.utils.rating import parse_rating
 from tradingagents.agents.utils.event_log import append_event
 from tradingagents.portfolio_advisor import state
 
 CandidateStatus = Literal["candidate", "watch", "research_queued", "rejected", "promoted"]
+
+
+def validate_catalyst_date(
+    catalyst_date: str,
+    cfg: Optional[Dict[str, Any]] = None,
+) -> Tuple[bool, str]:
+    """Validate that a catalyst_date string is a parseable ISO date that is
+    present-or-future and within ``portfolio_advisor_catalyst_max_days_out``
+    days from today (default 90).
+
+    Returns (valid: bool, error_message: str).  error_message is empty when
+    valid is True.  Intended for use in pm_tools.propose_trade,
+    pm_tools.emit_ep_candidate, and the candidates gate below.
+    """
+    date_str = (catalyst_date or "").strip()
+    if not date_str:
+        return False, "catalyst_date is missing — provide the ISO YYYY-MM-DD date of the event"
+    try:
+        parsed = date.fromisoformat(date_str)
+    except (ValueError, TypeError):
+        return False, (
+            f"catalyst_date '{date_str}' is not a valid ISO date (YYYY-MM-DD) — "
+            "verify the real event date before re-proposing"
+        )
+    today = date.today()
+    if parsed < today:
+        return False, (
+            f"catalyst_date {date_str} is in the past — "
+            "verify the real event date before re-proposing"
+        )
+    max_days = 90
+    if cfg:
+        try:
+            max_days = int(cfg.get("portfolio_advisor_catalyst_max_days_out", 90) or 90)
+        except (TypeError, ValueError):
+            max_days = 90
+    horizon = today + timedelta(days=max_days)
+    if parsed > horizon:
+        return False, (
+            f"catalyst_date {date_str} is more than {max_days} days out "
+            f"(limit: {horizon.isoformat()}) — this is too speculative for a dated catalyst trade; "
+            "re-propose closer to the event or use sleeve='core'"
+        )
+    return True, ""
 
 
 @dataclass
@@ -91,6 +135,7 @@ def evaluate_candidate(
     default_source: str = "monthly_lookout",
     theme: str = "",
     min_avg_daily_volume: int = 250_000,
+    cfg: Optional[Dict[str, Any]] = None,
 ) -> CandidateRecord:
     data = normalize_candidate(raw, default_source=default_source, theme=theme)
     ticker = data["ticker"]
@@ -139,21 +184,34 @@ def evaluate_candidate(
         strategy = "core"
 
     catalyst_ok = _bool_gate(data.get("catalyst_ok"))
-    catalyst_text = str(data.get("catalyst") or data.get("catalyst_date") or "").strip()
+    catalyst_text = str(data.get("catalyst") or "").strip()
+    catalyst_date_text = str(data.get("catalyst_date") or "").strip()
     if catalyst_ok is None:
-        catalyst_ok = bool(catalyst_text)
-    # A catalyst-sleeve candidate with no catalyst makes no sense — it is a hard failure.
+        catalyst_ok = bool(catalyst_text or catalyst_date_text)
+    # A catalyst-sleeve candidate with no catalyst makes no sense — hard failure.
+    # When a catalyst_date is present, also verify it is future-dated and within
+    # the max look-ahead window; an invalid/past date is also a hard failure.
     if strategy == "catalyst":
-        gates["catalyst"] = "pass" if catalyst_ok else "fail"
         if not catalyst_ok:
+            gates["catalyst"] = "fail"
             failures.append("missing_catalyst")
+        elif catalyst_date_text:
+            _date_valid, _date_err = validate_catalyst_date(catalyst_date_text, cfg)
+            if not _date_valid:
+                gates["catalyst"] = "fail"
+                gates["catalyst_date_reason"] = _date_err
+                failures.append("catalyst_date_invalid")
+            else:
+                gates["catalyst"] = "pass"
+        else:
+            gates["catalyst"] = "pass"
     else:
         gates["catalyst"] = "pass" if catalyst_ok else "unknown"
 
     full_graph_rating = str(data.get("full_graph_rating") or "").strip()
     priority = _priority(data.get("priority"))
     status: CandidateStatus
-    if any(f in failures for f in ("already_in_portfolio", "policy", "liquidity", "missing_catalyst")):
+    if any(f in failures for f in ("already_in_portfolio", "policy", "liquidity", "missing_catalyst", "catalyst_date_invalid")):
         status = "rejected"
         next_action = "Do not research until failed gates are resolved."
     elif full_graph_rating in {"Buy", "Overweight"} and priority <= 2:

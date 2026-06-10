@@ -146,7 +146,7 @@ List any missing figures explicitly. Do not guess prices or dates not shown abov
 
 _CATALYST_SCAN_PROMPT = """You are the desk lead evaluating whether a watchlist name fits as a CATALYST sleeve entry.
 A catalyst entry is short-term and event-driven: entry before a dated catalyst, hard stop at -8%, trailing
-stop after +10%, time-stop if the catalyst passes without the move, 30-day max hold.
+stop after +5% (configurable trail_arm_pct), time-stop if the catalyst passes without the move, 30-day max hold.
 Advisory only. No trade orders.
 {shared}
 
