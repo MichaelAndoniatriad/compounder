@@ -22,7 +22,7 @@ Implement in order — R1/R2 unblock everything else.
 
 ---
 
-## R1 — Execution machinery (BLOCKER: small-cap spreads eat the edge without this)
+## R1 — Execution machinery ✅ aacec0b (BLOCKER: small-cap spreads eat the edge without this)
 
 In `tradingagents/integrations/alpaca/executor.py`:
 1. **Marketable-limit entries.** Before a buy, fetch the latest quote (alpaca-py `StockHistoricalDataClient` + `StockLatestQuoteRequest`; free IEX feed; keys already in env). If quoted spread > `portfolio_advisor_max_spread_bps` (new cfg, default 100): skip with a logged+ledgered reason. Otherwise submit a LIMIT DAY order at ask × (1 + `portfolio_advisor_limit_slip_bps`/10000, default 10) instead of a market order. Quantity-based (qty = floor(notional/limit_price × 1000)/1000 fractional ok) since bracket orders need qty. If the quote fetch fails → fall back to current market-order behavior (large caps stay fine).
