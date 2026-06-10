@@ -172,6 +172,15 @@ def run_weekly_quick_check(cfg: Dict[str, Any]) -> Tuple[str, bool, Set[str]]:
     except Exception:
         logger.debug("alpaca scoreboard block skipped", exc_info=True)
 
+    try:
+        from tradingagents.portfolio_advisor.candidates import shadow_book_summary
+
+        shadow_block = shadow_book_summary(cfg)
+        if shadow_block:
+            lines.extend(["", shadow_block])
+    except Exception:
+        logger.debug("shadow book summary skipped", exc_info=True)
+
     lines.extend(["", "--- Account excerpt ---", portfolio_text[:4000]])
     digest = "\n".join(lines)
 

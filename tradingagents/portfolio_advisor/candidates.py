@@ -337,6 +337,197 @@ def append_candidate_events(cfg: Dict[str, Any], records: Iterable[CandidateReco
             continue
 
 
+def shadow_book_path(cfg: Dict[str, Any]) -> Path:
+    return state.advisor_dir(cfg) / "shadow_book.jsonl"
+
+
+def _mirror_gate_passers_to_shadow_book(cfg: Dict[str, Any], rows: List[CandidateRecord]) -> None:
+    """§6.2 Compounder 2.0 shadow book: open a small paper position for every candidate
+    that cleared the hard gates (status != 'rejected'). Equal-notional sizing so no
+    single name dominates. Records entry price via yfinance and logs to shadow_book.jsonl.
+
+    The shadow book answers "does the pipeline find alpha?" independently of the PM's
+    final picks. Positions are closed when the candidate is rejected or promoted (see
+    close_shadow_position). Outcomes feed the alpha-relative outcome tracker.
+
+    Config: portfolio_advisor_shadow_notional (default $500 per position).
+    Disabled via portfolio_advisor_shadow_book=False.
+    """
+    if not cfg.get("portfolio_advisor_shadow_book", True):
+        return
+
+    notional = float(cfg.get("portfolio_advisor_shadow_notional", 500) or 500)
+    pass_rows = [r for r in rows if r.status != "rejected"]
+    if not pass_rows:
+        return
+
+    # Load existing shadow positions to avoid duplicates
+    path = shadow_book_path(cfg)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    open_tickers: set = set()
+    if path.is_file():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+                if row.get("side") == "open" and not row.get("closed_at"):
+                    open_tickers.add(str(row.get("ticker") or "").upper())
+            except (json.JSONDecodeError, ValueError):
+                continue
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    new_entries = []
+    for r in pass_rows:
+        if r.ticker in open_tickers:
+            continue
+        try:
+            import yfinance as yf  # type: ignore
+            hist = yf.Ticker(r.ticker).history(period="5d")
+            if hist is None or len(hist) == 0:
+                continue
+            entry_price = float(hist["Close"].iloc[-1])
+        except Exception:
+            continue
+        shares = round(notional / entry_price, 6) if entry_price > 0 else 0
+        if shares <= 0:
+            continue
+        entry = {
+            "ts": now_iso,
+            "ticker": r.ticker,
+            "side": "open",
+            "entry_price": round(entry_price, 4),
+            "shares": shares,
+            "notional": notional,
+            "status": r.status,
+            "strategy": r.strategy or "unknown",
+            "source": r.source,
+            "reason": (r.reason or "")[:200],
+        }
+        new_entries.append(entry)
+
+    if new_entries:
+        with open(path, "a", encoding="utf-8") as f:
+            for e in new_entries:
+                f.write(json.dumps(e, ensure_ascii=False) + "\n")
+
+        try:
+            from tradingagents.portfolio_advisor import messaging
+            names = ", ".join(e["ticker"] for e in new_entries)
+            messaging.send_advisor_message(
+                cfg,
+                f"[SHADOW] Opened {len(new_entries)} positions",
+                f"Shadow book: opened {len(new_entries)} gate-passer positions at ~${notional:.0f} each: {names}",
+                urgent=False,
+            )
+        except Exception:
+            pass
+
+
+def close_shadow_position(cfg: Dict[str, Any], ticker: str, reason: str = "") -> Optional[Dict[str, Any]]:
+    """Close an open shadow position, record the alpha-relative return.
+
+    Called when a candidate is rejected (close short) or after the hold horizon.
+    Returns the outcome dict or None if no open position found.
+    """
+    path = shadow_book_path(cfg)
+    if not path.is_file():
+        return None
+
+    tk = ticker.strip().upper()
+    lines = path.read_text(encoding="utf-8").splitlines()
+    open_pos: Optional[Dict[str, Any]] = None
+    for line in reversed(lines):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+            if row.get("ticker") == tk and row.get("side") == "open" and not row.get("closed_at"):
+                open_pos = row
+                break
+        except (json.JSONDecodeError, ValueError):
+            continue
+
+    if open_pos is None:
+        return None
+
+    try:
+        import yfinance as yf  # type: ignore
+        hist = yf.Ticker(tk).history(period="5d")
+        if hist is None or len(hist) == 0:
+            return None
+        exit_price = float(hist["Close"].iloc[-1])
+    except Exception:
+        return None
+
+    entry_price = float(open_pos.get("entry_price") or 0)
+    if entry_price <= 0:
+        return None
+
+    raw_return = (exit_price - entry_price) / entry_price
+
+    # QQQ alpha
+    qqq_return = None
+    try:
+        from tradingagents.portfolio_advisor.outcome_tracker import _fetch_qqq_return
+        entry_ts = str(open_pos.get("ts") or "")[:10]
+        now_date = datetime.now(timezone.utc).date().isoformat()
+        qqq_return = _fetch_qqq_return(entry_ts, now_date)
+    except Exception:
+        pass
+
+    alpha = (raw_return - qqq_return) if qqq_return is not None else None
+    now_iso = datetime.now(timezone.utc).isoformat()
+    outcome: Dict[str, Any] = {
+        "ts": now_iso,
+        "ticker": tk,
+        "side": "close",
+        "closed_at": now_iso,
+        "entry_price": round(entry_price, 4),
+        "exit_price": round(exit_price, 4),
+        "raw_return": round(raw_return, 4),
+        "qqq_return": round(qqq_return, 4) if qqq_return is not None else None,
+        "alpha_vs_qqq": round(alpha, 4) if alpha is not None else None,
+        "reason": (reason or "")[:200],
+        "source": open_pos.get("source"),
+    }
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(outcome, ensure_ascii=False) + "\n")
+    return outcome
+
+
+def shadow_book_summary(cfg: Dict[str, Any]) -> str:
+    """Compact text block for the weekly digest: shadow book P&L vs QQQ."""
+    path = shadow_book_path(cfg)
+    if not path.is_file():
+        return ""
+    opens: Dict[str, Dict[str, Any]] = {}
+    closes: List[Dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if row.get("side") == "open" and not row.get("closed_at"):
+            opens[str(row.get("ticker") or "")] = row
+        elif row.get("side") == "close":
+            closes.append(row)
+
+    lines = ["--- Shadow book (pipeline gate-passers, not PM picks) ---"]
+    if closes:
+        alphas = [float(c["alpha_vs_qqq"]) for c in closes if c.get("alpha_vs_qqq") is not None]
+        hit_rate = sum(1 for a in alphas if a > 0) / len(alphas) if alphas else 0
+        mean_alpha = sum(alphas) / len(alphas) if alphas else 0
+        lines.append(f"Closed: {len(closes)} | alpha-positive: {hit_rate:.0%} | mean alpha: {mean_alpha:+.2%}")
+    else:
+        lines.append("No closed shadow positions yet.")
+    if opens:
+        lines.append(f"Open: {len(opens)} ({', '.join(sorted(opens))})")
+    return "\n".join(lines)
+
+
 def append_candidate_records(cfg: Dict[str, Any], records: Iterable[CandidateRecord]) -> None:
     rows = list(records)
     path = candidate_log_path(cfg)
@@ -346,6 +537,12 @@ def append_candidate_records(cfg: Dict[str, Any], records: Iterable[CandidateRec
             f.write(json.dumps(r.to_dict(), ensure_ascii=False) + "\n")
     update_candidate_state(cfg, rows)
     append_candidate_events(cfg, rows)
+    # §6.2 Compounder 2.0: shadow book — every candidate that clears the hard
+    # gates gets a small equal-notional paper position. This generates 5-10x
+    # more resolved outcomes per month than the advisor book alone, letting the
+    # learning loop converge faster. The shadow book is internal (paper_portfolio.py)
+    # rather than Alpaca, so it never mingles with the advisor track record.
+    _mirror_gate_passers_to_shadow_book(cfg, rows)
 
 
 def queue_candidate_research_jobs(cfg: Dict[str, Any], records: Iterable[CandidateRecord]) -> int:

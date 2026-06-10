@@ -13,6 +13,12 @@ count because already-measured entries are skipped by
 recommendation_log.load_due_for_measurement().
 
 Pluggable price fetcher: tests inject a mock. Production uses yfinance.
+
+Compounder 2.0 (§5.2): classification is ALPHA-RELATIVE — return minus QQQ
+over the same holding window. A pick that gains +6% while QQQ gains +8% is
+"bad" (-2% alpha), not "good". Absolute return is stored alongside but the
+headline metric and was_correct are driven by alpha. This is the only metric
+that matters for "does the system beat the alternative of buying QQQ?"
 """
 
 from __future__ import annotations
@@ -25,9 +31,10 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-# Classification thresholds (return as decimal, eg 0.05 = +5%)
-GOOD_THRESHOLD = 0.05
-BAD_THRESHOLD = -0.05
+# Alpha-relative classification thresholds (alpha = return minus QQQ, decimal)
+# e.g. GOOD_THRESHOLD = 0.02 means the pick must beat QQQ by ≥2% to be "good"
+GOOD_THRESHOLD = 0.02   # +2% alpha → good
+BAD_THRESHOLD = -0.02   # -2% alpha → bad
 
 
 def _outcomes_path(cfg: Dict[str, Any]) -> Path:
@@ -36,11 +43,25 @@ def _outcomes_path(cfg: Dict[str, Any]) -> Path:
     return pa_state.advisor_dir(cfg) / "outcomes.jsonl"
 
 
-def classify_outcome(return_pct: float) -> str:
-    """Return one of 'good', 'bad', 'neutral' from a fractional return."""
-    if return_pct >= GOOD_THRESHOLD:
+def _fetch_qqq_return(start_date: str, end_date: str) -> Optional[float]:
+    """Return QQQ fractional return over [start_date, end_date]. None on failure."""
+    try:
+        import yfinance as yf
+        hist = yf.Ticker("QQQ").history(start=start_date, end=end_date,
+                                         interval="1d", auto_adjust=False)
+        if hist is None or len(hist) < 2:
+            return None
+        return float(hist["Close"].iloc[-1]) / float(hist["Close"].iloc[0]) - 1
+    except Exception as e:
+        logger.debug("QQQ benchmark fetch failed: %s", e)
+        return None
+
+
+def classify_outcome(alpha_pct: float) -> str:
+    """Return one of 'good', 'bad', 'neutral' from an alpha (return minus QQQ) as decimal."""
+    if alpha_pct >= GOOD_THRESHOLD:
         return "good"
-    if return_pct <= BAD_THRESHOLD:
+    if alpha_pct <= BAD_THRESHOLD:
         return "bad"
     return "neutral"
 
@@ -156,7 +177,24 @@ def compute_recommendation_outcomes(
                 continue
 
             return_pct = (end_price - start_price) / start_price
-            classification = classify_outcome(return_pct)
+
+            # §5.2 Compounder 2.0: alpha-relative classification
+            qqq_return = _fetch_qqq_return(start_date, end_date)
+            if qqq_return is not None:
+                alpha = return_pct - qqq_return
+                classification = classify_outcome(alpha)
+            else:
+                # Fallback to absolute if QQQ fetch fails — log it so we notice
+                logger.warning("outcome tracker: QQQ benchmark unavailable for %s [%s, %s]; "
+                               "falling back to absolute return", ticker, start_date, end_date)
+                alpha = None
+                # Absolute fallback: ±5% (old thresholds)
+                if return_pct >= 0.05:
+                    classification = "good"
+                elif return_pct <= -0.05:
+                    classification = "bad"
+                else:
+                    classification = "neutral"
 
             outcome_record: Dict[str, Any] = {
                 "recommendation_id": rec.get("id"),
@@ -167,6 +205,8 @@ def compute_recommendation_outcomes(
                 "start_price": round(start_price, 4),
                 "end_price": round(end_price, 4),
                 "realised_return": round(return_pct, 4),
+                "qqq_return": round(qqq_return, 4) if qqq_return is not None else None,
+                "alpha_vs_qqq": round(alpha, 4) if alpha is not None else None,
                 "classification": classification,
                 "measured_at": datetime.now(timezone.utc).isoformat(),
                 "rule_ref": rec.get("rule_ref"),
@@ -194,12 +234,13 @@ def compute_recommendation_outcomes(
             except (TypeError, ValueError):
                 pnl_impact_est = None
 
+            alpha_str = f", alpha {alpha:+.2%}" if alpha is not None else ""
             recommendation_log.update_outcome(
                 cfg,
                 rec.get("id"),
                 was_correct=was_correct,
                 pnl_impact_est=pnl_impact_est,
-                note=f"horizon {horizon}d return {return_pct:+.2%} -> {classification}",
+                note=f"horizon {horizon}d return {return_pct:+.2%}{alpha_str} -> {classification}",
             )
 
             summary["measured"] += 1
@@ -241,7 +282,8 @@ def rule_performance_summary(
             continue
         rec = per_rule.setdefault(
             rule_ref,
-            {"rule_ref": rule_ref, "uses": 0, "good": 0, "bad": 0, "neutral": 0, "sum_score": 0, "sum_return": 0.0},
+            {"rule_ref": rule_ref, "uses": 0, "good": 0, "bad": 0, "neutral": 0,
+             "sum_score": 0, "sum_return": 0.0, "sum_alpha": 0.0},
         )
         rec["uses"] += 1
         cls = row.get("classification") or "neutral"
@@ -251,14 +293,22 @@ def rule_performance_summary(
             rec["sum_return"] += float(row.get("realised_return") or 0.0)
         except (TypeError, ValueError):
             pass
+        try:
+            alpha = row.get("alpha_vs_qqq")
+            if alpha is not None:
+                rec["sum_alpha"] += float(alpha)
+        except (TypeError, ValueError):
+            pass
 
     rules = []
     for rec in per_rule.values():
         uses = rec["uses"]
         rec["mean_score"] = round(rec["sum_score"] / uses, 3) if uses else 0.0
         rec["mean_return"] = round(rec["sum_return"] / uses, 4) if uses else 0.0
+        rec["mean_alpha"] = round(rec.get("sum_alpha", 0.0) / uses, 4) if uses else 0.0
         rec["pct_good"] = round(rec["good"] / uses * 100, 1) if uses else 0.0
         rec["pct_bad"] = round(rec["bad"] / uses * 100, 1) if uses else 0.0
+        rec["hit_rate"] = rec["pct_good"] / 100.0  # fraction alpha-positive
         rules.append(rec)
 
     rules.sort(key=lambda r: (r["mean_score"], r["uses"]), reverse=True)
@@ -286,19 +336,21 @@ def format_rule_performance_for_pm_prompt(
     if summary["total_outcomes"] == 0:
         return ""
 
-    lines = [f"[RULE PERFORMANCE] {summary['total_outcomes']} outcomes across {summary['total_rules']} rules."]
+    lines = [f"[RULE PERFORMANCE — alpha-relative] {summary['total_outcomes']} outcomes across {summary['total_rules']} rules."]
     if summary["top"]:
-        lines.append(f"Best ({top_n}):")
+        lines.append(f"Best alpha ({top_n}):")
         for r in summary["top"]:
+            flag = " ⚠ FLAGGED" if r.get("flagged") else ""
             lines.append(
-                f"  {r['rule_ref']}: {r['uses']} uses, {r['pct_good']:.0f}% good, "
-                f"avg return {r['mean_return']:+.2%}"
+                f"  {r['rule_ref']}: {r['uses']} uses, {r['pct_good']:.0f}% alpha-positive, "
+                f"avg alpha {r['mean_alpha']:+.2%}{flag}"
             )
     if summary["bottom"]:
-        lines.append(f"Worst ({top_n}):")
+        lines.append(f"Worst alpha ({top_n}):")
         for r in summary["bottom"]:
+            flag = " ⚠ FLAGGED" if r.get("flagged") else ""
             lines.append(
-                f"  {r['rule_ref']}: {r['uses']} uses, {r['pct_bad']:.0f}% bad, "
-                f"avg return {r['mean_return']:+.2%}"
+                f"  {r['rule_ref']}: {r['uses']} uses, {r['pct_bad']:.0f}% alpha-negative, "
+                f"avg alpha {r['mean_alpha']:+.2%}{flag}"
             )
     return "\n".join(lines)

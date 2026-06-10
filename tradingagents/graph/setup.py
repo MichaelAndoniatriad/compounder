@@ -43,11 +43,12 @@ class GraphSetup:
             return self.deep_thinking_llm
         return self.quick_thinking_llm
 
-    def setup_graph(
+    def setup_graph(  # noqa: PLR0912
         self,
         selected_analysts=["market", "social", "news", "fundamentals"],
         *,
         debate_enabled: bool = True,
+        risk_debate_enabled: bool = True,
     ):
         """Set up and compile the agent workflow graph.
 
@@ -61,6 +62,11 @@ class GraphSetup:
                 is included before Research And Execution. When False, analysts
                 feed directly into Research And Execution — saves 2+ LLM calls
                 but removes the adversarial signal.
+            risk_debate_enabled: When True (default), the aggressive/conservative
+                risk debate runs after Research And Execution. When False, R&E
+                feeds directly into the Portfolio Manager — saves 2 LLM calls.
+                Disable both flags to run the minimum viable graph (analysts →
+                R&E → PM) when scoreboard data shows debates add no alpha.
         """
         if len(selected_analysts) == 0:
             raise ValueError("Trading Agents Graph Setup Error: no analysts selected!")
@@ -180,25 +186,27 @@ class GraphSetup:
                 },
             )
 
-        # Research And Execution → risk debate → Portfolio Manager
-        workflow.add_edge("Research And Execution", "Aggressive Analyst")
-
-        workflow.add_conditional_edges(
-            "Aggressive Analyst",
-            self.conditional_logic.should_continue_risk_analysis,
-            {
-                "Conservative Analyst": "Conservative Analyst",
-                "Portfolio Manager": "Portfolio Manager",
-            },
-        )
-        workflow.add_conditional_edges(
-            "Conservative Analyst",
-            self.conditional_logic.should_continue_risk_analysis,
-            {
-                "Aggressive Analyst": "Aggressive Analyst",
-                "Portfolio Manager": "Portfolio Manager",
-            },
-        )
+        # Research And Execution → risk debate (optional) → Portfolio Manager
+        if risk_debate_enabled:
+            workflow.add_edge("Research And Execution", "Aggressive Analyst")
+            workflow.add_conditional_edges(
+                "Aggressive Analyst",
+                self.conditional_logic.should_continue_risk_analysis,
+                {
+                    "Conservative Analyst": "Conservative Analyst",
+                    "Portfolio Manager": "Portfolio Manager",
+                },
+            )
+            workflow.add_conditional_edges(
+                "Conservative Analyst",
+                self.conditional_logic.should_continue_risk_analysis,
+                {
+                    "Aggressive Analyst": "Aggressive Analyst",
+                    "Portfolio Manager": "Portfolio Manager",
+                },
+            )
+        else:
+            workflow.add_edge("Research And Execution", "Portfolio Manager")
 
         workflow.add_edge("Portfolio Manager", END)
 

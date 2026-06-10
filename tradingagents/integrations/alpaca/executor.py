@@ -105,6 +105,48 @@ def _scale_factor(cfg: Dict[str, Any], paper_equity: float) -> float:
     return 1.0
 
 
+def _confidence_size_multiplier(cfg: Dict[str, Any], confidence: Optional[float], ticker: str) -> float:
+    """§5.4 Compounder 2.0: confidence-weighted position sizing.
+
+    Linear scale: conf 0.5 → min_pct of book; conf 0.9 → max_pct of book.
+    Vol-dampened: divide by the 60-day realized-vol percentile (0.5–1.5 range)
+    so high-vol names get smaller positions at the same confidence.
+
+    Config keys:
+        portfolio_advisor_alpaca_conf_min_pct  (default 0.02 = 2%)
+        portfolio_advisor_alpaca_conf_max_pct  (default 0.06 = 6%)
+    Both are fractions of paper equity. The executor's separate
+    portfolio_advisor_alpaca_max_position_pct cap still applies after scaling.
+    """
+    min_pct = float(cfg.get("portfolio_advisor_alpaca_conf_min_pct", 0.02) or 0.02)
+    max_pct = float(cfg.get("portfolio_advisor_alpaca_conf_max_pct", 0.06) or 0.06)
+
+    if confidence is None:
+        # No confidence supplied — use mid-range (neutral sizing)
+        return (min_pct + max_pct) / 2 / max_pct
+
+    conf = max(0.0, min(1.0, float(confidence)))
+    # Linear interpolation between 0.5 and 0.9 confidence
+    t = max(0.0, min(1.0, (conf - 0.5) / 0.4))
+    target_pct = min_pct + t * (max_pct - min_pct)
+
+    # Vol dampener: shrink for high-vol names
+    try:
+        import yfinance as yf
+        hist = yf.Ticker(ticker).history(period="60d")["Close"]
+        if len(hist) >= 20:
+            returns = hist.pct_change().dropna()
+            vol = float(returns.std() * (252 ** 0.5))  # annualized
+            # Map vol to a dampener: vol 0.30 → 1.0 (neutral), 0.60+ → 1.5 (halved), 0.15 → 0.75 (boosted)
+            dampener = max(0.5, min(1.5, vol / 0.30))
+            target_pct = target_pct / dampener
+    except Exception:
+        pass  # skip dampener on any failure
+
+    # Return as a multiplier relative to the max_pct cap
+    return min(1.0, target_pct / max_pct)
+
+
 def _ensure_baseline(cfg: Dict[str, Any], equity: float) -> Dict[str, Any]:
     """Record the scoreboard baseline (start equity + SPY anchor) on first use."""
     p = _state_path(cfg)
@@ -180,7 +222,10 @@ def _paper_buy(
 
     scale = _scale_factor(cfg, equity)
     cap = float(cfg.get("portfolio_advisor_alpaca_max_position_pct", 0.10) or 0.10)
-    notional = round(min(usd * scale, equity * cap), 2)
+    # §5.4: confidence-weighted sizing — multiplier ∈ [0.2, 1.0] of the cap
+    conf = proposal.get("confidence")
+    conf_mult = _confidence_size_multiplier(cfg, conf, tk)
+    notional = round(min(usd * scale, equity * cap * conf_mult), 2)
     if notional < 1.0:
         _log_row(cfg, {"ticker": tk, "action": "buy", "status": "skipped", "note": f"notional {notional} < $1"})
         return f"skipped {tk}: scaled notional under $1"
@@ -199,11 +244,14 @@ def _paper_buy(
             "notional_usd": notional,
             "etoro_usd": usd,
             "scale": round(scale, 4),
+            "confidence": conf,
+            "conf_mult": round(conf_mult, 3),
             "sleeve": sleeve,
             "proposal_ts": proposal.get("ts"),
         },
     )
-    msg = f"BUY {tk} ~${notional:,.0f} ({sleeve}) submitted to Alpaca paper (scaled from ~${usd:,.0f} eToro-size)."
+    conf_note = f", conf {conf:.2f}→{conf_mult:.0%} of cap" if conf is not None else ""
+    msg = f"BUY {tk} ~${notional:,.0f} ({sleeve}) submitted to Alpaca paper (scaled from ~${usd:,.0f} eToro-size{conf_note})."
     _notify(cfg, f"BUY {tk}", msg + "\nFills at next market open if currently closed.")
     return msg
 

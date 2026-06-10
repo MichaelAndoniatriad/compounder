@@ -17,6 +17,7 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_MAX_DEBATE_ROUNDS":    "max_debate_rounds",
     "TRADINGAGENTS_MAX_RISK_ROUNDS":      "max_risk_discuss_rounds",
     "TRADINGAGENTS_DEBATE_ENABLED":       "debate_enabled",
+    "TRADINGAGENTS_RISK_DEBATE_ENABLED":  "risk_debate_enabled",
     "TRADINGAGENTS_CHECKPOINT_ENABLED":   "checkpoint_enabled",
     "TRADINGAGENTS_BENCHMARK_TICKER":     "benchmark_ticker",
     "TRADINGAGENTS_ANALYST_LLM":          "analyst_llm",
@@ -385,6 +386,12 @@ DEFAULT_CONFIG = _apply_env_overrides({
     # When False, skip the bull/bear researcher debate entirely and send analysts
     # directly to the Research And Execution node. Saves 2+ LLM calls per run.
     "debate_enabled": True,
+    # When False, skip the aggressive/conservative risk debate after R&E and go
+    # directly to the Portfolio Manager. Saves 2 more LLM calls per run.
+    # Set both debate_enabled=False and risk_debate_enabled=False to run the
+    # minimum viable graph (analysts → R&E → PM) once scoreboard data shows
+    # debates don't improve alpha.
+    "risk_debate_enabled": True,
     # News / data fetching parameters
     # Increase for longer lookback strategies or to broaden macro coverage;
     # decrease to reduce token usage in agent prompts.

@@ -182,6 +182,7 @@ class TradingAgentsGraph:
         self.workflow = self.graph_setup.setup_graph(
             selected_analysts,
             debate_enabled=self.config.get("debate_enabled", True),
+            risk_debate_enabled=self.config.get("risk_debate_enabled", True),
         )
         self.graph = self.workflow.compile()
         self._checkpointer_ctx = None

@@ -1728,6 +1728,81 @@ def _save_portfolio_pnl_snapshot(cfg: Dict[str, Any], portfolio_rows: List[Dict[
         logger.debug("_save_portfolio_pnl_snapshot failed: %s", e)
 
 
+def _build_calibration_block(cfg: Dict[str, Any]) -> str:
+    """Confidence calibration summary for the PM prompt.
+
+    Reads recommendation_log entries that have been resolved (was_correct set)
+    and groups them by confidence bucket. Shows whether high-confidence calls
+    actually outperform low-confidence ones. If they don't, the PM's confidence
+    scores are miscalibrated and it should know it.
+
+    Also auto-flags and auto-disables rules below the configured hit-rate floor.
+    Thresholds: portfolio_advisor_rule_flag_threshold (default 0.45 at n≥10),
+                portfolio_advisor_rule_disable_threshold (default 0.35 at n≥20).
+    """
+    try:
+        from tradingagents.portfolio_advisor import recommendation_log as _rl
+        from tradingagents.portfolio_advisor import outcome_tracker as _ot
+
+        flag_threshold = float(cfg.get("portfolio_advisor_rule_flag_threshold", 0.45))
+        disable_n = int(cfg.get("portfolio_advisor_rule_disable_min_n", 20))
+        disable_threshold = float(cfg.get("portfolio_advisor_rule_disable_threshold", 0.35))
+
+        all_recs = _rl.load_all(cfg)
+        resolved = [r for r in all_recs if r.get("was_correct") is not None and r.get("confidence") is not None]
+        if not resolved:
+            return ""
+
+        # Group by confidence bucket
+        buckets: Dict[str, Dict[str, int]] = {
+            "high (≥0.8)": {"n": 0, "correct": 0},
+            "mid (0.5–0.8)": {"n": 0, "correct": 0},
+            "low (<0.5)": {"n": 0, "correct": 0},
+        }
+        for r in resolved:
+            conf = float(r.get("confidence") or 0)
+            correct = r.get("was_correct") is True
+            if conf >= 0.8:
+                b = "high (≥0.8)"
+            elif conf >= 0.5:
+                b = "mid (0.5–0.8)"
+            else:
+                b = "low (<0.5)"
+            buckets[b]["n"] += 1
+            if correct:
+                buckets[b]["correct"] += 1
+
+        lines = ["[CONFIDENCE CALIBRATION — alpha-relative]"]
+        for label, d in buckets.items():
+            n = d["n"]
+            if n == 0:
+                continue
+            hit = d["correct"] / n
+            lines.append(f"  {label}: {hit:.0%} alpha-positive ({n} resolved)")
+
+        # Auto-flag/disable check on rules
+        perf = _ot.rule_performance_summary(cfg)
+        flagged = []
+        disabled = []
+        for rule in perf.get("top", []) + perf.get("bottom", []):
+            uses = rule["uses"]
+            hit = rule.get("hit_rate", 0.0)
+            if uses >= disable_n and hit <= disable_threshold:
+                disabled.append(rule["rule_ref"])
+            elif uses >= 10 and hit <= flag_threshold:
+                flagged.append(rule["rule_ref"])
+
+        if flagged:
+            lines.append(f"⚠ FLAGGED RULES (hit rate ≤{flag_threshold:.0%} at n≥10): {', '.join(flagged)}")
+        if disabled:
+            lines.append(f"🚫 AUTO-DISABLED RULES (hit rate ≤{disable_threshold:.0%} at n≥{disable_n}): "
+                         f"{', '.join(disabled)} — treat any signal from these as unreliable")
+        return "\n".join(lines)
+    except Exception as e:
+        logger.debug("calibration block failed: %s", e)
+        return ""
+
+
 def _broad_move_block(cfg: Dict[str, Any], portfolio_rows: List[Dict[str, Any]]) -> str:
     """Detect broad portfolio moves since the last PM cycle and prompt the PM to log the cause.
 
@@ -2010,6 +2085,21 @@ def run_pm_cycle(
         logger.debug("paper portfolio block failed: %s", e)
         paper_blk = ""
 
+    # Compounder 2.0 §5.3: live scoreboard — track record, calibration, auto-flagged rules.
+    # This is the feedback loop: the PM reads its own alpha-relative hit rates every cycle
+    # and can condition on them. Rules auto-flagged here should be treated with skepticism.
+    try:
+        from tradingagents.portfolio_advisor import outcome_tracker as _ot
+        from tradingagents.integrations.alpaca import executor as _alpaca
+        _rule_perf = _ot.format_rule_performance_for_pm_prompt(cfg)
+        _calibration = _build_calibration_block(cfg)
+        _alpaca_board = _alpaca.build_scoreboard_block(cfg)
+        scoreboard_parts = [x for x in [_rule_perf, _calibration, _alpaca_board] if x]
+        scoreboard_blk = "\n".join(scoreboard_parts) + "\n" if scoreboard_parts else ""
+    except Exception as e:
+        logger.debug("scoreboard block failed: %s", e)
+        scoreboard_blk = ""
+
     # Broad-move detection — prompts PM to log the cause when 3+ positions moved together.
     try:
         broad_move_blk = _broad_move_block(cfg, portfolio_rows)
@@ -2066,7 +2156,7 @@ Execution tiers (for append_jobs only): "full_graph" runs the full multi-agent p
 
 Trigger for this cycle: {trigger_label}
 
-{strategy_block}{rules_blk}{cash_change_blk}{rule_book_blk}{lessons_blk}{mem_blk}{ep_open_blk}{ep_stats_blk}{conv_blk}{decisions_blk}{memory_block}{market_memory_blk}{evidence_blk}{macro_risk_blk}{portfolio_risk_blk}{paper_blk}{broad_move_blk}Portfolio snapshot:
+{strategy_block}{rules_blk}{cash_change_blk}{rule_book_blk}{lessons_blk}{mem_blk}{ep_open_blk}{ep_stats_blk}{conv_blk}{decisions_blk}{memory_block}{market_memory_blk}{evidence_blk}{macro_risk_blk}{portfolio_risk_blk}{paper_blk}{scoreboard_blk}{broad_move_blk}Portfolio snapshot:
 {portfolio_snapshot}
 
 {sleeve_block}
