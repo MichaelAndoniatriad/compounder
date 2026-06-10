@@ -63,6 +63,9 @@ _MIN_REQUEST_INTERVAL_S = 0.11  # ~9 req/s, safely under 10
 # Ticker→CIK cache TTL: 7 days (the file is static for weeks at a time).
 _CIK_MAP_TTL_DAYS = 7
 
+# companyfacts cache TTL: 7 days (XBRL facts update at most quarterly).
+_COMPANYFACTS_TTL_DAYS = 7
+
 # Backoff on 429/403: wait this many seconds before one retry.
 _BACKOFF_S = 6.0
 
@@ -391,3 +394,189 @@ def fetch_recent_8k_items(
     # Sort by filed_at descending.
     all_results.sort(key=lambda x: x.get("filed_at") or "", reverse=True)
     return all_results
+
+
+# ---------------------------------------------------------------------------
+# XBRL companyfacts — revenue growth + gross margin for small-cap R5 funnel
+# ---------------------------------------------------------------------------
+
+
+def _companyfacts_cache_path(cik: int) -> Path:
+    return _cache_dir() / "companyfacts" / f"cik{str(cik).zfill(10)}.json"
+
+
+def _load_companyfacts_from_cache(cik: int) -> Optional[Dict[str, Any]]:
+    p = _companyfacts_cache_path(cik)
+    if not p.exists():
+        return None
+    age_days = (datetime.now(timezone.utc).timestamp() - p.stat().st_mtime) / 86400
+    if age_days > _COMPANYFACTS_TTL_DAYS:
+        return None
+    try:
+        return json.loads(p.read_bytes())
+    except Exception:
+        return None
+
+
+def _save_companyfacts_to_cache(cik: int, data: bytes) -> None:
+    p = _companyfacts_cache_path(cik)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        p.write_bytes(data)
+    except Exception:
+        pass
+
+
+def _extract_annual_revenue(facts: Dict[str, Any]) -> Optional[Tuple[float, float]]:
+    """Extract (latest_annual_revenue, prior_year_revenue) from XBRL facts.
+
+    Returns None when insufficient data is present. Tries us-gaap
+    RevenueFromContractWithCustomerExcludingAssessedTax first, then Revenues.
+    Looks only at 10-K frames (annual period, no instantaneous facts).
+    """
+    us_gaap = (facts.get("facts") or {}).get("us-gaap") or {}
+    candidates = [
+        "RevenueFromContractWithCustomerExcludingAssessedTax",
+        "Revenues",
+        "RevenueFromContractWithCustomerIncludingAssessedTax",
+        "SalesRevenueNet",
+        "SalesRevenueGoodsNet",
+    ]
+    for concept in candidates:
+        concept_data = us_gaap.get(concept) or {}
+        units = concept_data.get("units") or {}
+        usd_units = units.get("USD") or []
+        # Filter for annual 10-K facts (form field present and duration of ~365d)
+        annual_entries = []
+        for entry in usd_units:
+            form = str(entry.get("form") or "").strip().upper()
+            start = str(entry.get("start") or "").strip()
+            end = str(entry.get("end") or "").strip()
+            if form != "10-K":
+                continue
+            if not start or not end:
+                continue
+            try:
+                from datetime import date as _date
+                s = _date.fromisoformat(start)
+                e = _date.fromisoformat(end)
+                days = (e - s).days
+                # Accept 300-400 day windows as annual (accommodates fiscal year boundaries)
+                if 300 <= days <= 400:
+                    annual_entries.append((e, int(entry.get("val") or 0)))
+            except (ValueError, TypeError):
+                continue
+        if len(annual_entries) >= 2:
+            annual_entries.sort(key=lambda x: x[0], reverse=True)
+            latest_rev = float(annual_entries[0][1])
+            prior_rev = float(annual_entries[1][1])
+            return latest_rev, prior_rev
+    return None
+
+
+def _extract_gross_profit(facts: Dict[str, Any]) -> Optional[float]:
+    """Extract latest annual gross profit from XBRL facts. Returns None on miss."""
+    us_gaap = (facts.get("facts") or {}).get("us-gaap") or {}
+    concept_data = us_gaap.get("GrossProfit") or {}
+    units = concept_data.get("units") or {}
+    usd_units = units.get("USD") or []
+    annual_entries = []
+    for entry in usd_units:
+        form = str(entry.get("form") or "").strip().upper()
+        start = str(entry.get("start") or "").strip()
+        end = str(entry.get("end") or "").strip()
+        if form != "10-K" or not start or not end:
+            continue
+        try:
+            from datetime import date as _date
+            s = _date.fromisoformat(start)
+            e = _date.fromisoformat(end)
+            if 300 <= (e - s).days <= 400:
+                annual_entries.append((e, int(entry.get("val") or 0)))
+        except (ValueError, TypeError):
+            continue
+    if annual_entries:
+        annual_entries.sort(key=lambda x: x[0], reverse=True)
+        return float(annual_entries[0][1])
+    return None
+
+
+def _parse_companyfacts(raw_facts: Dict[str, Any]) -> Dict[str, Any]:
+    """Parse XBRL companyfacts JSON into a fundamentals dict.
+
+    Returns a dict with keys: rev_latest, rev_prior, rev_growth (fraction),
+    gross_profit_latest, gross_margin (fraction or None), ticker, cik_str.
+    Missing/insufficient data → the corresponding key is None.
+    """
+    entity_name = raw_facts.get("entityName") or ""
+    cik_str = str(raw_facts.get("cik") or "").strip()
+
+    rev_data = _extract_annual_revenue(raw_facts)
+    gross_profit = _extract_gross_profit(raw_facts)
+
+    rev_latest = rev_prior = rev_growth = None
+    if rev_data is not None:
+        rev_latest, rev_prior = rev_data
+        if rev_prior and rev_prior != 0:
+            rev_growth = (rev_latest - rev_prior) / abs(rev_prior)
+
+    gross_margin = None
+    if gross_profit is not None and rev_latest and rev_latest != 0:
+        gross_margin = gross_profit / rev_latest
+
+    return {
+        "entity_name": entity_name,
+        "cik_str": cik_str,
+        "rev_latest": rev_latest,
+        "rev_prior": rev_prior,
+        "rev_growth": rev_growth,
+        "gross_profit_latest": gross_profit,
+        "gross_margin": gross_margin,
+    }
+
+
+def companyfacts(ticker: str, *, _allow_in_test: bool = False) -> Optional[Dict[str, Any]]:
+    """Fetch and parse SEC XBRL companyfacts for a ticker.
+
+    Uses https://data.sec.gov/api/xbrl/companyfacts/CIK##########.json
+    with the same throttle/UA/caching infrastructure from the 8-K feed.
+    Cache TTL: 7 days.
+
+    Returns a dict with {entity_name, cik_str, rev_latest, rev_prior,
+    rev_growth, gross_profit_latest, gross_margin} or None when the
+    ticker has no CIK mapping or the fetch fails.
+
+    Returns None under pytest unless ``_allow_in_test=True``.
+    """
+    if "PYTEST_CURRENT_TEST" in os.environ and not _allow_in_test:
+        return None
+
+    tk = (ticker or "").strip().upper()
+    if not tk:
+        return None
+
+    _, tk_to_cik = get_cik_maps(_allow_in_test=_allow_in_test)
+    cik = tk_to_cik.get(tk)
+    if not cik:
+        logger.debug("companyfacts: no CIK for ticker %s", tk)
+        return None
+
+    cached = _load_companyfacts_from_cache(cik)
+    if cached is not None:
+        return _parse_companyfacts(cached)
+
+    cik_padded = str(cik).zfill(10)
+    url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik_padded}.json"
+    try:
+        raw_bytes = _fetch_url(url)
+    except Exception as exc:
+        logger.debug("companyfacts fetch failed for %s (CIK %s): %s", tk, cik, exc)
+        return None
+
+    try:
+        raw_facts = json.loads(raw_bytes)
+    except Exception:
+        return None
+
+    _save_companyfacts_to_cache(cik, raw_bytes)
+    return _parse_companyfacts(raw_facts)

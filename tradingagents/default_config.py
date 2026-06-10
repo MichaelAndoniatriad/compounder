@@ -256,6 +256,20 @@ DEFAULT_CONFIG = _apply_env_overrides({
     # Memory review: last N events as compact JSON in the reasoning prompt.
     "portfolio_advisor_memory_review_sample_events": 24,
     "portfolio_advisor_memory_review_json_chars": 6000,
+    # --- R5: Down-cap universe expansion (off by default until R1-R4 are proven live) ---
+    # Master switch: when False the S&P 600 fetch is never attempted and the universe
+    # stays at S&P 500 + NASDAQ 100.  A human must flip this after R1-R4 are validated.
+    "portfolio_advisor_universe_smallcap_enabled": False,
+    # Shadow-routing window: for this many days after the flag is first enabled, ALL
+    # small-cap candidates route to the shadow book only (never live proposals).
+    # The enable date is persisted as pa_state["smallcap_enabled_at"].
+    "portfolio_advisor_smallcap_shadow_days": 90,
+    # Tradability gate: 20-day average dollar volume floor (shares × price).
+    # Names below this are hard-rejected by mechanical_filter.
+    "portfolio_advisor_min_dollar_adv": 2_000_000,
+    # Dollar-ADV upper bound for the "edge zone" tag.
+    # Names with ADV in [$2M, $50M] are tagged edge_zone=True in filter output.
+    "portfolio_advisor_edge_zone_max_adv": 50_000_000,
     # core_discovery_cadence: monthly (runs first Saturday of each month).
     # Core names change on quarterly fundamentals cadence; monthly is enough.
     # Cron: 0 10 1-7 * 6 (first Saturday, 10:00 UTC).

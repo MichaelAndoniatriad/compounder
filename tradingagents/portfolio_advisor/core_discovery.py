@@ -34,19 +34,22 @@ _COMBO_BONUS_THRESHOLD = (0.20, 0.15, 1.5)  # rev_growth, roic, peg
 _COMBO_BONUS_POINTS = 0.15
 
 
-def _build_universe() -> List[str]:
+def _build_universe(cfg: Optional[Dict[str, Any]] = None) -> List[str]:
     """Pull live index constituents from Wikipedia. No hardcoded lists.
 
     Scans all tables on each page for a Symbol/Ticker column rather than
     hardcoding table indices, which break when Wikipedia editors reorder tables.
 
-    UNIVERSE = S&P 500 + NASDAQ 100. Down-cap widening is DELIBERATELY DEFERRED:
-    a separate decision after de-biasing is proven (see core_discovery_v2_plan.md section 9).
-    Widening the universe raises risk and must be assessed independently.
+    Base universe: S&P 500 + NASDAQ 100.
+    Extended universe (when portfolio_advisor_universe_smallcap_enabled=True):
+      also includes S&P 600 constituents (fetched + cached; fallback to
+      vendored CSV). Extended names are tagged in the cohort map but the list
+      returned here is still flat (cohort info lives in _build_universe_with_cohorts).
     """
     import pandas as pd
 
     tickers: set[str] = set()
+    _cfg = cfg or {}
 
     def _extract_tickers(url: str, col_names: tuple[str, ...], label: str) -> int:
         """Scan all tables on a Wikipedia page for a ticker column. Returns count added."""
@@ -99,7 +102,69 @@ def _build_universe() -> List[str]:
             "CRWD", "ZS", "PANW", "FTNT", "SHOP", "UBER", "ABNB", "DKNG",
         ])
 
+    # R5: optionally extend with S&P 600 (off by default)
+    if _cfg.get("portfolio_advisor_universe_smallcap_enabled", False):
+        from tradingagents.portfolio_advisor.smallcap_universe import (
+            fetch_sp600_constituents,
+            record_smallcap_enabled_at,
+        )
+        record_smallcap_enabled_at(_cfg)
+        sp600 = fetch_sp600_constituents(_cfg)
+        new_smallcap = set(sp600) - tickers
+        tickers.update(sp600)
+        logger.info(
+            "core discovery: added %d S&P 600 small-cap tickers (%d new after dedup)",
+            len(sp600), len(new_smallcap),
+        )
+
     return sorted(tickers)
+
+
+def _build_cohort_map(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
+    """Return {ticker: cohort} for use in the discovery pipeline.
+
+    cohort values: "largecap" (S&P 500 + NASDAQ 100) or "smallcap" (S&P 600).
+    When smallcap_enabled is False, all tickers map to "largecap".
+    """
+    import pandas as pd
+
+    _cfg = cfg or {}
+    cohort: Dict[str, str] = {}
+
+    def _add_cohort(url: str, col_names: tuple[str, ...], label: str, cohort_name: str) -> None:
+        try:
+            import io as _io
+            import requests
+            resp = requests.get(url, headers={"User-Agent": "TradingAgents/1.0 (portfolio research)"}, timeout=15)
+            resp.raise_for_status()
+            all_tables = pd.read_html(_io.StringIO(resp.text))
+        except Exception:
+            return
+        for table in all_tables:
+            for col in col_names:
+                if col not in table.columns:
+                    continue
+                for t in table[col].tolist():
+                    s = str(t).strip().upper().replace(".", "-")
+                    if s[:1].isalpha():
+                        cohort.setdefault(s, cohort_name)
+                break
+
+    _add_cohort(
+        "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
+        ("Symbol", "Ticker"), "S&P 500", "largecap",
+    )
+    _add_cohort(
+        "https://en.wikipedia.org/wiki/Nasdaq-100",
+        ("Ticker", "Symbol"), "NASDAQ 100", "largecap",
+    )
+
+    if _cfg.get("portfolio_advisor_universe_smallcap_enabled", False):
+        from tradingagents.portfolio_advisor.smallcap_universe import fetch_sp600_constituents
+        for tk in fetch_sp600_constituents(_cfg):
+            cohort.setdefault(tk, "smallcap")
+
+    return cohort
 
 
 def _score_quantitative(info: Dict[str, Any]) -> float:
@@ -171,13 +236,50 @@ def _score_quantitative(info: Dict[str, Any]) -> float:
     return min(score, 1.0)
 
 
-def _quantitative_screen(tickers: List[str]) -> List[Dict[str, Any]]:
+def _enrich_smallcap_info_from_companyfacts(ticker: str, info: Dict[str, Any]) -> Dict[str, Any]:
+    """Augment the fundamentals dict with SEC XBRL companyfacts data for smallcap.
+
+    For the smallcap cohort, Alpha Vantage may not have data or may use the
+    free-tier quota; companyfacts provides revenue growth and gross margin
+    from the SEC XBRL filing — free, no API key, no rate-limit concerns.
+
+    Missing/partial facts leave the corresponding info keys as None (the
+    mechanical filter treats missing fundamentals as a fail for smallcap).
+    """
+    try:
+        from tradingagents.dataflows.edgar import companyfacts as _cf
+        facts = _cf(ticker)
+        if not facts:
+            return info
+        out = dict(info)
+        # Revenue growth: overwrite only when companyfacts has it
+        rev_growth = facts.get("rev_growth")
+        if rev_growth is not None:
+            out["revenueGrowth"] = rev_growth
+        # Gross margin
+        gross_margin = facts.get("gross_margin")
+        if gross_margin is not None:
+            out["grossMargins"] = gross_margin
+        return out
+    except Exception:
+        return info
+
+
+def _quantitative_screen(
+    tickers: List[str],
+    cohort_map: Optional[Dict[str, str]] = None,
+) -> List[Dict[str, Any]]:
     """Score every ticker and return those above SURVIVOR_SCORE.
 
-    Uses Alpha Vantage OVERVIEW with 7-day disk cache. No yfinance dependency.
+    Uses Alpha Vantage OVERVIEW with 7-day disk cache for largecap tickers.
+    For smallcap cohort (cohort_map[ticker] == "smallcap"), supplements with
+    SEC XBRL companyfacts for revenue growth and gross margin — no AV quota
+    consumed for these names.  Missing fundamentals → None fields → filter fail
+    (conservative for new smallcap names).
     """
     import time as _time
 
+    _cohort = cohort_map or {}
     passing = []
     for i, ticker in enumerate(tickers):
         # Respect Alpha Vantage rate limit (75/min premium, 5/min free).
@@ -185,11 +287,28 @@ def _quantitative_screen(tickers: List[str]) -> List[Dict[str, Any]]:
         if i > 0 and i % 10 == 0:
             _time.sleep(0.3)
         try:
+            cohort = _cohort.get(ticker, "largecap")
             from tradingagents.dataflows.alpha_vantage_fundamentals_cached import get_ticker_fundamentals
 
             info = get_ticker_fundamentals(ticker)
             if not info:
-                continue
+                if cohort == "smallcap":
+                    # For smallcap: try companyfacts as sole source
+                    info = {}
+                    info = _enrich_smallcap_info_from_companyfacts(ticker, info)
+                    if not info.get("revenueGrowth") and not info.get("grossMargins"):
+                        # No fundamentals at all — hard fail for smallcap (conservative)
+                        continue
+                else:
+                    continue
+
+            if cohort == "smallcap":
+                # Augment AV data with companyfacts (free, no quota cost)
+                info = _enrich_smallcap_info_from_companyfacts(ticker, info)
+
+                # Missing fundamentals = fail for smallcap (conservative)
+                if info.get("revenueGrowth") is None and info.get("grossMargins") is None:
+                    continue
 
             market_cap = info.get("marketCap", 0) or 0
             if market_cap < MIN_MARKET_CAP:
@@ -205,6 +324,7 @@ def _quantitative_screen(tickers: List[str]) -> List[Dict[str, Any]]:
 
             passing.append({
                 "ticker": ticker,
+                "cohort": cohort,
                 "name": info.get("shortName", ticker),
                 "market_cap_b": round(market_cap / 1e9, 1),
                 "rev_growth": round(rev_growth * 100, 1),
@@ -507,7 +627,7 @@ def run_core_discovery(cfg: Dict[str, Any]) -> str:
 
     # Phase 1: Build dynamic universe
     logger.info("core discovery: building universe")
-    universe = _build_universe()
+    universe = _build_universe(cfg)
     t1 = time.monotonic()
     logger.info("core discovery: %d tickers in universe (%.1fs)", len(universe), t1 - t0)
 
@@ -516,13 +636,22 @@ def run_core_discovery(cfg: Dict[str, Any]) -> str:
     from tradingagents.portfolio_advisor.mechanical_filter import mechanical_filter
 
     reject_log = str(Path.home() / ".tradingagents" / "logs" / f"core_discovery_rejects_{today}.csv")
-    universe, rejections = mechanical_filter(universe, reject_log_path=reject_log)
-    total_rejected = sum(len(ts) for ts in rejections.values())
+    universe, rejections = mechanical_filter(universe, reject_log_path=reject_log, cfg=cfg)
+
+    # Build cohort map for shadow-routing decisions later
+    _cohort_map: Dict[str, str] = {}
+    if cfg.get("portfolio_advisor_universe_smallcap_enabled", False):
+        try:
+            _cohort_map = _build_cohort_map(cfg)
+        except Exception as _cm_err:
+            logger.warning("core discovery: cohort map build failed: %s", _cm_err)
+    # _edge_zone is a meta-key (not a rejection reason) — exclude it from the count
+    total_rejected = sum(len(ts) for k, ts in rejections.items() if not k.startswith("_"))
     t2 = time.monotonic()
     logger.info("core discovery: %d survived mechanical filter (%d rejected) (%.1fs)", len(universe), total_rejected, t2 - t1)
 
     # Phase 2: Quantitative screen
-    quant_pass = _quantitative_screen(universe)
+    quant_pass = _quantitative_screen(universe, cohort_map=_cohort_map if _cohort_map else None)
     t3 = time.monotonic()
     if not quant_pass:
         return "Core discovery: no tickers passed quantitative filters this month."
@@ -702,6 +831,46 @@ def run_core_discovery(cfg: Dict[str, Any]) -> str:
             )
     except Exception as e:
         logger.warning("core discovery: watchlist update failed: %s", e)
+
+    # Phase 5b: R5 shadow-routing window — smallcap deep-dive picks that would
+    # become proposals are instead written to the shadow book during the window.
+    if cfg.get("portfolio_advisor_universe_smallcap_enabled", False) and _cohort_map:
+        try:
+            from tradingagents.portfolio_advisor.smallcap_universe import smallcap_shadow_active
+            from tradingagents.portfolio_advisor.candidates import shadow_book_add
+
+            _shadow_active = smallcap_shadow_active(cfg)
+            _shadow_diverted: List[Dict] = []
+            _live_deep_dive: List[Dict] = []
+            for pick in deep_dive_picks:
+                cohort = _cohort_map.get(pick["ticker"], "largecap")
+                if cohort == "smallcap" and _shadow_active:
+                    result = shadow_book_add(
+                        cfg,
+                        ticker=pick["ticker"],
+                        source="core_discovery_smallcap",
+                        reason=pick.get("thesis", "")[:200],
+                        strategy="core",
+                        gates_passed=["quant_screen", "llm_qualitative"],
+                        status="shadow_smallcap_window",
+                    )
+                    if result is not None:
+                        logger.info(
+                            "core discovery: smallcap shadow window — diverted %s to shadow book",
+                            pick["ticker"],
+                        )
+                    _shadow_diverted.append(pick)
+                else:
+                    _live_deep_dive.append(pick)
+            if _shadow_diverted:
+                logger.info(
+                    "core discovery: shadow window active — %d smallcap pick(s) routed to shadow, "
+                    "%d largecap pick(s) proceed normally",
+                    len(_shadow_diverted), len(_live_deep_dive),
+                )
+            deep_dive_picks = _live_deep_dive
+        except Exception as _sr_err:
+            logger.warning("core discovery: shadow routing failed: %s", _sr_err)
 
     # Phase 6: Promote deep-dive picks (high-conviction only) into a PM portfolio
     # evaluation. One batched PM cycle weighs them against the live book and decides
