@@ -24,10 +24,17 @@ CandidateStatus = Literal["candidate", "watch", "research_queued", "rejected", "
 def validate_catalyst_date(
     catalyst_date: str,
     cfg: Optional[Dict[str, Any]] = None,
+    *,
+    allow_recent_past_days: int = 0,
 ) -> Tuple[bool, str]:
     """Validate that a catalyst_date string is a parseable ISO date that is
-    present-or-future and within ``portfolio_advisor_catalyst_max_days_out``
-    days from today (default 90).
+    present-or-future (or within ``allow_recent_past_days`` in the past) and
+    within ``portfolio_advisor_catalyst_max_days_out`` days from today
+    (default 90).
+
+    ``allow_recent_past_days``: dates up to this many calendar days in the past
+    are accepted.  Default 0 (past dates rejected — preserves existing behaviour
+    for all callers except the PEAD path, which passes 5).
 
     Returns (valid: bool, error_message: str).  error_message is empty when
     valid is True.  Intended for use in pm_tools.propose_trade,
@@ -44,7 +51,8 @@ def validate_catalyst_date(
             "verify the real event date before re-proposing"
         )
     today = date.today()
-    if parsed < today:
+    earliest_allowed = today - timedelta(days=max(0, allow_recent_past_days))
+    if parsed < earliest_allowed:
         return False, (
             f"catalyst_date {date_str} is in the past — "
             "verify the real event date before re-proposing"
@@ -196,7 +204,14 @@ def evaluate_candidate(
             gates["catalyst"] = "fail"
             failures.append("missing_catalyst")
         elif catalyst_date_text:
-            _date_valid, _date_err = validate_catalyst_date(catalyst_date_text, cfg)
+            # PEAD candidates have a catalyst_date in the recent past by design
+            # (the reported earnings date is always yesterday or earlier).  Allow
+            # up to 5 days in the past for that source so the date gate does not
+            # kill every PEAD survivor.  All other catalyst paths keep default 0.
+            _allow_past = 5 if str(data.get("source") or "").strip() == "pead_scanner" else 0
+            _date_valid, _date_err = validate_catalyst_date(
+                catalyst_date_text, cfg, allow_recent_past_days=_allow_past
+            )
             if not _date_valid:
                 gates["catalyst"] = "fail"
                 gates["catalyst_date_reason"] = _date_err

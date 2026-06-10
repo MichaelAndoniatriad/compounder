@@ -27,6 +27,7 @@ import csv
 import json
 import logging
 import os
+import time
 from datetime import date, datetime, timedelta, timezone
 from io import StringIO
 from pathlib import Path
@@ -42,6 +43,53 @@ _DEFAULT_MAX_NAMES = 15
 _SUE_MIN_PCT = 10.0      # +10 % surprise required
 _RVOL_MIN = 1.5          # 1.5× 20-day average volume
 _DOLLAR_VOL_MIN = 5_000_000.0  # $5 M daily dollar volume
+
+
+_AV_EARNINGS_THROTTLE_S = 13.0   # 5 calls/min free tier → ≥12s spacing; use 13s
+_SESSION_HOURS = 6.5             # 09:30–16:00 ET = 6.5 h
+_SESSION_OPEN_HOUR_ET = 9
+_SESSION_OPEN_MIN_ET = 30
+
+
+def _session_elapsed_fraction() -> float:
+    """Fraction of the regular trading session (09:30–16:00 ET) elapsed right now.
+
+    Uses executor.market_clock() next_close to compute elapsed seconds.
+    Falls back to a naive ET-clock calculation when the clock is unavailable.
+    Clamped to [0.05, 1.0] so gates are never gated to zero volume.
+    """
+    try:
+        from tradingagents.integrations.alpaca.executor import market_clock
+        clk = market_clock()
+        if clk is not None and clk.get("is_open"):
+            next_close_str = clk.get("next_close") or ""
+            if next_close_str:
+                if next_close_str.endswith("Z"):
+                    next_close_str = next_close_str[:-1] + "+00:00"
+                next_close = datetime.fromisoformat(next_close_str)
+                if next_close.tzinfo is None:
+                    next_close = next_close.replace(tzinfo=timezone.utc)
+                now_utc = datetime.now(timezone.utc)
+                total_session_s = _SESSION_HOURS * 3600
+                remaining_s = (next_close - now_utc).total_seconds()
+                elapsed_s = total_session_s - remaining_s
+                fraction = elapsed_s / total_session_s
+                return max(0.05, min(1.0, fraction))
+    except Exception:
+        pass
+    # Fallback: naive ET clock (UTC-4 during EDT, UTC-5 during EST; use -4 as approx)
+    try:
+        now_utc = datetime.now(timezone.utc)
+        et_offset = timedelta(hours=-4)
+        now_et = now_utc + et_offset
+        open_today = now_et.replace(
+            hour=_SESSION_OPEN_HOUR_ET, minute=_SESSION_OPEN_MIN_ET, second=0, microsecond=0
+        )
+        elapsed_s = (now_et - open_today).total_seconds()
+        fraction = elapsed_s / (_SESSION_HOURS * 3600)
+        return max(0.05, min(1.0, fraction))
+    except Exception:
+        return 1.0  # safe fallback: full-day scale (no pro-rating)
 
 
 def _advisor_dir(cfg: Dict[str, Any]) -> Path:
@@ -72,7 +120,11 @@ def _av_api_key() -> str:
 
 
 def _fetch_earnings_calendar() -> str:
-    """Pull EARNINGS_CALENDAR CSV from AV (1 call). Returns raw CSV text."""
+    """Pull EARNINGS_CALENDAR CSV from AV (1 call). Returns raw CSV text.
+
+    Raises ``ValueError`` if the response is a rate-limit/error JSON body
+    rather than real CSV data — callers must keep the existing stale cache.
+    """
     import requests  # type: ignore
     url = "https://www.alphavantage.co/query"
     resp = requests.get(url, params={
@@ -81,11 +133,30 @@ def _fetch_earnings_calendar() -> str:
         "apikey": _av_api_key(),
     }, timeout=30)
     resp.raise_for_status()
-    return resp.text
+    text = resp.text or ""
+    if _av_rate_limit_body(text):
+        raise ValueError(f"AV rate-limit response for EARNINGS_CALENDAR: {text[:120]}")
+    return text
+
+
+def _av_rate_limit_body(text: str) -> bool:
+    """Return True when the AV response body is a rate-limit/error JSON rather
+    than real data.  AV returns HTTP 200 with a JSON body containing "Note",
+    "Information", or "rate limit" on quota exhaustion.
+    """
+    stripped = text.lstrip() if text else ""
+    if not stripped.startswith("{"):
+        return False
+    low = stripped.lower()
+    return '"note"' in low or '"information"' in low or "rate limit" in low
 
 
 def _fetch_earnings_eps(symbol: str) -> Optional[Dict[str, Any]]:
-    """Pull EARNINGS JSON for one symbol. Returns the most-recent quarterly row or None."""
+    """Pull EARNINGS JSON for one symbol. Returns the most-recent quarterly row or None.
+
+    Returns None for rate-limit/error responses so callers can distinguish
+    quota exhaustion from genuinely missing data.
+    """
     import requests  # type: ignore
     url = "https://www.alphavantage.co/query"
     resp = requests.get(url, params={
@@ -94,6 +165,9 @@ def _fetch_earnings_eps(symbol: str) -> Optional[Dict[str, Any]]:
         "apikey": _av_api_key(),
     }, timeout=20)
     resp.raise_for_status()
+    text = resp.text or ""
+    if _av_rate_limit_body(text):
+        raise ValueError(f"AV rate-limit response for {symbol}: {text[:120]}")
     try:
         data = resp.json()
     except Exception:
@@ -172,10 +246,24 @@ def refresh_calendar(cfg: Dict[str, Any]) -> Dict[str, Any]:
     try:
         csv_text = _fetch_earnings_calendar()
     except Exception as exc:
-        logger.error("pead_scanner.refresh_calendar: AV fetch failed: %s", exc)
+        # Rate-limit or network error — keep existing stale cache rather than
+        # poisoning it with an empty payload.
+        logger.error(
+            "pead_scanner.refresh_calendar: AV fetch failed (%s) — keeping stale cache", exc
+        )
         return {"symbols": 0, "cached": False, "path": str(cache_path), "error": str(exc)}
 
     rows = _parse_calendar_csv(csv_text)
+    # Validate that we got real data.  AV rate-limit bodies parse as empty rows
+    # (no 'symbol' column); do NOT cache an empty result — keep the existing stale
+    # cache and warn loudly so the operator knows the quota is exhausted.
+    if not rows:
+        logger.warning(
+            "pead_scanner.refresh_calendar: parsed 0 symbols from AV response "
+            "(quota exhausted or bad response?) — keeping stale cache"
+        )
+        return {"symbols": 0, "cached": False, "path": str(cache_path), "error": "zero_rows"}
+
     payload = {
         "fetched_at": datetime.now(timezone.utc).isoformat(),
         "rows": rows,
@@ -307,32 +395,90 @@ def scan_post_reports(cfg: Dict[str, Any]) -> Dict[str, Any]:
     max_names = _max_names(cfg)
     reporters = reporters[:max_names]  # cap AV calls
 
+    # Compute partial-session elapsed fraction once for all gate scaling.
+    elapsed_fraction = _session_elapsed_fraction()
+
     candidates: List[Dict[str, Any]] = []
     skipped: List[Dict[str, Any]] = []
     gate_log: List[Dict[str, Any]] = []
     proposals: List[str] = []
+    _last_av_call_time: float = 0.0  # monotonic clock for per-name throttle
+    _rate_limit_hit = False
 
-    for row in reporters:
+    for row_idx, row in enumerate(reporters):
         ticker = row["symbol"]
         report_date_str = row.get("report_date", yesterday.isoformat())
         gate: Dict[str, Any] = {"ticker": ticker, "report_date": report_date_str}
 
         # --- Gate 0: Fetch AV EPS surprise ---
+        # Throttle: ≥13s between calls to stay within 5/min free tier.
+        if _last_av_call_time > 0:
+            elapsed_since = time.monotonic() - _last_av_call_time
+            if elapsed_since < _AV_EARNINGS_THROTTLE_S:
+                time.sleep(_AV_EARNINGS_THROTTLE_S - elapsed_since)
+
         eps_row = None
+        _rate_limit_this_call = False
         try:
+            _last_av_call_time = time.monotonic()
             eps_row = _fetch_earnings_eps(ticker)
+        except ValueError as exc:
+            # _fetch_earnings_eps raises ValueError on rate-limit body
+            _rate_limit_this_call = True
+            _rate_limit_hit = True
+            gate["failed_at"] = "av_rate_limit"
+            gate["error"] = str(exc)
+            gate_log.append(gate)
+            skipped.append({"ticker": ticker, "reason": f"AV rate limit: {exc}"})
         except Exception as exc:
             gate["failed_at"] = "eps_fetch_error"
             gate["error"] = str(exc)
             gate_log.append(gate)
             skipped.append({"ticker": ticker, "reason": f"EPS fetch error: {exc}"})
-            continue
 
-        if eps_row is None:
+        if _rate_limit_hit:
+            # Stop early — remaining names would also fail; log how many are skipped.
+            remaining = [r["symbol"] for r in reporters[row_idx + 1:]]
+            if remaining:
+                logger.warning(
+                    "pead_scanner: AV rate limit hit at %s — skipping %d remaining names: %s",
+                    ticker, len(remaining), ", ".join(remaining),
+                )
+            break
+
+        if eps_row is None and not _rate_limit_this_call:
             gate["failed_at"] = "no_eps_data"
             gate_log.append(gate)
             skipped.append({"ticker": ticker, "reason": "no quarterly EPS data from AV"})
             continue
+
+        if eps_row is None:
+            continue
+
+        # --- Gate 0b: Verify reportedDate is within the scan lookback window ---
+        # AV EARNINGS frequently lags — quarterly[0] is often the prior quarter.
+        # Require the row's reportedDate to be within ±3 days of the calendar
+        # report_date to avoid gating on the wrong quarter's surprise.
+        eps_reported_date = str(eps_row.get("reportedDate") or "").strip()
+        if eps_reported_date:
+            try:
+                eps_dt = date.fromisoformat(eps_reported_date)
+                cal_dt = date.fromisoformat(report_date_str)
+                if abs((eps_dt - cal_dt).days) > 3:
+                    gate["failed_at"] = "reportedDate_mismatch"
+                    gate["eps_reported_date"] = eps_reported_date
+                    gate["calendar_report_date"] = report_date_str
+                    gate_log.append(gate)
+                    skipped.append({
+                        "ticker": ticker,
+                        "reason": (
+                            f"AV earnings not yet updated: reportedDate={eps_reported_date} "
+                            f"is >3 days from calendar report_date={report_date_str}"
+                        ),
+                    })
+                    continue
+            except (ValueError, TypeError):
+                pass  # unparseable reportedDate — allow through
 
         reported_eps = str(eps_row.get("reportedEPS") or "")
         estimated_eps = str(eps_row.get("estimatedEPS") or eps_row.get("surprisePercentage") and "" or "")
@@ -405,11 +551,21 @@ def scan_post_reports(cfg: Dict[str, Any]) -> Dict[str, Any]:
         gate["gap_pct"] = round(gap_pct, 2)
         gate["gap_pass"] = True
 
-        # --- Gate 3: RVOL ≥ 1.5 ---
+        # --- Gate 3: RVOL ≥ 1.5 (elapsed-fraction scaled) ---
+        # At 09:45 ET (15 min into session) only ~3.8% of the day has elapsed.
+        # Comparing partial-session volume to a full-day average would require
+        # ~26x normal pace to pass — too strict.  Scale both RVOL and the dollar-
+        # volume floor by the elapsed session fraction so the gate measures "pace",
+        # not absolute volume accumulated so far.
+        # RVOL_scaled = today_vol / (avg_vol_20d × elapsed_fraction)
+        # dollar_vol_floor_scaled = _DOLLAR_VOL_MIN × elapsed_fraction
         avg_vol = pv["avg_vol_20d"]
         today_vol = pv["today_volume"]
-        rvol = (today_vol / avg_vol) if avg_vol > 0 else 0.0
+        # Avoid division by zero; elapsed_fraction already clamped ≥ 0.05
+        scaled_avg = avg_vol * elapsed_fraction if avg_vol > 0 else 0.0
+        rvol = (today_vol / scaled_avg) if scaled_avg > 0 else 0.0
         gate["rvol"] = round(rvol, 2)
+        gate["elapsed_fraction"] = round(elapsed_fraction, 4)
 
         if rvol < _RVOL_MIN:
             gate["failed_at"] = "rvol_below_threshold"
@@ -417,23 +573,32 @@ def scan_post_reports(cfg: Dict[str, Any]) -> Dict[str, Any]:
             gate_log.append(gate)
             skipped.append({
                 "ticker": ticker,
-                "reason": f"RVOL {rvol:.2f} < {_RVOL_MIN} (vol={today_vol:.0f}, avg={avg_vol:.0f})",
+                "reason": (
+                    f"RVOL {rvol:.2f} < {_RVOL_MIN} "
+                    f"(vol={today_vol:.0f}, scaled_avg={scaled_avg:.0f}, "
+                    f"elapsed={elapsed_fraction:.2%})"
+                ),
             })
             continue
 
         gate["rvol_pass"] = True
 
-        # --- Gate 4: Dollar volume ≥ $5M ---
+        # --- Gate 4: Dollar volume ≥ $5M (elapsed-fraction scaled) ---
         dollar_vol = pv["price"] * today_vol
+        dollar_vol_floor = _DOLLAR_VOL_MIN * elapsed_fraction
         gate["dollar_vol"] = round(dollar_vol, 0)
+        gate["dollar_vol_floor"] = round(dollar_vol_floor, 0)
 
-        if dollar_vol < _DOLLAR_VOL_MIN:
+        if dollar_vol < dollar_vol_floor:
             gate["failed_at"] = "dollar_vol_below_threshold"
-            gate["threshold"] = _DOLLAR_VOL_MIN
+            gate["threshold"] = round(dollar_vol_floor, 0)
             gate_log.append(gate)
             skipped.append({
                 "ticker": ticker,
-                "reason": f"dollar vol ${dollar_vol:,.0f} < ${_DOLLAR_VOL_MIN:,.0f}",
+                "reason": (
+                    f"dollar vol ${dollar_vol:,.0f} < "
+                    f"${dollar_vol_floor:,.0f} (scaled ${_DOLLAR_VOL_MIN:,.0f} × {elapsed_fraction:.2%})"
+                ),
             })
             continue
 

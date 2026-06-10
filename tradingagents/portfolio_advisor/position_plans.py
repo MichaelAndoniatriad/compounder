@@ -129,6 +129,13 @@ class PositionPlan:
     # for catalyst positions (set by reconcile_fills after entry_filled).  Empty string
     # means no broker-resident stop is currently active for this plan.
     stop_order_id: str = ""
+    # When set, overrides CatalystRules.time_stop_days for this specific plan.
+    # PEAD plans carry source="pead_scanner" and use a longer hold window
+    # (cfg portfolio_advisor_pead_hold_days, default 20) so drift has time to play out.
+    time_stop_days_override: Optional[int] = None
+    # Source scanner that created this plan (e.g. "pead_scanner", "ep_scanner").
+    # Persisted so exit rules can apply source-specific overrides.
+    source: str = ""
 
     def __post_init__(self) -> None:
         self.strategy = (self.strategy or _DEFAULT_STRATEGY).strip().lower()
@@ -189,6 +196,8 @@ def load_position_plans(cfg: Dict[str, Any]) -> Dict[str, PositionPlan]:
             if ep <= 0:
                 continue
             peak = data.get("peak_price")
+            _tso_raw = data.get("time_stop_days_override")
+            _tso: Optional[int] = int(_tso_raw) if _tso_raw not in (None, "") else None
             out[ticker.upper()] = PositionPlan(
                 ticker=ticker.upper(),
                 entry_price=ep,
@@ -206,6 +215,8 @@ def load_position_plans(cfg: Dict[str, Any]) -> Dict[str, PositionPlan]:
                 pre_event_flat_done_at=str(data.get("pre_event_flat_done_at") or ""),
                 high_conviction=bool(data.get("high_conviction")),
                 stop_order_id=str(data.get("stop_order_id") or ""),
+                time_stop_days_override=_tso,
+                source=str(data.get("source") or ""),
             )
         except (TypeError, ValueError):
             continue
@@ -744,13 +755,20 @@ def eval_catalyst_exit(
         if px <= trailing_stop_level:
             return "paper_catalyst_trailing_stop"
 
-    # Time stop: catalyst_date + time_stop_days, position hasn't run
+    # Time stop: catalyst_date + time_stop_days, position hasn't run.
+    # When the plan carries a time_stop_days_override (set for PEAD plans to give
+    # drift more time), that value supersedes CatalystRules.time_stop_days.
     if plan.catalyst_date:
+        effective_time_stop_days = (
+            plan.time_stop_days_override
+            if plan.time_stop_days_override is not None
+            else rules.time_stop_days
+        )
         days_after = _days_since(plan.catalyst_date)
-        if days_after is not None and days_after >= rules.time_stop_days:
+        if days_after is not None and days_after >= effective_time_stop_days:
             moved_up = px >= entry * 1.05
             if not moved_up:
-                return f"paper_catalyst_time_stop_{rules.time_stop_days}d_post_catalyst"
+                return f"paper_catalyst_time_stop_{effective_time_stop_days}d_post_catalyst"
 
     return None
 

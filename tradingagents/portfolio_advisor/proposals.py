@@ -124,6 +124,7 @@ def add(
     catalyst_date: str = "",
     confidence: float = 0.0,
     high_conviction: bool = False,
+    source: str = "",
 ) -> Dict[str, Any]:
     """Record a proposal, superseding any existing OPEN proposal for the same
     ticker+side.
@@ -167,6 +168,9 @@ def add(
         # against the confidence floor and the concurrent HC slot cap.
         "high_conviction": bool(high_conviction),
         "status": "proposed",
+        # Scanner source (e.g. "pead_scanner") — carried through to PositionPlan
+        # so source-specific exit-rule overrides (e.g. PEAD hold window) apply.
+        "source": (source or "").strip(),
     }
     rows.append(entry)
     save_all(cfg, rows)

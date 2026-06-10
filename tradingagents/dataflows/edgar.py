@@ -362,14 +362,41 @@ def fetch_recent_8k_items(
         return []
 
     # Determine which CIKs to query.
-    if tickers:
-        upper_tickers = [t.upper() for t in tickers]
-        target_ciks = {tk_to_cik[tk]: tk for tk in upper_tickers if tk in tk_to_cik}
-    else:
-        target_ciks = {cik: tk for cik, tk in cik_to_tk.items()}
+    # Require an explicit ticker list — crawling the full CIK map (~10K entries)
+    # would take 18+ minutes and violates SEC fair-access policy.
+    if not tickers:
+        logger.warning(
+            "EDGAR fetch_recent_8k_items called with no ticker list — "
+            "refusing to crawl the full CIK map; pass an explicit ticker list. "
+            "Returning []."
+        )
+        return []
+
+    upper_tickers = [t.upper() for t in tickers]
+    target_ciks = {tk_to_cik[tk]: tk for tk in upper_tickers if tk in tk_to_cik}
 
     if not target_ciks:
         return []
+
+    # Cap the number of CIK fetches per scan to avoid run-away crawls.
+    # The default cap (cfg portfolio_advisor_edgar_max_ticker_fetches = 60)
+    # keeps each scan well under 10 seconds at 0.11s/request.
+    # NOTE: the cap is applied here from the environment / caller context.
+    # Since fetch_recent_8k_items doesn't take a cfg, the cap is read from
+    # the env var TRADINGAGENTS_EDGAR_MAX_TICKER_FETCHES (default 60).
+    try:
+        _cap = int(os.environ.get("TRADINGAGENTS_EDGAR_MAX_TICKER_FETCHES", "60") or "60")
+    except (ValueError, TypeError):
+        _cap = 60
+    if len(target_ciks) > _cap:
+        cik_items = list(target_ciks.items())[:_cap]
+        truncated_n = len(target_ciks) - _cap
+        logger.warning(
+            "EDGAR: ticker list has %d entries; capping to %d (TRADINGAGENTS_EDGAR_MAX_TICKER_FETCHES=%d). "
+            "%d tickers skipped.",
+            len(target_ciks), _cap, _cap, truncated_n,
+        )
+        target_ciks = dict(cik_items)
 
     # Cutoff time for filtering.
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)

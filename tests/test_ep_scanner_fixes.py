@@ -221,13 +221,15 @@ def _build_propose_tool(cfg, captured, monkeypatch):
 
 
 def test_propose_trade_rejects_past_catalyst_date(tmp_path, monkeypatch):
+    # propose_trade now accepts up to 5 days in the past (allow_recent_past_days=5).
+    # Use 6 days ago to confirm rejection beyond the allowance window.
     captured: list = []
     tool = _build_propose_tool(_cfg(tmp_path), captured, monkeypatch)
     out = tool.invoke({
         "ticker": "DKNG",
         "action": "buy",
         "sleeve": "catalyst",
-        "catalyst_date": _past(5),
+        "catalyst_date": _past(6),  # 6 days ago → outside 5-day allowance → rejected
         "approx_usd": 500,
         "reason": "Earnings beat last week",
     })
@@ -299,6 +301,8 @@ def _emit_tool(cfg):
 
 
 def test_emit_ep_candidate_invalid_date_stays_advisory(tmp_path, monkeypatch):
+    # emit_ep_candidate now accepts up to 5 days in the past (allow_recent_past_days=5).
+    # Use 6 days ago to confirm rejection beyond the allowance window.
     from tradingagents.portfolio_advisor import etoro_scan, messaging, proposals
 
     filed: list = []
@@ -316,7 +320,7 @@ def test_emit_ep_candidate_invalid_date_stays_advisory(tmp_path, monkeypatch):
         "catalyst": "WWDC hardware event",
         "entry_price": 200.0,
         "stop_price": 185.0,
-        "catalyst_date": _past(2),  # past date — should not file
+        "catalyst_date": _past(6),  # 6 days ago → outside 5-day allowance → rejected
     })
     assert "advisory" in result.lower() or "invalid" in result.lower()
     assert filed == []  # no proposal filed

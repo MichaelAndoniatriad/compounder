@@ -506,4 +506,10 @@ DEFAULT_CONFIG = _apply_env_overrides({
     # PEAD scanner settings (R3)
     # Max Alpha Vantage EARNINGS calls per scan_post_reports run (free-tier budget).
     "portfolio_advisor_pead_max_names": 15,
+    # Days to hold a PEAD position before the time-stop exits it (post-event drift
+    # needs more time than the default catalyst 3-day window).  Overrides
+    # portfolio_advisor_catalyst_time_stop_days for pead_scanner-sourced plans.
+    "portfolio_advisor_pead_hold_days": 20,
+    # Max number of per-ticker EDGAR CIK fetches per ep-scan run (fair-use cap).
+    "portfolio_advisor_edgar_max_ticker_fetches": 60,
 })

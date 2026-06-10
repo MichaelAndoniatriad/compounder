@@ -567,3 +567,367 @@ class TestPytestGuard:
         cfg = _make_cfg(tmp_path)
         result = scan_post_reports(cfg)
         assert result.get("skipped_pytest") is True
+
+
+# ---------------------------------------------------------------------------
+# New tests for review findings (items 1–5)
+# ---------------------------------------------------------------------------
+
+
+class TestValidateCatalystDateAllowRecentPast:
+    """Item 1: validate_catalyst_date allow_recent_past_days parameter."""
+
+    def test_past_date_rejected_by_default(self):
+        from tradingagents.portfolio_advisor.candidates import validate_catalyst_date
+        yesterday = (date.today() - timedelta(days=1)).isoformat()
+        valid, err = validate_catalyst_date(yesterday)
+        assert valid is False
+        assert "past" in err.lower()
+
+    def test_past_5d_ok_via_pead_path(self):
+        """allow_recent_past_days=5: dates up to 5 days in past validate OK."""
+        from tradingagents.portfolio_advisor.candidates import validate_catalyst_date
+        five_days_ago = (date.today() - timedelta(days=5)).isoformat()
+        valid, err = validate_catalyst_date(five_days_ago, allow_recent_past_days=5)
+        assert valid is True, f"Expected valid=True, got err={err!r}"
+
+    def test_past_6d_still_rejected_with_5d_allowance(self):
+        """6 days ago is outside the 5-day allowance."""
+        from tradingagents.portfolio_advisor.candidates import validate_catalyst_date
+        six_days_ago = (date.today() - timedelta(days=6)).isoformat()
+        valid, err = validate_catalyst_date(six_days_ago, allow_recent_past_days=5)
+        assert valid is False
+        assert "past" in err.lower()
+
+    def test_evaluate_candidate_pead_source_accepts_past_date(self):
+        """evaluate_candidate with source=pead_scanner accepts yesterday's catalyst_date."""
+        from tradingagents.portfolio_advisor.candidates import evaluate_candidate
+        yesterday = (date.today() - timedelta(days=1)).isoformat()
+        raw = {
+            "ticker": "AAPL",
+            "strategy": "catalyst",
+            "catalyst": "earnings beat +20%",
+            "catalyst_date": yesterday,
+            "reason": "PEAD: EPS surprise +20%, gap +5%, RVOL 2.1x",
+            "liquidity_ok": True,
+            "source": "pead_scanner",
+            "priority": 2,
+        }
+        rec = evaluate_candidate(raw)
+        # Should NOT be rejected for catalyst_date_invalid
+        assert "catalyst_date_invalid" not in rec.gate_failures, (
+            f"Expected no catalyst_date_invalid but got gate_failures={rec.gate_failures}"
+        )
+        assert rec.status != "rejected" or "catalyst_date_invalid" not in rec.gate_failures
+
+    def test_evaluate_candidate_non_pead_still_rejects_past_date(self):
+        """Non-PEAD source with a past catalyst_date is still rejected."""
+        from tradingagents.portfolio_advisor.candidates import evaluate_candidate
+        yesterday = (date.today() - timedelta(days=1)).isoformat()
+        raw = {
+            "ticker": "AAPL",
+            "strategy": "catalyst",
+            "catalyst": "FDA approval expected",
+            "catalyst_date": yesterday,
+            "reason": "Thesis: strong clinical data",
+            "liquidity_ok": True,
+            "source": "ep_scanner",
+            "priority": 2,
+        }
+        rec = evaluate_candidate(raw)
+        assert "catalyst_date_invalid" in rec.gate_failures
+
+
+class TestPositionPlanTimeStopOverride:
+    """Item 2: time_stop_days_override persisted and honored by eval_catalyst_exit."""
+
+    def test_override_serializes_and_deserializes(self, tmp_path):
+        from tradingagents.portfolio_advisor.position_plans import (
+            PositionPlan, load_position_plans, save_position_plans,
+        )
+        cfg = {"portfolio_advisor_dir": str(tmp_path / "pa")}
+        (tmp_path / "pa").mkdir(parents=True, exist_ok=True)
+        plan = PositionPlan(
+            ticker="AAPL",
+            entry_price=150.0,
+            strategy="catalyst",
+            catalyst_date=(date.today() - timedelta(days=10)).isoformat(),
+            time_stop_days_override=20,
+            source="pead_scanner",
+        )
+        save_position_plans(cfg, {"AAPL": plan})
+        loaded = load_position_plans(cfg)
+        assert loaded["AAPL"].time_stop_days_override == 20
+        assert loaded["AAPL"].source == "pead_scanner"
+
+    def test_eval_catalyst_exit_honors_override_longer_window(self):
+        """With override=20, a 10-day-old position is NOT time-stopped (rules.time_stop_days=3)."""
+        from tradingagents.portfolio_advisor.position_plans import (
+            PositionPlan, CatalystRules, eval_catalyst_exit,
+        )
+        plan = PositionPlan(
+            ticker="AAPL",
+            entry_price=100.0,
+            strategy="catalyst",
+            catalyst_date=(date.today() - timedelta(days=10)).isoformat(),
+            time_stop_days_override=20,  # PEAD: 20-day hold
+        )
+        rules = CatalystRules(time_stop_days=3, hard_stop_pct=0.08, trailing_activate_pct=0.05,
+                               trailing_stop_pct=0.08, max_hold_days=30)
+        # Price hasn't moved up yet (+3% < +5% threshold)
+        result = eval_catalyst_exit(plan, current_price=103.0, rules=rules)
+        assert result is None, f"Expected no exit at day 10 with override=20, got {result!r}"
+
+    def test_eval_catalyst_exit_fires_when_override_exceeded(self):
+        """With override=20 and 25 days elapsed, time-stop fires."""
+        from tradingagents.portfolio_advisor.position_plans import (
+            PositionPlan, CatalystRules, eval_catalyst_exit,
+        )
+        plan = PositionPlan(
+            ticker="AAPL",
+            entry_price=100.0,
+            strategy="catalyst",
+            catalyst_date=(date.today() - timedelta(days=25)).isoformat(),
+            time_stop_days_override=20,
+        )
+        rules = CatalystRules(time_stop_days=3, hard_stop_pct=0.08, trailing_activate_pct=0.05,
+                               trailing_stop_pct=0.08, max_hold_days=30)
+        result = eval_catalyst_exit(plan, current_price=102.0, rules=rules)
+        assert result is not None
+        assert "time_stop" in result
+        assert "20d" in result
+
+    def test_eval_catalyst_exit_uses_default_when_no_override(self):
+        """Without override, the default time_stop_days (3) applies."""
+        from tradingagents.portfolio_advisor.position_plans import (
+            PositionPlan, CatalystRules, eval_catalyst_exit,
+        )
+        plan = PositionPlan(
+            ticker="AAPL",
+            entry_price=100.0,
+            strategy="catalyst",
+            catalyst_date=(date.today() - timedelta(days=5)).isoformat(),
+            # No override → rules.time_stop_days=3 applies
+        )
+        rules = CatalystRules(time_stop_days=3, hard_stop_pct=0.08, trailing_activate_pct=0.05,
+                               trailing_stop_pct=0.08, max_hold_days=30)
+        result = eval_catalyst_exit(plan, current_price=102.0, rules=rules)
+        assert result is not None
+        assert "time_stop" in result
+        assert "3d" in result
+
+
+class TestReportedDateMismatch:
+    """Item 3: wrong-quarter SUE detection — Gate 0b logic.
+
+    Exercises the ±3-day check inline rather than running the full scan
+    (which would require stripping PYTEST_CURRENT_TEST and mocking many
+    layers).  The logic is: abs((eps_dt - cal_dt).days) > 3 → mismatch.
+    """
+
+    def test_same_day_is_within_window(self):
+        """reportedDate == calendar date → 0 days apart → passes."""
+        from datetime import date, timedelta
+        cal_dt = date.today() - timedelta(days=1)
+        eps_dt = cal_dt
+        assert abs((eps_dt - cal_dt).days) <= 3
+
+    def test_3_days_apart_is_within_window(self):
+        """reportedDate ±3 days → boundary case → passes."""
+        from datetime import date, timedelta
+        cal_dt = date.today() - timedelta(days=1)
+        eps_dt = cal_dt + timedelta(days=3)
+        assert abs((eps_dt - cal_dt).days) <= 3
+
+    def test_4_days_apart_fails_gate(self):
+        """reportedDate 4 days from calendar date → outside ±3 window → mismatch."""
+        from datetime import date, timedelta
+        cal_dt = date.today() - timedelta(days=1)
+        eps_dt = cal_dt - timedelta(days=4)
+        assert abs((eps_dt - cal_dt).days) > 3
+
+    def test_prior_quarter_lag_fails_gate(self):
+        """reportedDate 30 days ago (prior quarter) → way outside ±3 → mismatch."""
+        from datetime import date, timedelta
+        cal_dt = date.today() - timedelta(days=1)
+        eps_dt = cal_dt - timedelta(days=30)
+        assert abs((eps_dt - cal_dt).days) > 3
+
+    def test_gate_0b_label_in_scan_skipped(self, tmp_path):
+        """When reportedDate is far off, scan_post_reports emits failed_at=reportedDate_mismatch.
+
+        This runs with PYTEST_CURRENT_TEST stripped so the real scan loop executes,
+        with _fetch_earnings_eps and _yf_price_volume mocked.
+        """
+        yesterday = (date.today() - timedelta(days=1)).isoformat()
+        old_date = (date.today() - timedelta(days=30)).isoformat()
+        stale_eps = {
+            "reportedDate": old_date,
+            "reportedEPS": "1.80",
+            "estimatedEPS": "1.50",
+            "surprisePercentage": "20.0",
+        }
+        cfg = _make_cfg(tmp_path)
+        pa_dir = Path(cfg["portfolio_advisor_dir"])
+        pa_dir.mkdir(parents=True, exist_ok=True)
+        calendar_payload = {
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+            "rows": [
+                {
+                    "symbol": "AAPL",
+                    "name": "Apple",
+                    "report_date": yesterday,
+                    "fiscal_date_ending": "2024-09-30",
+                    "estimate": "1.50",
+                    "currency": "USD",
+                }
+            ],
+        }
+        (pa_dir / "earnings_calendar.json").write_text(
+            json.dumps(calendar_payload), encoding="utf-8"
+        )
+        # Strip PYTEST_CURRENT_TEST so the scan loop actually runs
+        env_copy = {k: v for k, v in os.environ.items() if k != "PYTEST_CURRENT_TEST"}
+        with (
+            patch.dict(os.environ, env_copy, clear=True),
+            patch(
+                "tradingagents.portfolio_advisor.pead_scanner._fetch_earnings_eps",
+                return_value=stale_eps,
+            ),
+            patch(
+                "tradingagents.portfolio_advisor.pead_scanner._yf_price_volume",
+                return_value=None,  # won't be reached after gate 0b fires
+            ),
+            patch(
+                "tradingagents.portfolio_advisor.pead_scanner._session_elapsed_fraction",
+                return_value=0.5,
+            ),
+        ):
+            result = scan_post_reports(cfg)
+
+        assert not any(c["ticker"] == "AAPL" for c in result["candidates"]), (
+            "Expected AAPL to be skipped due to reportedDate mismatch"
+        )
+        skip = next((s for s in result["skipped"] if s["ticker"] == "AAPL"), None)
+        assert skip is not None
+        assert "not yet updated" in skip["reason"] or "reportedDate" in skip["reason"]
+        gate = next((g for g in result["gate_log"] if g.get("ticker") == "AAPL"), None)
+        assert gate is not None
+        assert gate.get("failed_at") == "reportedDate_mismatch"
+
+
+class TestElapsedFractionRvol:
+    """Item 4: partial-day RVOL scaling."""
+
+    def test_session_elapsed_fraction_clamped(self):
+        """_session_elapsed_fraction returns a value in [0.05, 1.0]."""
+        from tradingagents.portfolio_advisor.pead_scanner import _session_elapsed_fraction
+        # PYTEST_CURRENT_TEST is set → market_clock returns None → fallback ET calc
+        # The result must be clamped
+        fraction = _session_elapsed_fraction()
+        assert 0.05 <= fraction <= 1.0
+
+    def test_09_45_et_elapsed_fraction_is_clamped(self):
+        """At 09:45 ET (15 min into session), fraction ≈ 0.038 → clamped to 0.05."""
+        from tradingagents.portfolio_advisor.pead_scanner import _SESSION_HOURS
+        # 15 minutes = 0.25h; session = 6.5h → raw fraction = 0.25/6.5 ≈ 0.038
+        raw = 0.25 / _SESSION_HOURS  # ≈ 0.0385
+        clamped = max(0.05, min(1.0, raw))
+        assert clamped == pytest.approx(0.05, abs=0.001), (
+            f"Expected 0.05 (clamped), got {clamped}"
+        )
+        assert raw < 0.05  # confirm it would have been below the floor
+
+    def test_rvol_scale_with_fraction(self):
+        """RVOL computed at fraction=0.05: 100k vol / (1M * 0.05) = 2.0 → pass."""
+        # Simulate a gate check at 5% elapsed: avg_vol=1M, today_vol=100k
+        # scaled_avg = 1_000_000 * 0.05 = 50_000
+        # rvol = 100_000 / 50_000 = 2.0 → passes >= 1.5
+        avg_vol = 1_000_000.0
+        today_vol = 100_000.0
+        elapsed = 0.05
+        scaled_avg = avg_vol * elapsed
+        rvol = today_vol / scaled_avg
+        assert rvol == pytest.approx(2.0, rel=0.01)
+        assert rvol >= 1.5  # gate passes
+
+
+class TestCacheNoCacheOnError:
+    """Item 5: refresh_calendar must not cache empty/error body."""
+
+    def _env_no_pytest(self):
+        return {k: v for k, v in os.environ.items() if k != "PYTEST_CURRENT_TEST"}
+
+    def test_no_cache_on_empty_csv(self, tmp_path):
+        """If AV returns an empty CSV (0 rows), existing stale cache is preserved."""
+        cfg = _make_cfg(tmp_path)
+        pa_dir = Path(cfg["portfolio_advisor_dir"])
+        pa_dir.mkdir(parents=True, exist_ok=True)
+        # Plant a stale but valid cache (4 days old — beyond the 3-day TTL)
+        stale_ts = (datetime.now(timezone.utc) - timedelta(days=4)).isoformat()
+        stale_rows = [{"symbol": "AAPL", "name": "Apple", "report_date": "2024-10-31",
+                       "fiscal_date_ending": "", "estimate": "1.5", "currency": "USD"}]
+        stale_cache = {"fetched_at": stale_ts, "rows": stale_rows}
+        (pa_dir / "earnings_calendar.json").write_text(json.dumps(stale_cache), encoding="utf-8")
+
+        with (
+            patch.dict(os.environ, self._env_no_pytest(), clear=True),
+            # Simulate AV returning an empty CSV body (header only)
+            patch(
+                "tradingagents.portfolio_advisor.pead_scanner._fetch_earnings_calendar",
+                return_value="symbol,name,reportDate,fiscalDateEnding,estimate,currency\n",
+            ),
+        ):
+            result = refresh_calendar(cfg)
+
+        # Should return error with zero_rows and NOT overwrite the cache
+        assert result.get("error") == "zero_rows"
+        # Cache should still contain the original stale data (not clobbered)
+        cached = json.loads((pa_dir / "earnings_calendar.json").read_text())
+        assert len(cached["rows"]) == 1
+        assert cached["rows"][0]["symbol"] == "AAPL"
+
+    def test_no_cache_on_rate_limit_response(self, tmp_path):
+        """If AV returns a rate-limit JSON body, existing cache is preserved."""
+        cfg = _make_cfg(tmp_path)
+        pa_dir = Path(cfg["portfolio_advisor_dir"])
+        pa_dir.mkdir(parents=True, exist_ok=True)
+        stale_ts = (datetime.now(timezone.utc) - timedelta(days=4)).isoformat()
+        stale_cache = {"fetched_at": stale_ts, "rows": [{"symbol": "MSFT"}]}
+        (pa_dir / "earnings_calendar.json").write_text(json.dumps(stale_cache), encoding="utf-8")
+
+        with (
+            patch.dict(os.environ, self._env_no_pytest(), clear=True),
+            # Simulate AV rate-limit — _fetch_earnings_calendar raises ValueError
+            patch(
+                "tradingagents.portfolio_advisor.pead_scanner._fetch_earnings_calendar",
+                side_effect=ValueError("AV rate-limit response for EARNINGS_CALENDAR: {\"Information\": \"...\"}")
+            ),
+        ):
+            result = refresh_calendar(cfg)
+
+        # Should return with an error key
+        assert "error" in result
+        # Cache should be preserved
+        cached = json.loads((pa_dir / "earnings_calendar.json").read_text())
+        assert len(cached.get("rows", [])) == 1
+
+    def test_av_rate_limit_body_detection(self):
+        """_av_rate_limit_body correctly detects AV rate-limit JSON responses.
+
+        The function only inspects JSON bodies (starting with '{').
+        Plain-text or CSV responses that don't start with '{' are not flagged.
+        """
+        from tradingagents.portfolio_advisor.pead_scanner import _av_rate_limit_body
+        # JSON body with "Information" key → rate-limit
+        assert _av_rate_limit_body('{"Information": "API rate limit reached"}') is True
+        # JSON body with "Note" key → rate-limit
+        assert _av_rate_limit_body('{"Note": "Thank you for using Alpha Vantage"}') is True
+        # JSON body with "rate limit" text → rate-limit
+        assert _av_rate_limit_body('{"message": "rate limit exceeded, please retry"}') is True
+        # Normal CSV (not JSON) → not flagged
+        assert _av_rate_limit_body("symbol,name,reportDate\nAAPL,Apple,2024-10-31\n") is False
+        # Plain text (not JSON) → not flagged
+        assert _av_rate_limit_body("rate limit exceeded") is False
+        # Empty body → not flagged
+        assert _av_rate_limit_body("") is False

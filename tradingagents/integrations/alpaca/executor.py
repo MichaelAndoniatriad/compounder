@@ -1076,6 +1076,16 @@ def _auto_create_position_plan(
         logger.debug("auto-create plan: no entry price for %s — skipping", tk)
         return
 
+    proposal_source = str(proposal.get("source") or "").strip()
+    # PEAD plans need a longer time-stop window (drift takes time).
+    # Use cfg portfolio_advisor_pead_hold_days (default 20) as the override.
+    _tso: Optional[int] = None
+    if proposal_source == "pead_scanner":
+        try:
+            _tso = int(cfg.get("portfolio_advisor_pead_hold_days", 20) or 20)
+        except (TypeError, ValueError):
+            _tso = 20
+
     note = f"auto-created on autonomous buy {_now_iso()}"
     plan = PositionPlan(
         ticker=tk,
@@ -1085,6 +1095,8 @@ def _auto_create_position_plan(
         catalyst_date=catalyst_date or "",
         notes=note,
         high_conviction=bool(high_conviction),
+        time_stop_days_override=_tso,
+        source=proposal_source,
     )
     upsert_position_plan(cfg, plan)
 

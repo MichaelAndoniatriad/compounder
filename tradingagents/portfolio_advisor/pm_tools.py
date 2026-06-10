@@ -329,12 +329,13 @@ def build_pm_tools(cfg: Dict[str, Any], live_tickers: set) -> List[Any]:
                 "the sleeve."
             )
         # Guard: when a catalyst_date is supplied for a buy/add, it must be a valid
-        # future date within the max look-ahead window. A hallucinated or past date
-        # would drive a real autonomous entry on a stale thesis.
+        # date within the max look-ahead window.  Post-event drift trades (PEAD)
+        # have a catalyst_date that is the recent past earnings date by design —
+        # allow up to 5 days in the past so they are not auto-rejected here.
         if (sleeve or "").strip().lower() == "catalyst" and act in ("buy", "add") \
                 and (catalyst_date or "").strip():
             from tradingagents.portfolio_advisor.candidates import validate_catalyst_date
-            _valid, _err = validate_catalyst_date(catalyst_date, cfg)
+            _valid, _err = validate_catalyst_date(catalyst_date, cfg, allow_recent_past_days=5)
             if not _valid:
                 return f"error: {_err}"
         # Guard: high_conviction applies only to buy/add (size-up makes no sense on exits).
@@ -722,7 +723,9 @@ def build_pm_tools(cfg: Dict[str, Any], live_tickers: set) -> List[Any]:
         _date_advisory_reason = ""  # non-empty → date was invalid; stay advisory
         if _dated_catalyst:
             from tradingagents.portfolio_advisor.candidates import validate_catalyst_date
-            _date_ok, _date_err = validate_catalyst_date(_dated_catalyst, cfg)
+            # Allow up to 5 days in the past for post-event drift (PEAD) entries
+            # where catalyst_date is the recent earnings/event date.
+            _date_ok, _date_err = validate_catalyst_date(_dated_catalyst, cfg, allow_recent_past_days=5)
             if not _date_ok:
                 _date_advisory_reason = _date_err
         if _mode == "alpaca" and _dated_catalyst and not _date_advisory_reason:
