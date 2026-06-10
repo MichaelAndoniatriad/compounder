@@ -52,7 +52,7 @@ New `tradingagents/portfolio_advisor/pead_scanner.py`:
 
 Accept: unit tests for SUE math, gate logic, calendar parsing (fixture CSV), proposal routing; plist loads.
 
-## R4 — EP scanner fixes + EDGAR 8-K feed (funnel starvation)
+## R4 — EP scanner fixes + EDGAR 8-K feed ✅ 0012974 (funnel starvation)
 
 1. In `ep_scanner.py`: add the RVOL gate its own SOP mandates — day volume ≥ 2× 20d average AND dollar volume ≥ $5M — logged to the existing gate log with pass/fail detail. (docs/strategies/episodic_pivot.md §volume; gap-without-volume is where reversals live.)
 2. Pre-market scan honesty: the 08:30 scan currently uses yfinance daily bars (no prepost) — fake. Use Alpaca latest quote/trade (free IEX) for pre-market price when in the pre-market window; if unavailable, SKIP the pre-market scan with a log line rather than scanning stale closes.
