@@ -743,7 +743,7 @@ def compute_deployment_split(
     """Decide how to deploy `new_cash` toward the target sleeve mix.
 
     sleeve_actuals: {"core": $, "catalyst": $, "cash": $} BEFORE the new cash.
-    sleeve_targets: {"core": 0.50, "catalyst": 0.30, "cash": 0.20} (default).
+    sleeve_targets: {"core": 0.70, "catalyst": 0.20, "cash": 0.10} (default).
 
     Returns:
       {
@@ -753,7 +753,7 @@ def compute_deployment_split(
         "after_pct": {"core": float, "catalyst": float, "cash": float},
       }
     """
-    tgt = sleeve_targets or {"core": 0.50, "catalyst": 0.30, "cash": 0.20}
+    tgt = sleeve_targets or {"core": 0.70, "catalyst": 0.20, "cash": 0.10}
     core = float(sleeve_actuals.get("core") or 0.0)
     catalyst = float(sleeve_actuals.get("catalyst") or 0.0)
     cash = float(sleeve_actuals.get("cash") or 0.0)

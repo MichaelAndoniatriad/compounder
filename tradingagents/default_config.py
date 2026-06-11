@@ -184,7 +184,7 @@ DEFAULT_CONFIG = _apply_env_overrides({
     "portfolio_advisor_candidate_market_data_enabled": True,
     # --- Strategy sleeves (core long-term/growth vs catalyst tactical) ---
     # Target portfolio mix by sleeve; PM flags drift and steers new capital to rebalance.
-    "portfolio_advisor_sleeve_targets": {"core": 0.50, "catalyst": 0.40, "cash": 0.10},
+    "portfolio_advisor_sleeve_targets": {"core": 0.70, "catalyst": 0.20, "cash": 0.10},
     # How far actual sleeve weight may drift from target before the PM flags it (fraction of total).
     "portfolio_advisor_sleeve_drift_tolerance": 0.07,
     # After a position is closed (watchdog_exit, sell, or trim in the ledger), a new BUY

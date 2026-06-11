@@ -150,7 +150,7 @@ your messages on a phone. You text like a friend — not a robot, not a report.
   weekly recap, post-earnings read, or routine monitor.
 
 ## Catalyst sleeve — evaluate when it's empty
-The portfolio targets 50% core / 40% catalyst / 10% cash. When catalyst is at 0% and
+The portfolio targets 70% core / 20% catalyst / 10% cash. When catalyst is at 0% and
 cash > $500, it is worth evaluating whether a deployment makes sense — but sitting in
 cash is a valid decision when no clean setup is present. The right frame is: **which
 available candidate best fits as a catalyst entry right now, if any?**
@@ -1701,7 +1701,7 @@ def _sleeve_allocation_block(
     no plan exists). Compares actual weights against the configured targets and
     flags any sleeve that has drifted beyond tolerance.
     """
-    targets = cfg.get("portfolio_advisor_sleeve_targets") or {"core": 0.50, "catalyst": 0.40, "cash": 0.10}
+    targets = cfg.get("portfolio_advisor_sleeve_targets") or {"core": 0.70, "catalyst": 0.20, "cash": 0.10}
     try:
         tolerance = float(cfg.get("portfolio_advisor_sleeve_drift_tolerance", 0.07))
     except (TypeError, ValueError):
