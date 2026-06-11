@@ -515,8 +515,25 @@ def run_watchdog(cfg: Dict[str, Any], *, ignore_market_hours: bool = False, supp
     try:
         from tradingagents.integrations.alpaca import executor as _alpaca
 
+        # Determine whether we are in alpaca (autonomous) mode.  Wrap in
+        # try/except so any import or resolution error falls through to the
+        # old (safe) behaviour — close — rather than silently skipping.
+        _in_alpaca_mode: bool = False
+        try:
+            from tradingagents.portfolio_advisor.etoro_scan import account_mode as _account_mode
+            _in_alpaca_mode = (_account_mode() == "alpaca")
+        except Exception:
+            _in_alpaca_mode = False
+
         for t in mandatory:
-            _alpaca.close_for_watchdog(cfg, t.get("ticker", ""), 1.0, "dd40_mandatory_exit")
+            ticker_m = t.get("ticker", "")
+            if _in_alpaca_mode:
+                logger.info(
+                    "dd40 mirror skipped for %s: alpaca mode — re-underwrite flow owns core -40%%",
+                    ticker_m,
+                )
+                continue
+            _alpaca.close_for_watchdog(cfg, ticker_m, 1.0, "dd40_mandatory_exit")
 
         # Consumed-marker set for pre-earnings trims, keyed by "TICKER:earnings_date".
         consumed_trims: set = set()

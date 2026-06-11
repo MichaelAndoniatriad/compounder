@@ -803,3 +803,98 @@ def test_record_reunderwrite_verdict_requires_reason(tmp_path):
         "reason": "",
     })
     assert "error" in result.lower()
+
+
+# ---------------------------------------------------------------------------
+# 10. Watchdog mirror dd40 skip in alpaca mode (bypass prevention)
+# ---------------------------------------------------------------------------
+
+# Minimal synthesised mandatory-exit entry (as returned by _split_watchdog_triggers).
+_DD40_MANDATORY = {
+    "ticker": "NVDA",
+    "entry": 100.0,
+    "price": 55.0,
+    "gain_pct": -45.0,
+    "drawdown_pct": 45.0,
+    "units": 10.0,
+    "codes": ["dd40_mandatory_exit"],
+    "earnings_date": "",
+}
+
+
+def _run_watchdog_mirror_only(cfg, tmp_path, account_mode_value: str) -> list:
+    """Drive run_watchdog through the mirror block and return calls made to
+    close_for_watchdog.  All external side-effects are patched away.
+
+    We bypass _split_watchdog_triggers (which requires live eToro row data) by
+    patching it to return our pre-built mandatory bucket directly.
+    """
+    from tradingagents.portfolio_advisor import watchdog as wd
+    from tradingagents.integrations.alpaca import executor as _exec
+
+    close_calls: list = []
+
+    def _fake_close(c, ticker, fraction, rule):
+        close_calls.append({"ticker": ticker, "fraction": fraction, "rule": rule})
+        return f"closed-{ticker}"
+
+    with (
+        # fetch_portfolio_rows returns a minimal eToro response.
+        patch.object(wd.etoro_scan, "fetch_portfolio_rows",
+                     return_value=("", "", ["NVDA"], [])),
+        patch.object(wd, "market_is_open", return_value=True),
+        # _split_watchdog_triggers returns our pre-built mandatory bucket.
+        patch.object(wd, "_split_watchdog_triggers",
+                     return_value=([_DD40_MANDATORY], [], [])),
+        # Suppress enforce_paper_exits (runs at top of tick; owns -40% in alpaca mode).
+        patch("tradingagents.integrations.alpaca.executor.enforce_paper_exits"),
+        # Suppress all PM paths.
+        patch("tradingagents.portfolio_advisor.messaging.send_advisor_message"),
+        patch("tradingagents.portfolio_advisor.pm_workspace.active_decision", return_value=None),
+        patch(
+            "tradingagents.portfolio_advisor.advisor_pm.optional_pm_cycle_on_portfolio_change"
+        ),
+        patch("tradingagents.portfolio_advisor.advisor_pm.run_pm_cycle"),
+        # Patch account_mode used inside the mirror block.
+        patch(
+            "tradingagents.portfolio_advisor.etoro_scan.account_mode",
+            return_value=account_mode_value,
+        ),
+        patch.object(_exec, "close_for_watchdog", side_effect=_fake_close),
+        # Suppress ancillaries.
+        patch("tradingagents.portfolio_advisor.outcome_tracker.record_daily_nav"),
+        patch("tradingagents.portfolio_advisor.outcome_sync.auto_close_outcomes", return_value=None),
+    ):
+        wd.run_watchdog(cfg, ignore_market_hours=True, suppress_pm_handoff=True)
+
+    return close_calls
+
+
+def test_watchdog_mirror_dd40_skipped_in_alpaca_mode(tmp_path):
+    """In alpaca mode the mirror must NOT call close_for_watchdog for the dd40 bucket.
+    enforce_paper_exits owns core -40% handling in that mode.
+    """
+    cfg = _cfg(tmp_path)
+    Path(cfg["portfolio_advisor_dir"]).mkdir(parents=True, exist_ok=True)
+
+    close_calls = _run_watchdog_mirror_only(cfg, tmp_path, account_mode_value="alpaca")
+
+    dd40_closes = [c for c in close_calls if c["rule"] == "dd40_mandatory_exit"]
+    assert dd40_closes == [], (
+        f"Expected NO dd40_mandatory_exit close in alpaca mode, got: {dd40_closes}"
+    )
+
+
+def test_watchdog_mirror_dd40_fires_in_etoro_mode(tmp_path):
+    """In etoro mode the mirror MUST still call close_for_watchdog for the dd40 bucket."""
+    cfg = _cfg(tmp_path)
+    Path(cfg["portfolio_advisor_dir"]).mkdir(parents=True, exist_ok=True)
+
+    close_calls = _run_watchdog_mirror_only(cfg, tmp_path, account_mode_value="etoro")
+
+    dd40_closes = [c for c in close_calls if c["rule"] == "dd40_mandatory_exit"]
+    assert len(dd40_closes) == 1, (
+        f"Expected exactly 1 dd40_mandatory_exit close in etoro mode, got: {dd40_closes}"
+    )
+    assert dd40_closes[0]["ticker"] == "NVDA"
+    assert dd40_closes[0]["fraction"] == 1.0
