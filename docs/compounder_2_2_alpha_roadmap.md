@@ -135,6 +135,24 @@ Catalyst sleeve's alpha bounded by mechanical components; LLM judgment can only 
 
 Suite: **842 tests + 93 subtests, all green**.
 
+### T3 ✅ 2bbb8c7 — Re-underwrite flow + hard book-loss cap + counterfactual ledger — 2026-06-11
+
+Converted the core sleeve's mandatory -40% full-exit stop into a forced re-underwrite with
+a deterministic deadline and a separate hard book-loss cap — so the Bessembinder tail can
+survive temporary drawdowns while accounts are still protected from concentrated losses.
+
+| Component | Detail |
+|-----------|--------|
+| `position_plans.py` | `PositionPlan` gains `reunderwrite_triggered_at`, `reunderwrite_deadline`, `reunderwrite_verdict`, `reunderwrite_last_cleared_at`; `build_trigger_block` surfaces PENDING RE-UNDERWRITES section with deadline |
+| `executor.py` | Core -40% now arms re-underwrite + queues `full_graph` job (idempotent; dedup); deadline expiry → `paper_core_reunderwrite_expired`; `reunderwrite_verdict="broken"` → `paper_core_thesis_broken`; account equity cached once per tick; book-loss cap (5% equity) closes immediately regardless of re-underwrite state; `close_for_watchdog` appends to `counterfactual_ledger.jsonl` on every rule close |
+| `pm_tools.py` | New `record_reunderwrite_verdict(ticker, verdict, reason)` tool; "reconfirmed" clears trigger + 30d cooldown; "broken" flags for immediate close |
+| `outcome_tracker.py` | New `score_counterfactuals(cfg)`: scores ledger rows ≥30d/≥180d vs SPY forward return, writes `counterfactual_scores.jsonl`; idempotent |
+| `default_config.py` | 3 new keys: `portfolio_advisor_reunderwrite_days=5`, `portfolio_advisor_reunderwrite_cooldown_days=30`, `portfolio_advisor_max_position_book_loss_pct=0.05` |
+| `cli/advisor_cmd.py` | `measure-outcomes` now calls `score_counterfactuals` |
+| Tests | 18 new tests in `test_reunderwrite_and_book_loss.py` |
+
+Suite: **860 tests + 93 subtests, all green**.
+
 ---
 
 ## Explicitly rejected (do not build)
