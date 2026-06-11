@@ -192,6 +192,20 @@ DEFAULT_CONFIG = _apply_env_overrides({
     # Applies to both 'buy' and 'add' actions; the existing add-cooldown covers only
     # sequential adds, not re-entry after a stop-out.
     "portfolio_advisor_reentry_cooldown_days": 5,
+    # --- T3: Re-underwrite flow for core positions at -40% ---
+    # When a core position hits -40% plpc, instead of closing immediately, a forced
+    # re-underwrite is triggered.  The PM has this many days to call
+    # record_reunderwrite_verdict(ticker, "reconfirmed"|"broken", reason).
+    # If the deadline passes without a reconfirmed verdict, the position closes.
+    "portfolio_advisor_reunderwrite_days": 5,
+    # Cooldown after a reconfirmed re-underwrite: re-underwrite does not re-trigger
+    # for this many days even if the position remains ≤ -40%.
+    "portfolio_advisor_reunderwrite_cooldown_days": 30,
+    # Hard book-loss cap (code-level, no LLM voice): close 100% if unrealized loss
+    # exceeds this fraction of account equity (e.g. 0.05 = 5%).  A -40% on a 3%
+    # position (-1.2% book) waits for re-underwrite; a -40% on a 14% position
+    # (-5.6% book) closes immediately.
+    "portfolio_advisor_max_position_book_loss_pct": 0.05,
     # Catalyst-sleeve exit rules (fractions of entry/peak; days for time-based exits).
     "portfolio_advisor_catalyst_hard_stop_pct": 0.08,        # exit if down 8% from entry
     # Trailing stop arm threshold: trailing activates once the position is up this much from entry.

@@ -1248,6 +1248,47 @@ def _paper_reduce(
     return msg
 
 
+def _counterfactual_ledger_path(cfg: Dict[str, Any]) -> Path:
+    """Path to counterfactual_ledger.jsonl under the advisor directory."""
+    return pa_state.advisor_dir(cfg) / "counterfactual_ledger.jsonl"
+
+
+def _append_counterfactual_row(cfg: Dict[str, Any], ticker: str, rule: str, pos) -> None:
+    """Append one row to the counterfactual ledger for a rule-driven close.
+
+    Captures {ts, ticker, rule, exit_price, qty_closed_fraction} so
+    score_counterfactuals can later fetch the forward return and answer
+    "did this guardrail make or lose money?"
+    """
+    try:
+        exit_price: Optional[float] = None
+        try:
+            mv = float(pos.market_value or 0)
+            qty = float(pos.qty or 0)
+            if qty != 0:
+                exit_price = abs(mv) / abs(qty)
+        except (TypeError, ValueError, ZeroDivisionError):
+            pass
+        if exit_price is None:
+            try:
+                exit_price = float(pos.current_price or 0) or None
+            except (TypeError, ValueError, AttributeError):
+                pass
+
+        row = {
+            "ts": _now_iso(),
+            "ticker": ticker,
+            "rule": rule,
+            "exit_price": round(exit_price, 6) if exit_price else None,
+        }
+        p = _counterfactual_ledger_path(cfg)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row) + "\n")
+    except Exception:
+        logger.debug("_append_counterfactual_row failed for %s", ticker, exc_info=True)
+
+
 def close_for_watchdog(cfg: Dict[str, Any], ticker: str, fraction: float, rule: str) -> Optional[str]:
     """Deterministic-rule exit (dd40 → 1.0, pre-earnings trim → 0.5). Never raises."""
     if not enabled(cfg):
@@ -1278,6 +1319,8 @@ def close_for_watchdog(cfg: Dict[str, Any], ticker: str, fraction: float, rule: 
         _log_row(cfg, {"ticker": tk, "action": "watchdog_exit", "status": "submitted",
                        "fraction": round(fraction, 3), "rule": rule,
                        "position_mv": float(pos.market_value or 0)})
+        # T3: append counterfactual row so score_counterfactuals can measure this exit.
+        _append_counterfactual_row(cfg, tk, rule, pos)
         msg = f"{tk}: {note} on rule {rule}."
         _notify(cfg, f"watchdog exit {tk}", msg)
         return msg
@@ -1590,6 +1633,14 @@ def enforce_paper_exits(cfg: Dict[str, Any]) -> int:
         closed = 0
         plans_dirty = False  # track whether we need to save plans
 
+        # T3: Fetch account equity once for book-loss cap math (avoid per-position API call).
+        _account_equity_cached: Optional[float] = None
+        try:
+            _acct = client.get_account()
+            _account_equity_cached = float(_acct.equity or 0)
+        except Exception:
+            pass
+
         for pos in positions:
             tk = str(pos.symbol).upper()
             try:
@@ -1726,8 +1777,134 @@ def enforce_paper_exits(cfg: Dict[str, Any]) -> int:
                                 pass
 
             elif sleeve == "core":
-                if plpc <= -0.40:
-                    rule = "paper_core_hard_stop_-40pct"
+                # T3 — Hard book-loss cap (code-level, no LLM voice).
+                # Check this FIRST regardless of re-underwrite state.
+                # If unrealized loss > max_position_book_loss_pct × equity, close immediately.
+                book_loss_cap = float(
+                    cfg.get("portfolio_advisor_max_position_book_loss_pct", 0.05) or 0.05
+                )
+                _unrealized_pl: Optional[float] = None
+                try:
+                    _unrealized_pl = float(pos.unrealized_pl or 0)
+                except (TypeError, ValueError, AttributeError):
+                    pass
+
+                if (
+                    _unrealized_pl is not None
+                    and _unrealized_pl < 0
+                    and _account_equity_cached is not None
+                    and _account_equity_cached > 0
+                    and abs(_unrealized_pl) / _account_equity_cached >= book_loss_cap
+                ):
+                    rule = "paper_book_loss_cap"
+                elif plpc <= -0.40:
+                    # T3 — Re-underwrite flow: instead of closing immediately,
+                    # set re-underwrite fields on the plan and queue a full_graph job.
+                    # Subsequent ticks: if deadline passed without reconfirmed verdict → close.
+                    # Cooldown: do not re-trigger if reunderwrite_last_cleared_at is recent.
+                    if plan is not None:
+                        now_iso_tick = now.isoformat()
+                        reunderwrite_days = int(
+                            cfg.get("portfolio_advisor_reunderwrite_days", 5) or 5
+                        )
+                        cooldown_days = int(
+                            cfg.get("portfolio_advisor_reunderwrite_cooldown_days", 30) or 30
+                        )
+
+                        # Check cooldown: skip re-trigger if recently cleared.
+                        in_cooldown = False
+                        if plan.reunderwrite_last_cleared_at:
+                            try:
+                                from datetime import timedelta as _td
+                                cleared_dt = datetime.fromisoformat(
+                                    plan.reunderwrite_last_cleared_at.replace("Z", "+00:00")
+                                )
+                                if (now - cleared_dt).days < cooldown_days:
+                                    in_cooldown = True
+                            except (TypeError, ValueError):
+                                pass
+
+                        if plan.reunderwrite_triggered_at and not plan.reunderwrite_verdict:
+                            # Re-underwrite already pending — check deadline.
+                            try:
+                                deadline_dt = datetime.fromisoformat(
+                                    plan.reunderwrite_deadline.replace("Z", "+00:00")
+                                )
+                                if now > deadline_dt:
+                                    rule = "paper_core_reunderwrite_expired"
+                            except (TypeError, ValueError):
+                                pass
+                        elif plan.reunderwrite_verdict == "broken":
+                            # Explicit broken verdict — close immediately (already done below
+                            # by record_reunderwrite_verdict, but handle here as safety net).
+                            rule = "paper_core_thesis_broken"
+                        elif not plan.reunderwrite_triggered_at and not in_cooldown:
+                            # First time hitting -40% for this cycle — arm the re-underwrite.
+                            from datetime import timedelta as _td2
+                            deadline_iso = (
+                                now + _td2(days=reunderwrite_days)
+                            ).isoformat()
+                            plan.reunderwrite_triggered_at = now_iso_tick
+                            plan.reunderwrite_deadline = deadline_iso
+                            plan.reunderwrite_verdict = ""
+                            plan.last_updated = now_iso_tick
+                            plans[tk] = plan
+                            plans_dirty = True
+
+                            # Queue a full_graph research job for the re-underwrite.
+                            try:
+                                _ru_reason = (
+                                    f"core re-underwrite: position is {plpc*100:.1f}% "
+                                    f"(≤-40%), deadline {deadline_iso[:10]}. "
+                                    "Call record_reunderwrite_verdict(ticker, verdict, reason) "
+                                    "before deadline or position closes automatically."
+                                )
+                                from tradingagents.portfolio_advisor import state as _pa_st
+                                import uuid as _uuid
+                                _st = _pa_st.load_state(cfg)
+                                # Dedup: skip if a pending reunderwrite_dd40 job exists.
+                                _already = any(
+                                    str(j.get("ticker") or "").upper() == tk
+                                    and str(j.get("source") or "") == "reunderwrite_dd40"
+                                    and str(j.get("status") or "") == "pending"
+                                    for j in (_st.get("jobs") or [])
+                                )
+                                if not _already:
+                                    _job = {
+                                        "id": _uuid.uuid4().hex[:20],
+                                        "ticker": tk,
+                                        "scheduled_at": now_iso_tick,
+                                        "kind": "deep_research",
+                                        "reason": _ru_reason[:500],
+                                        "status": "pending",
+                                        "created_at": now_iso_tick,
+                                        "execution_tier": "full_graph",
+                                        "job_type": "thesis_check",
+                                        "source": "reunderwrite_dd40",
+                                    }
+                                    _st.setdefault("jobs", []).append(_job)
+                                    _pa_st.save_state(cfg, _st)
+                            except Exception:
+                                logger.debug(
+                                    "enforce_paper_exits: could not queue re-underwrite job for %s", tk,
+                                    exc_info=True,
+                                )
+
+                            # Send one Telegram note explaining the contract.
+                            _notify(
+                                cfg,
+                                f"{tk} -40%: re-underwrite triggered",
+                                (
+                                    f"{tk} {plpc*100:.1f}%: re-underwrite triggered, "
+                                    f"full_graph queued, deadline {deadline_iso[:10]}. "
+                                    "Exit at deadline unless thesis re-confirmed via "
+                                    "record_reunderwrite_verdict."
+                                ),
+                            )
+                            # No rule set — position stays open, re-underwrite pending.
+                    else:
+                        # No plan — fall back to legacy hard stop.
+                        rule = "paper_core_hard_stop_-40pct"
                 elif (
                     plan is not None
                     and current_price is not None
@@ -1753,6 +1930,16 @@ def enforce_paper_exits(cfg: Dict[str, Any]) -> int:
                         # Persist the consumption flag so re-open-order retries don't re-spam.
                         plan.pre_event_flat_done_at = datetime.now(timezone.utc).isoformat()
                         plan.last_updated = plan.pre_event_flat_done_at
+                        plans[tk] = plan
+                        plans_dirty = True
+                    # T3: reconfirmed verdict — clear re-underwrite trigger fields.
+                    elif rule in ("paper_core_reunderwrite_expired", "paper_core_thesis_broken",
+                                  "paper_book_loss_cap") and plan is not None:
+                        # Clear re-underwrite state after close so the plan doesn't linger.
+                        plan.reunderwrite_triggered_at = ""
+                        plan.reunderwrite_deadline = ""
+                        plan.reunderwrite_verdict = ""
+                        plan.last_updated = datetime.now(timezone.utc).isoformat()
                         plans[tk] = plan
                         plans_dirty = True
 

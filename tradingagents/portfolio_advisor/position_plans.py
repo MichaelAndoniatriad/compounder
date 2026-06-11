@@ -136,6 +136,16 @@ class PositionPlan:
     # Source scanner that created this plan (e.g. "pead_scanner", "ep_scanner").
     # Persisted so exit rules can apply source-specific overrides.
     source: str = ""
+    # --- Re-underwrite flow (T3) ---
+    # ISO timestamp set when the -40% re-underwrite is first triggered (once per event).
+    # Empty string means no re-underwrite is pending.
+    reunderwrite_triggered_at: str = ""
+    # ISO deadline: if no "reconfirmed" verdict arrives by this time, the position is closed.
+    reunderwrite_deadline: str = ""
+    # Verdict from record_reunderwrite_verdict PM tool: "reconfirmed" | "broken" | ""
+    reunderwrite_verdict: str = ""
+    # ISO timestamp set when a reconfirmed verdict clears the trigger fields.
+    reunderwrite_last_cleared_at: str = ""
 
     def __post_init__(self) -> None:
         self.strategy = (self.strategy or _DEFAULT_STRATEGY).strip().lower()
@@ -217,6 +227,10 @@ def load_position_plans(cfg: Dict[str, Any]) -> Dict[str, PositionPlan]:
                 stop_order_id=str(data.get("stop_order_id") or ""),
                 time_stop_days_override=_tso,
                 source=str(data.get("source") or ""),
+                reunderwrite_triggered_at=str(data.get("reunderwrite_triggered_at") or ""),
+                reunderwrite_deadline=str(data.get("reunderwrite_deadline") or ""),
+                reunderwrite_verdict=str(data.get("reunderwrite_verdict") or ""),
+                reunderwrite_last_cleared_at=str(data.get("reunderwrite_last_cleared_at") or ""),
             )
         except (TypeError, ValueError):
             continue
@@ -874,5 +888,22 @@ def build_trigger_block(
         lines.append(
             f"\nPositions with no plan on file (entry price / sleeve unknown): {', '.join(tickers_without_plans)}"
         )
+
+    # T3: Surface pending re-underwrites so the PM can call record_reunderwrite_verdict.
+    pending_reunderwrites = [
+        tk for tk, pl in plans.items()
+        if pl.reunderwrite_triggered_at and not pl.reunderwrite_verdict
+    ]
+    if pending_reunderwrites:
+        lines.append("\nPENDING RE-UNDERWRITES (call record_reunderwrite_verdict for each):")
+        for tk in sorted(pending_reunderwrites):
+            pl = plans[tk]
+            deadline = pl.reunderwrite_deadline[:16] if pl.reunderwrite_deadline else "unknown"
+            lines.append(
+                f"  {tk}: re-underwrite triggered {pl.reunderwrite_triggered_at[:10]}, "
+                f"deadline {deadline} UTC — "
+                "call record_reunderwrite_verdict(ticker, verdict='reconfirmed'|'broken', reason=...) "
+                "or position closes at deadline."
+            )
 
     return "\n".join(lines) + "\n"

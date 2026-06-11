@@ -951,6 +951,98 @@ def build_pm_tools(cfg: Dict[str, Any], live_tickers: set) -> List[Any]:
         except Exception as e:
             return f"error vetoing {tk}: {e}"
 
+    @tool
+    def record_reunderwrite_verdict(ticker: str, verdict: str, reason: str) -> str:
+        """Record a re-underwrite verdict for a core position that hit -40% drawdown.
+
+        When a core position hits -40% unrealized loss, the system triggers a
+        forced re-underwrite: a full_graph research job is queued and a deadline
+        is set (default 5 days).  Before that deadline, call this tool with your
+        verdict after reviewing the fresh research:
+
+          verdict = "reconfirmed" — the original thesis still holds despite the
+            drawdown (e.g. NVDA at -42% during the AI infrastructure build-out —
+            the Bessembinder tail narrative is intact). The position stays open
+            and the re-underwrite trigger is cleared with a cooldown so it does
+            not re-fire for 30 days even if still ≤ -40%.
+
+          verdict = "broken" — the thesis no longer holds (e.g. secular decline,
+            losing business model, thesis assumptions invalidated). The position
+            is closed immediately on the next executor tick via rule
+            "paper_core_thesis_broken".
+
+        This tool is ONLY valid while a re-underwrite is pending (reunderwrite_triggered_at
+        set, reunderwrite_verdict empty).  Calling it outside that window is a no-op.
+
+        reason is REQUIRED — explain the thesis re-assessment concisely.
+        """
+        tk = (ticker or "").strip().upper()
+        verdict_clean = (verdict or "").strip().lower()
+        reason_clean = (reason or "").strip()
+        if not tk:
+            return "error: empty ticker"
+        if verdict_clean not in ("reconfirmed", "broken"):
+            return "error: verdict must be 'reconfirmed' or 'broken'"
+        if not reason_clean:
+            return "error: reason is required — explain the thesis re-assessment"
+
+        try:
+            from tradingagents.portfolio_advisor import position_plans as _pp
+            from tradingagents.integrations.alpaca import executor as _exec
+
+            plans = _pp.load_position_plans(cfg)
+            plan = plans.get(tk)
+            if plan is None:
+                return f"no position plan for {tk}; cannot record verdict"
+            if not plan.reunderwrite_triggered_at:
+                return (
+                    f"{tk}: no pending re-underwrite — "
+                    "record_reunderwrite_verdict is only valid while re-underwrite is pending."
+                )
+            if plan.reunderwrite_verdict:
+                return (
+                    f"{tk}: re-underwrite verdict already recorded as "
+                    f"'{plan.reunderwrite_verdict}' — nothing to change."
+                )
+
+            now_iso = datetime.now(timezone.utc).isoformat()
+
+            if verdict_clean == "reconfirmed":
+                # Clear the trigger, set cooldown timestamp.
+                plan.reunderwrite_triggered_at = ""
+                plan.reunderwrite_deadline = ""
+                plan.reunderwrite_verdict = ""
+                plan.reunderwrite_last_cleared_at = now_iso
+                plan.last_updated = now_iso
+                _pp.upsert_position_plan(cfg, plan)
+                # Append to decision history.
+                _pp.append_position_decision(
+                    cfg, tk, "reunderwrite_reconfirmed", reason_clean,
+                    source="pm_tool",
+                )
+                return (
+                    f"RE-UNDERWRITE RECONFIRMED for {tk}: thesis intact, "
+                    "position stays open. Cooldown set — re-underwrite will not "
+                    "re-trigger for the configured cooldown period even if still ≤-40%. "
+                    f"Reason: {reason_clean[:200]}"
+                )
+            else:
+                # verdict == "broken": record it — the executor will close on the next tick.
+                plan.reunderwrite_verdict = "broken"
+                plan.last_updated = now_iso
+                _pp.upsert_position_plan(cfg, plan)
+                _pp.append_position_decision(
+                    cfg, tk, "reunderwrite_broken", reason_clean,
+                    source="pm_tool",
+                )
+                return (
+                    f"THESIS BROKEN for {tk}: position will be closed on the next "
+                    f"executor tick (rule: paper_core_thesis_broken). "
+                    f"Reason: {reason_clean[:200]}"
+                )
+        except Exception as e:
+            return f"error recording re-underwrite verdict for {tk}: {e}"
+
     return [
         queue_research,
         mark_action_done,
@@ -973,4 +1065,5 @@ def build_pm_tools(cfg: Dict[str, Any], live_tickers: set) -> List[Any]:
         update_ep_trade,
         run_macro_review,
         veto_candidate,
+        record_reunderwrite_verdict,
     ]

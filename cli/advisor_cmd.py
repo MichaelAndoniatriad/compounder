@@ -540,6 +540,7 @@ def portfolio_advisor_measure_outcomes(
         from tradingagents.portfolio_advisor.outcome_tracker import (
             compute_recommendation_outcomes,
             veto_scorecard,
+            score_counterfactuals,
         )
         from tradingagents.portfolio_advisor.recommendation_log import human_override_analysis
         from tradingagents.portfolio_advisor.candidates import shadow_outcomes
@@ -578,6 +579,17 @@ def portfolio_advisor_measure_outcomes(
             f"vetoed={veto['vetoed']['count']} avg={veto['vetoed']['avg_30d_return']}, "
             f"executed={veto['executed']['count']} avg={veto['executed']['avg_30d_return']}, "
             f"pm_veto_lift={veto['pm_veto_lift']} — {veto['note']}"
+        )
+
+        # 5. T3 — Counterfactual ledger scoring
+        cf_summary = score_counterfactuals(cfg)
+        console.print(
+            f"[cyan]counterfactuals:[/cyan] "
+            f"ledger_rows={cf_summary['ledger_rows']}, "
+            f"scored_30d={cf_summary['scored_30d']}, "
+            f"scored_180d={cf_summary['scored_180d']}, "
+            f"skipped_too_young={cf_summary['skipped_too_young']}, "
+            f"skipped_no_price={cf_summary['skipped_no_price']}"
         )
 
     except Exception as e:

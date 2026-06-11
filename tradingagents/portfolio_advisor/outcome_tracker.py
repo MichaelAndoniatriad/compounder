@@ -560,6 +560,160 @@ def veto_scorecard(cfg: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _counterfactual_scores_path(cfg: Dict[str, Any]) -> "Path":
+    from tradingagents.portfolio_advisor import state as pa_state
+    return pa_state.advisor_dir(cfg) / "counterfactual_scores.jsonl"
+
+
+def score_counterfactuals(
+    cfg: Dict[str, Any],
+    *,
+    price_fetcher: Optional[Callable[[str, str, str], Optional[Tuple[float, float]]]] = None,
+) -> Dict[str, Any]:
+    """Score counterfactual_ledger rows that are ≥30d or ≥180d without scores.
+
+    For each rule-driven close row in counterfactual_ledger.jsonl:
+    - If row is ≥30d old and has no 30d_score: fetch forward 30d return for
+      the ticker vs SPY from exit_price, append a score row to
+      counterfactual_scores.jsonl.
+    - If row already has a 30d score but is ≥180d old and has no 180d_score:
+      fetch 180d forward return and append.
+
+    Score rows use the exit timestamp as the start date and exit_price as the
+    reference price.  The "forward return" is what the stock did AFTER the rule
+    fired — positive means the guardrail cost money (we sold at the wrong time);
+    negative means the guardrail saved money.
+
+    Idempotent: already-scored rows (matched by ticker+ts+horizon) are skipped.
+
+    Returns a summary dict.
+    """
+    from tradingagents.portfolio_advisor import state as pa_state
+
+    if price_fetcher is None:
+        price_fetcher = _default_price_fetcher
+
+    ledger_path = pa_state.advisor_dir(cfg) / "counterfactual_ledger.jsonl"
+    scores_path = _counterfactual_scores_path(cfg)
+
+    summary = {
+        "ledger_rows": 0,
+        "scored_30d": 0,
+        "scored_180d": 0,
+        "skipped_too_young": 0,
+        "skipped_no_price": 0,
+    }
+
+    if not ledger_path.is_file():
+        return summary
+
+    # Build set of already-scored (ticker, ts, horizon) to stay idempotent.
+    already_scored: set = set()
+    if scores_path.is_file():
+        for line in scores_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                r = json.loads(line)
+                already_scored.add((r.get("ticker", ""), r.get("exit_ts", ""), r.get("horizon_days", 0)))
+            except (json.JSONDecodeError, ValueError):
+                continue
+
+    rows: List[Dict[str, Any]] = []
+    for line in ledger_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rows.append(json.loads(line))
+        except (json.JSONDecodeError, ValueError):
+            continue
+
+    summary["ledger_rows"] = len(rows)
+    now = datetime.now(timezone.utc)
+    scores_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(scores_path, "a", encoding="utf-8") as out_f:
+        for row in rows:
+            ticker = str(row.get("ticker") or "").upper()
+            ts_str = str(row.get("ts") or "")
+            if not ticker or not ts_str:
+                continue
+            try:
+                exit_dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+            except (TypeError, ValueError):
+                continue
+
+            age_days = (now - exit_dt).days
+            exit_date = exit_dt.date().isoformat()
+            rule = str(row.get("rule") or "")
+
+            from datetime import timedelta as _td
+
+            for horizon_days in (30, 180):
+                if age_days < horizon_days:
+                    summary["skipped_too_young"] += 1
+                    continue
+
+                score_key = (ticker, ts_str, horizon_days)
+                if score_key in already_scored:
+                    continue
+
+                end_date = (exit_dt + _td(days=horizon_days + 2)).date().isoformat()
+                prices = price_fetcher(ticker, exit_date, end_date)
+                if prices is None:
+                    summary["skipped_no_price"] += 1
+                    continue
+
+                start_price, end_price = prices
+                if start_price <= 0:
+                    summary["skipped_no_price"] += 1
+                    continue
+
+                fwd_return = (end_price - start_price) / start_price
+
+                # Benchmark: SPY over same window.
+                spy_return: Optional[float] = None
+                try:
+                    spy_prices = price_fetcher("SPY", exit_date, end_date)
+                    if spy_prices is not None and spy_prices[0] > 0:
+                        spy_return = (spy_prices[1] - spy_prices[0]) / spy_prices[0]
+                except Exception:
+                    pass
+
+                alpha_vs_spy = (fwd_return - spy_return) if spy_return is not None else None
+
+                # Positive forward return = guardrail cost money (we sold; stock went up).
+                # Negative forward return = guardrail saved money (stock went down after exit).
+                score_row: Dict[str, Any] = {
+                    "scored_at": now.isoformat(),
+                    "ticker": ticker,
+                    "exit_ts": ts_str,
+                    "exit_date": exit_date,
+                    "rule": rule,
+                    "horizon_days": horizon_days,
+                    "exit_price": row.get("exit_price"),
+                    "start_price": round(start_price, 4),
+                    "end_price": round(end_price, 4),
+                    "fwd_return": round(fwd_return, 4),
+                    "spy_return": round(spy_return, 4) if spy_return is not None else None,
+                    "alpha_vs_spy": round(alpha_vs_spy, 4) if alpha_vs_spy is not None else None,
+                    # guardrail_saved: negative fwd_return means exit was correct
+                    "guardrail_saved": fwd_return < 0,
+                }
+                out_f.write(json.dumps(score_row, ensure_ascii=False) + "\n")
+                already_scored.add(score_key)
+
+                if horizon_days == 30:
+                    summary["scored_30d"] += 1
+                else:
+                    summary["scored_180d"] += 1
+
+    logger.info("score_counterfactuals: %s", json.dumps(summary))
+    return summary
+
+
 def format_rule_performance_for_pm_prompt(
     cfg: Dict[str, Any],
     *,
