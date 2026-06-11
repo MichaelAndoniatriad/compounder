@@ -139,13 +139,26 @@ _TELEGRAM_MAX_TEXT = 4096
 
 
 def message_log_path(cfg: Dict[str, Any]) -> Path:
-    """Resolve the JSONL message log path (sibling of memory log by default)."""
+    """Resolve the JSONL message log path (sibling of memory log by default).
+
+    When running under pytest (PYTEST_CURRENT_TEST is set) and the cfg does not
+    explicitly set ``message_log_path`` or ``memory_log_path``, the real home
+    path is NOT used — we redirect to a temp directory so tests can never
+    accidentally append to the production message log.  Tests that explicitly
+    set a cfg key keep their override unchanged.
+    """
+    import os
+    import tempfile
+
     raw = cfg.get("message_log_path")
     if isinstance(raw, str) and raw.strip():
         return Path(raw).expanduser()
     mem = cfg.get("memory_log_path")
     if isinstance(mem, str) and mem.strip():
         return Path(mem).expanduser().parent / "messages.jsonl"
+    # No explicit path in cfg.
+    if "PYTEST_CURRENT_TEST" in os.environ:
+        return Path(tempfile.gettempdir()) / "tradingagents-test-logs" / "messages.jsonl"
     return Path.home() / ".tradingagents" / "memory" / "messages.jsonl"
 
 

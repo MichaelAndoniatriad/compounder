@@ -41,12 +41,26 @@ def _event_weight(event_type: Any) -> int:
 
 
 def _default_event_path(cfg: Dict[str, Any]) -> Path:
+    """Resolve the JSONL event log path.
+
+    When running under pytest (PYTEST_CURRENT_TEST is set) and the cfg does not
+    explicitly set ``event_log_path`` or ``memory_log_path``, redirect to a temp
+    directory instead of the real home path.  The conftest ``_isolate_live_event_log``
+    fixture provides a second layer of protection, but this guard ensures that any
+    code path not covered by the monkeypatch also stays safe.
+    """
+    import os
+    import tempfile
+
     raw = cfg.get("event_log_path")
     if isinstance(raw, str) and raw.strip():
         return Path(raw).expanduser()
     mem = cfg.get("memory_log_path")
     if isinstance(mem, str) and mem.strip():
         return Path(mem).expanduser().parent / "events.jsonl"
+    # No explicit path in cfg.
+    if "PYTEST_CURRENT_TEST" in os.environ:
+        return Path(tempfile.gettempdir()) / "tradingagents-test-logs" / "events.jsonl"
     return Path.home() / ".tradingagents" / "memory" / "events.jsonl"
 
 

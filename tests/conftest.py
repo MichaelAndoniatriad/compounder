@@ -60,6 +60,34 @@ def _isolate_live_event_log(tmp_path, monkeypatch):
     monkeypatch.setattr(el, "_default_event_path", _guarded)
 
 
+@pytest.fixture(autouse=True)
+def _isolate_live_message_log(tmp_path, monkeypatch):
+    """No test may write to the real ~/.tradingagents message log.
+
+    messaging.message_log_path() falls back to ~/.tradingagents/memory/messages.jsonl
+    when cfg has no explicit path.  The PYTEST guard inside the function itself is
+    the primary defence; this fixture is belt-and-braces: it patches the function so
+    that the real-home fallback is replaced with a per-test tmp file even if the
+    in-function guard were ever removed or circumvented.
+
+    Tests that explicitly pass ``message_log_path`` in cfg still use their own path
+    (the function returns before reaching the fallback, so the monkeypatch never fires).
+    """
+    from pathlib import Path
+
+    import tradingagents.portfolio_advisor.messaging as msg
+
+    real = Path.home() / ".tradingagents" / "memory" / "messages.jsonl"
+    safe = tmp_path / "messages.jsonl"
+    _orig = msg.message_log_path
+
+    def _guarded(cfg):
+        resolved = _orig(cfg)
+        return safe if Path(resolved) == real else resolved
+
+    monkeypatch.setattr(msg, "message_log_path", _guarded)
+
+
 @pytest.fixture()
 def mock_llm_client():
     client = MagicMock()
