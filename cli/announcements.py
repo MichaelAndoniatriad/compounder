@@ -7,22 +7,31 @@ from cli.config import CLI_CONFIG
 
 
 def fetch_announcements(url: str = None, timeout: float = None) -> dict:
-    """Fetch announcements from endpoint. Returns dict with announcements and settings."""
-    endpoint = url or CLI_CONFIG["announcements_url"]
+    """Fetch announcements from endpoint. Returns dict with announcements and settings.
+
+    When announcements_url is empty (or url arg is empty/None), returns an empty
+    result immediately without making any network call.
+    """
+    endpoint = url if url is not None else CLI_CONFIG["announcements_url"]
     timeout = timeout or CLI_CONFIG["announcements_timeout"]
     fallback = CLI_CONFIG["announcements_fallback"]
+
+    # Empty URL means announcements are disabled — skip silently.
+    if not endpoint:
+        return {"announcements": [], "require_attention": False}
 
     try:
         response = requests.get(endpoint, timeout=timeout)
         response.raise_for_status()
         data = response.json()
         return {
-            "announcements": data.get("announcements", [fallback]),
+            "announcements": data.get("announcements", [fallback] if fallback else []),
             "require_attention": data.get("require_attention", False),
         }
     except Exception:
+        result = [fallback] if fallback else []
         return {
-            "announcements": [fallback],
+            "announcements": result,
             "require_attention": False,
         }
 

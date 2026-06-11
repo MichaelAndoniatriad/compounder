@@ -60,7 +60,7 @@ def _http_get(url: str, timeout: float = 10.0) -> Optional[bytes]:
         req = urllib.request.Request(
             url,
             headers={
-                "User-Agent": "tradingagents-ep-scanner/1.0 (https://github.com/TauricResearch/TradingAgents)",
+                "User-Agent": "compounder/1.0 (+https://github.com/MichaelAndoniatriad/compounder)",
                 "Accept": "application/rss+xml, application/xml, text/xml",
             },
         )

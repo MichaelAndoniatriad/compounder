@@ -6,7 +6,7 @@
 
 ## Context in one paragraph
 
-This is the trading-agents portfolio advisor ("compounder") on a Hetzner server. Built originally on the open source TauricResearch/TradingAgents multi agent LLM framework. The system runs a PM cycle on cron, generates trade proposals, and is meant to surface them to the human via Telegram. The session that produced this handoff spent roughly 24 hours building out the missing pieces of the learning loop (recommendation log, outcome tracker, rule retirement, dashboard) and fixing two pipelines that were silently returning zero candidates (EP scanner and core discovery). The compounder logic is now sound. The current blocker is operational: the Hetzner VM has been down for 24+ hours after a second SSH brute force takedown in 48 hours.
+This is the trading-agents portfolio advisor ("compounder") on a Hetzner server. Built originally on an open-source multi-agent LLM trading framework (Apache-2.0). The system runs a PM cycle on cron, generates trade proposals, and is meant to surface them to the human via Telegram. The session that produced this handoff spent roughly 24 hours building out the missing pieces of the learning loop (recommendation log, outcome tracker, rule retirement, dashboard) and fixing two pipelines that were silently returning zero candidates (EP scanner and core discovery). The compounder logic is now sound. The current blocker is operational: the Hetzner VM has been down for 24+ hours after a second SSH brute force takedown in 48 hours.
 
 ## Two parallel projects
 

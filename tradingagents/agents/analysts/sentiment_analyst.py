@@ -16,7 +16,7 @@ the LLM is invoked and injects them into the prompt as structured blocks:
 The agent does not use tool-calling; the data is in the prompt from
 turn 0. The LLM produces the sentiment report in a single invocation.
 
-See: https://github.com/TauricResearch/TradingAgents/issues/557
+The redesign was motivated by confirmed LLM hallucination of social-media content when only news data was available but the prompt demanded Reddit/X/StockTwits analysis.
 """
 
 import logging

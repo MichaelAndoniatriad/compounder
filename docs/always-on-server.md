@@ -38,7 +38,7 @@ sudo apt install -y git python3.12 python3.12-venv
 ```bash
 sudo mkdir -p /opt && sudo chown "$USER":"$USER" /opt
 cd /opt
-git clone https://github.com/TauricResearch/TradingAgents.git tradingagents
+git clone https://github.com/MichaelAndoniatriad/compounder.git tradingagents
 cd tradingagents
 ```
 

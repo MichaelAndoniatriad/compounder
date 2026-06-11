@@ -5,7 +5,7 @@ StockTwits cashtag streams, and Reddit posts into a single sentiment
 report. Import from ``tradingagents.agents.analysts.sentiment_analyst``
 going forward; this module will be removed in a future release.
 
-See: https://github.com/TauricResearch/TradingAgents/issues/557
+Renamed from social_media_analyst because the old prompt requested social-media analysis but only Yahoo Finance news was available, causing LLMs to fabricate Reddit/X/StockTwits content under prompt pressure.
 """
 
 import warnings as _warnings
