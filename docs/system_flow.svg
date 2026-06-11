@@ -1,0 +1,84 @@
+<svg width="680" height="700" viewBox="0 0 680 700" role="img" xmlns="http://www.w3.org/2000/svg">
+<title>Compounder system flow</title>
+<desc>Tree diagram: scheduled jobs trigger three discovery scanners, which feed mechanical gates, a proposals ledger, the LLM portfolio manager, the paper-trading executor, open positions with exit rails, and a measurement loop that feeds scores back to the portfolio manager. Telegram connects the human to the PM.</desc>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="#888780" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<style>
+  text { font-family: 'Helvetica Neue', Arial, sans-serif; }
+  .th { font-size: 14px; font-weight: 500; }
+  .ts { font-size: 12px; font-weight: 400; }
+  .arr { stroke: #888780; stroke-width: 1.5; fill: none; }
+</style>
+
+<rect x="90" y="40" width="500" height="44" rx="4" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="0.5"/>
+<text class="th" x="340" y="58" text-anchor="middle" fill="#444441">Scheduled jobs (launchd)</text>
+<text class="ts" x="340" y="75" text-anchor="middle" fill="#5F5E5A">watchdog &#183; scanners &#183; screens &#183; scoring</text>
+
+<line class="arr" x1="144" y1="84" x2="144" y2="118" marker-end="url(#arrow)"/>
+<line class="arr" x1="340" y1="84" x2="340" y2="118" marker-end="url(#arrow)"/>
+<line class="arr" x1="536" y1="84" x2="536" y2="118" marker-end="url(#arrow)"/>
+
+<rect x="56" y="120" width="176" height="48" rx="4" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.5"/>
+<text class="th" x="144" y="140" text-anchor="middle" fill="#085041">EP scanner</text>
+<text class="ts" x="144" y="157" text-anchor="middle" fill="#0F6E56">news + gap + volume</text>
+<rect x="252" y="120" width="176" height="48" rx="4" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.5"/>
+<text class="th" x="340" y="140" text-anchor="middle" fill="#085041">PEAD scanner</text>
+<text class="ts" x="340" y="157" text-anchor="middle" fill="#0F6E56">earnings drift</text>
+<rect x="448" y="120" width="176" height="48" rx="4" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.5"/>
+<text class="th" x="536" y="140" text-anchor="middle" fill="#085041">Core discovery</text>
+<text class="ts" x="536" y="157" text-anchor="middle" fill="#0F6E56">weekly quality screen</text>
+
+<line class="arr" x1="144" y1="168" x2="238" y2="198" marker-end="url(#arrow)"/>
+<line class="arr" x1="340" y1="168" x2="340" y2="198" marker-end="url(#arrow)"/>
+<line class="arr" x1="536" y1="168" x2="442" y2="198" marker-end="url(#arrow)"/>
+
+<rect x="190" y="200" width="300" height="48" rx="4" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.5"/>
+<text class="th" x="340" y="220" text-anchor="middle" fill="#085041">Mechanical gates</text>
+<text class="ts" x="340" y="237" text-anchor="middle" fill="#0F6E56">gap &#183; RVOL &#183; $ volume &#183; dates</text>
+
+<line class="arr" x1="340" y1="248" x2="340" y2="278" marker-end="url(#arrow)"/>
+
+<rect x="190" y="280" width="300" height="48" rx="4" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.5"/>
+<text class="th" x="340" y="300" text-anchor="middle" fill="#085041">Proposals ledger</text>
+<text class="ts" x="340" y="317" text-anchor="middle" fill="#0F6E56">dedup &#183; cooldowns &#183; 45-min veto</text>
+
+<line class="arr" x1="340" y1="328" x2="340" y2="358" marker-end="url(#arrow)"/>
+
+<rect x="120" y="360" width="280" height="48" rx="4" fill="#EEEDFE" stroke="#534AB7" stroke-width="0.5"/>
+<text class="th" x="260" y="380" text-anchor="middle" fill="#3C3489">Portfolio manager (LLM)</text>
+<text class="ts" x="260" y="397" text-anchor="middle" fill="#534AB7">vetoes &#183; core picks &#183; verdicts</text>
+<rect x="440" y="360" width="176" height="48" rx="4" fill="#EEEDFE" stroke="#534AB7" stroke-width="0.5"/>
+<text class="th" x="528" y="380" text-anchor="middle" fill="#3C3489">You (Telegram)</text>
+<text class="ts" x="528" y="397" text-anchor="middle" fill="#534AB7">ask &#183; alerts &#183; chat</text>
+<line class="arr" x1="404" y1="384" x2="436" y2="384" marker-start="url(#arrow)" marker-end="url(#arrow)"/>
+
+<line class="arr" x1="260" y1="408" x2="260" y2="438" marker-end="url(#arrow)"/>
+
+<rect x="120" y="440" width="280" height="48" rx="4" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.5"/>
+<text class="th" x="260" y="460" text-anchor="middle" fill="#085041">Executor (Alpaca paper)</text>
+<text class="ts" x="260" y="477" text-anchor="middle" fill="#0F6E56">limit orders &#183; R-sizing &#183; guards</text>
+<rect x="440" y="440" width="176" height="48" rx="4" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.5"/>
+<text class="th" x="528" y="460" text-anchor="middle" fill="#085041">Regime + breaker</text>
+<text class="ts" x="528" y="477" text-anchor="middle" fill="#0F6E56">scales new-buy size</text>
+<line class="arr" x1="436" y1="464" x2="404" y2="464" marker-end="url(#arrow)"/>
+
+<line class="arr" x1="260" y1="488" x2="260" y2="518" marker-end="url(#arrow)"/>
+
+<rect x="120" y="520" width="280" height="48" rx="4" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.5"/>
+<text class="th" x="260" y="540" text-anchor="middle" fill="#085041">Positions + exit rails</text>
+<text class="ts" x="260" y="557" text-anchor="middle" fill="#0F6E56">stops &#183; trims &#183; time exits</text>
+
+<line class="arr" x1="260" y1="568" x2="260" y2="598" marker-end="url(#arrow)"/>
+
+<rect x="120" y="600" width="280" height="48" rx="4" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="0.5"/>
+<text class="th" x="260" y="620" text-anchor="middle" fill="#444441">Measurement loop</text>
+<text class="ts" x="260" y="637" text-anchor="middle" fill="#5F5E5A">NAV vs SPY &#183; outcomes &#183; shadow</text>
+
+<path class="arr" d="M120 624 H60 V384 H114" marker-end="url(#arrow)"/>
+
+<rect x="120" y="668" width="12" height="12" rx="2" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.5"/>
+<text class="ts" x="140" y="678" fill="#888780">deterministic code</text>
+<rect x="280" y="668" width="12" height="12" rx="2" fill="#EEEDFE" stroke="#534AB7" stroke-width="0.5"/>
+<text class="ts" x="300" y="678" fill="#888780">LLM + human</text>
+<rect x="410" y="668" width="12" height="12" rx="2" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="0.5"/>
+<text class="ts" x="430" y="678" fill="#888780">schedule + scoring</text>
+</svg>

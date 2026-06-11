@@ -8,6 +8,8 @@ Compounder orchestrates a multi-agent LLM graph (analysts → researchers → tr
 
 ## Architecture
 
+![Compounder system flow](docs/system_flow.svg)
+
 Scheduled LaunchAgents (or server cron) fire weekly and event-driven scans. Scanners surface candidate tickers into a priority queue. PM cycles pull from the queue, run the full LLM graph, and emit trade proposals. A paper executor sends approved orders to Alpaca. A watchdog monitors positions and fires alerts via Telegram. See `docs/` for detailed runbooks.
 
 ## Setup
