@@ -54,42 +54,14 @@ _SESSION_OPEN_MIN_ET = 30
 def _session_elapsed_fraction() -> float:
     """Fraction of the regular trading session (09:30–16:00 ET) elapsed right now.
 
-    Uses executor.market_clock() next_close to compute elapsed seconds.
-    Falls back to a naive ET-clock calculation when the clock is unavailable.
-    Clamped to [0.05, 1.0] so gates are never gated to zero volume.
+    Delegates to the shared ``session_elapsed_fraction`` helper in
+    ``session_utils``.  Returns 1.0 outside the regular session (before the
+    open, after the close, weekends) so that RVOL gates are never inflated
+    by a pre-market or overnight 0.05 clamp.  Returns a value in [0.05, 1.0]
+    during the session.  See session_utils for full semantics.
     """
-    try:
-        from tradingagents.integrations.alpaca.executor import market_clock
-        clk = market_clock()
-        if clk is not None and clk.get("is_open"):
-            next_close_str = clk.get("next_close") or ""
-            if next_close_str:
-                if next_close_str.endswith("Z"):
-                    next_close_str = next_close_str[:-1] + "+00:00"
-                next_close = datetime.fromisoformat(next_close_str)
-                if next_close.tzinfo is None:
-                    next_close = next_close.replace(tzinfo=timezone.utc)
-                now_utc = datetime.now(timezone.utc)
-                total_session_s = _SESSION_HOURS * 3600
-                remaining_s = (next_close - now_utc).total_seconds()
-                elapsed_s = total_session_s - remaining_s
-                fraction = elapsed_s / total_session_s
-                return max(0.05, min(1.0, fraction))
-    except Exception:
-        pass
-    # Fallback: naive ET clock (UTC-4 during EDT, UTC-5 during EST; use -4 as approx)
-    try:
-        now_utc = datetime.now(timezone.utc)
-        et_offset = timedelta(hours=-4)
-        now_et = now_utc + et_offset
-        open_today = now_et.replace(
-            hour=_SESSION_OPEN_HOUR_ET, minute=_SESSION_OPEN_MIN_ET, second=0, microsecond=0
-        )
-        elapsed_s = (now_et - open_today).total_seconds()
-        fraction = elapsed_s / (_SESSION_HOURS * 3600)
-        return max(0.05, min(1.0, fraction))
-    except Exception:
-        return 1.0  # safe fallback: full-day scale (no pro-rating)
+    from tradingagents.portfolio_advisor.session_utils import session_elapsed_fraction
+    return session_elapsed_fraction()
 
 
 def _advisor_dir(cfg: Dict[str, Any]) -> Path:

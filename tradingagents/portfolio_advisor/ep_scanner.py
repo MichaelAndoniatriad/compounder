@@ -539,43 +539,16 @@ _EP_SESSION_HOURS = 6.5      # 09:30–16:00 ET
 def _ep_session_elapsed_fraction(
     _market_clock_override: Optional[Dict[str, Any]] = None,
 ) -> float:
-    """Fraction of the regular trading session elapsed right now.
+    """Fraction of the regular trading session (09:30–16:00 ET) elapsed right now.
 
-    Mirrors the same logic in pead_scanner; kept local to avoid circular imports.
-    Uses executor.market_clock() next_close; falls back to a naive ET estimate.
-    Clamped to [0.05, 1.0].
+    Delegates to the shared ``session_elapsed_fraction`` helper in
+    ``session_utils``.  Returns 1.0 outside the regular session (before the
+    open, after the close, weekends) so that RVOL gates are never inflated
+    by a pre-market or overnight 0.05 clamp.  Returns a value in [0.05, 1.0]
+    during the session.  See session_utils for full semantics.
     """
-    try:
-        if _market_clock_override is not None:
-            clk = _market_clock_override
-        else:
-            from tradingagents.integrations.alpaca.executor import market_clock
-            clk = market_clock()
-        if clk is not None and clk.get("is_open"):
-            next_close_str = clk.get("next_close") or ""
-            if next_close_str:
-                if next_close_str.endswith("Z"):
-                    next_close_str = next_close_str[:-1] + "+00:00"
-                next_close = datetime.fromisoformat(next_close_str)
-                if next_close.tzinfo is None:
-                    next_close = next_close.replace(tzinfo=timezone.utc)
-                now_utc = datetime.now(timezone.utc)
-                total_session_s = _EP_SESSION_HOURS * 3600
-                remaining_s = (next_close - now_utc).total_seconds()
-                elapsed_s = total_session_s - remaining_s
-                return max(0.05, min(1.0, elapsed_s / total_session_s))
-    except Exception:
-        pass
-    # Fallback: naive ET clock
-    try:
-        now_utc = datetime.now(timezone.utc)
-        et_offset = timedelta(hours=-4)
-        now_et = now_utc + et_offset
-        open_today = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
-        elapsed_s = (now_et - open_today).total_seconds()
-        return max(0.05, min(1.0, elapsed_s / (_EP_SESSION_HOURS * 3600)))
-    except Exception:
-        return 1.0
+    from tradingagents.portfolio_advisor.session_utils import session_elapsed_fraction
+    return session_elapsed_fraction(_market_clock_override)
 
 
 def scan_for_ep_candidates(
