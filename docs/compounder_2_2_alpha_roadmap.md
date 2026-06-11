@@ -135,6 +135,23 @@ Catalyst sleeve's alpha bounded by mechanical components; LLM judgment can only 
 
 Suite: **842 tests + 93 subtests, all green**.
 
+### T4 ✅ 81972a9 — Multi-horizon outcome scoring — 2026-06-11
+
+Single 30-day window was scoring 3–5yr core theses against noise. Catalyst trades need R-multiple scoring at their natural horizon.
+
+| Component | Detail |
+|-----------|--------|
+| `outcome_tracker.py` | `compute_core_multihorizon_outcomes()`: idempotent 30/90/365d checkpoints → `multihorizon_outcomes.jsonl`; `CORE_HORIZONS=(30,90,365)` module constant |
+| `outcome_tracker.py` | `compute_catalyst_r_outcomes()`: R = (exit−entry)/(entry×hard_stop_pct) at catalyst_date+5d; ledger close used when position exits early → `catalyst_r_outcomes.jsonl` |
+| `outcome_tracker.py` | `multihorizon_aggregates()`: per-horizon count/avg_ret/avg_alpha for core; count/avg_R for catalyst |
+| `veto_scorecard` | Gains `core_horizons` + `catalyst_r` aggregates in return dict |
+| `recommendation_log.py` | `log_recommendation()` gains `sleeve` + `catalyst_date` params |
+| `proposals.py` | `proposals.add()` passes sleeve/catalyst_date to recommendation log |
+| `cli/advisor_cmd.py` | `measure-outcomes` calls both new scorers; prints per-horizon alpha/R summary |
+| Tests | 8 new tests in `TestMultiHorizonCoreScoring` + `TestCatalystRMultipleScoring` |
+
+Suite: **870 tests + 93 subtests, all green**.
+
 ### T3 ✅ 2bbb8c7 — Re-underwrite flow + hard book-loss cap + counterfactual ledger — 2026-06-11
 
 Converted the core sleeve's mandatory -40% full-exit stop into a forced re-underwrite with
