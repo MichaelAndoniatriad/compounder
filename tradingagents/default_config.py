@@ -19,6 +19,7 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_DEBATE_ENABLED":       "debate_enabled",
     "TRADINGAGENTS_RISK_DEBATE_ENABLED":  "risk_debate_enabled",
     "TRADINGAGENTS_ACCOUNT_MODE":         "account_mode",
+    "TRADINGAGENTS_PORTFOLIO_ADVISOR_ETORO_ENABLED": "portfolio_advisor_etoro_enabled",
     "TRADINGAGENTS_CHECKPOINT_ENABLED":   "checkpoint_enabled",
     "TRADINGAGENTS_BENCHMARK_TICKER":     "benchmark_ticker",
     "TRADINGAGENTS_ANALYST_LLM":          "analyst_llm",
@@ -471,6 +472,15 @@ DEFAULT_CONFIG = _apply_env_overrides({
     # are decision notices, not action requests). Real-money execution does not
     # exist in either mode. Override with TRADINGAGENTS_ACCOUNT_MODE.
     "account_mode": "etoro",
+    # Hard-disable all eToro network reads. When False (the default) and NOT under
+    # pytest, any eToro HTTP fetch is short-circuited — no API calls are made, the
+    # function returns an "unavailable" result, and a one-time warning is logged.
+    # account_mode() also hard-returns "alpaca" regardless of env when this is False
+    # and we are not inside pytest (so a LaunchAgent without TRADINGAGENTS_ACCOUNT_MODE
+    # can never accidentally fall back to eToro mode).
+    # Set True only to re-enable eToro reads deliberately (e.g. a future hybrid mode).
+    # Under pytest this flag is ignored — existing eToro tests with mocks keep passing.
+    "portfolio_advisor_etoro_enabled": False,
     # News / data fetching parameters
     # Increase for longer lookback strategies or to broaden macro coverage;
     # decrease to reduce token usage in agent prompts.

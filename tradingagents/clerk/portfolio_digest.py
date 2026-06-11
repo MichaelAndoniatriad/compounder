@@ -34,6 +34,15 @@ def _load_snapshot(path: Path) -> Optional[Dict[str, Any]]:
 
 def fetch_current_portfolio_headlines() -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Return (pnl_payload, headlines dict from portfolio_headlines)."""
+    from tradingagents.portfolio_advisor.etoro_scan import (
+        _etoro_enabled,
+        _log_etoro_disabled_once,
+    )
+    if not _etoro_enabled():
+        _log_etoro_disabled_once("fetch_current_portfolio_headlines")
+        raise RuntimeError(
+            "eToro reads are disabled (portfolio_advisor_etoro_enabled=False)."
+        )
     from tradingagents.integrations.etoro.client import EtoroClient
     from tradingagents.integrations.etoro.portfolio import portfolio_headlines
 

@@ -30,6 +30,16 @@ def fetch_clerk_watchlist_from_etoro(
     template_path: Optional[Path] = None,
 ) -> ClerkWatchlist:
     """Build a ``ClerkWatchlist`` from live open positions + optional JSON template for triggers."""
+    from tradingagents.portfolio_advisor.etoro_scan import (
+        _etoro_enabled,
+        _log_etoro_disabled_once,
+    )
+    if not _etoro_enabled():
+        _log_etoro_disabled_once("fetch_clerk_watchlist_from_etoro")
+        raise RuntimeError(
+            "eToro reads are disabled (portfolio_advisor_etoro_enabled=False). "
+            "Use a watchlist file or the Alpaca adapter instead."
+        )
     client = EtoroClient()
     payload = client.get_portfolio_pnl()
     cp = payload.get("clientPortfolio") or {}

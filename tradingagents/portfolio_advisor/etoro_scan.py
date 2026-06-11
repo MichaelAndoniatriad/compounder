@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any, Dict, List, Set, Tuple
 
@@ -15,6 +16,47 @@ from tradingagents.integrations.etoro.portfolio import (
     summarize_portfolio,
 )
 
+logger = logging.getLogger(__name__)
+
+# -----------------------------------------------------------------------
+# Testable seam: tests monkeypatch _is_pytest() to control the gate.
+# Production code never sets this — it reads the real PYTEST_CURRENT_TEST.
+# -----------------------------------------------------------------------
+def _is_pytest() -> bool:
+    """Return True when running under pytest. Monkeypatched in tests."""
+    return "PYTEST_CURRENT_TEST" in os.environ
+
+
+def _etoro_enabled() -> bool:
+    """Return True when eToro reads are enabled.
+
+    Rules (evaluated in this order):
+    1. Under pytest — always True (preserves existing eToro-mock tests).
+    2. ``portfolio_advisor_etoro_enabled`` in DEFAULT_CONFIG (default: False) — controls
+       production behaviour.  When False, every eToro network fetch is short-circuited.
+    """
+    if _is_pytest():
+        return True
+    try:
+        from tradingagents.default_config import DEFAULT_CONFIG
+        return bool(DEFAULT_CONFIG.get("portfolio_advisor_etoro_enabled", False))
+    except Exception:
+        return False
+
+
+# One-shot log guard so we don't spam the log on every watchdog tick.
+_etoro_disabled_logged: bool = False
+
+
+def _log_etoro_disabled_once(context: str = "") -> None:
+    global _etoro_disabled_logged
+    if not _etoro_disabled_logged:
+        msg = "eToro reads are disabled (portfolio_advisor_etoro_enabled=False). Returning empty/unavailable result."
+        if context:
+            msg = f"{msg} context={context}"
+        logger.warning(msg)
+        _etoro_disabled_logged = True
+
 
 def etoro_keys_configured() -> bool:
     return bool(
@@ -27,17 +69,27 @@ def account_mode() -> str:
     """Which account the advisor manages: "etoro" (advisory, human executes)
     or "alpaca" (autonomous, PM-managed paper book).
 
-    Env TRADINGAGENTS_ACCOUNT_MODE wins; default_config "account_mode" second;
-    falls back to "etoro". This is THE switch for autonomous mode — every
-    portfolio consumer reads through fetch_portfolio_rows(), so flipping it
-    repoints the PM cycle, watchdog, weekly check, sleeves, and risk at the
-    chosen book.
+    Priority order:
+    1. Under pytest: always "etoro" (fully mocked, preserves existing tests).
+    2. When eToro reads are disabled (portfolio_advisor_etoro_enabled=False):
+       always "alpaca" — a LaunchAgent without TRADINGAGENTS_ACCOUNT_MODE must
+       never fall back to eToro mode.
+    3. Env TRADINGAGENTS_ACCOUNT_MODE wins over DEFAULT_CONFIG.
+    4. DEFAULT_CONFIG "account_mode" second; falls back to "etoro".
+
+    This is THE switch for autonomous mode — every portfolio consumer reads
+    through fetch_portfolio_rows(), so flipping it repoints the PM cycle,
+    watchdog, weekly check, sleeves, and risk at the chosen book.
     """
     # Tests always run in etoro mode (fully mocked) — never let a dev shell's
     # .env leak autonomous mode into pytest, where the Alpaca adapter would
     # make live API calls.
-    if "PYTEST_CURRENT_TEST" in os.environ:
+    if _is_pytest():
         return "etoro"
+    # When eToro reads are hard-disabled, always run in alpaca mode regardless
+    # of env — prevents a LaunchAgent from silently falling back to eToro.
+    if not _etoro_enabled():
+        return "alpaca"
     mode = (os.environ.get("TRADINGAGENTS_ACCOUNT_MODE") or "").strip().lower()
     if not mode:
         try:
@@ -55,6 +107,16 @@ def fetch_portfolio_rows() -> Tuple[Dict[str, Any], str, List[str], List[Dict[st
         from tradingagents.integrations.alpaca.account_adapter import fetch_portfolio_rows_alpaca
 
         return fetch_portfolio_rows_alpaca()
+    # --- eToro gate ---
+    # This path is only reached when account_mode() == "etoro", which only happens
+    # when _etoro_enabled() is True (or under pytest).  Belt-and-suspenders: gate
+    # again here at the lowest network-call level.
+    if not _etoro_enabled():
+        _log_etoro_disabled_once("fetch_portfolio_rows")
+        raise RuntimeError(
+            "eToro reads are disabled (portfolio_advisor_etoro_enabled=False). "
+            "Set account_mode='alpaca' or enable eToro reads explicitly."
+        )
     if not etoro_keys_configured():
         raise RuntimeError(
             "eToro keys missing: set ETORO_API_KEY and ETORO_USER_KEY in the environment."

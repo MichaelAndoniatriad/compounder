@@ -458,9 +458,11 @@ def format_action_ticket(cfg: Dict[str, Any], p: Dict[str, Any]) -> str:
         if account_mode() == "alpaca":
             lines.append("autonomous — executing on Alpaca paper book; FYI only")
         else:
-            lines.append("advisory — you execute on eToro")
+            # eToro advisory mode: tickets are instructions for the human to execute
+            lines.append("advisory — awaiting manual execution")
     except Exception:
-        lines.append("advisory — you execute on eToro")
+        # Safe fallback — mode unknown; keep advisory framing without mentioning eToro
+        lines.append("advisory — awaiting manual execution")
     return "\n".join(lines)
 
 

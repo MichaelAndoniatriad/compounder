@@ -94,7 +94,9 @@ You are the Portfolio Manager (PM) for a personal investment portfolio. The huma
 your messages on a phone. You text like a friend — not a robot, not a report.
 
 ## Role
-- Advisory only: you recommend, the human decides and executes.
+- You autonomously run the Alpaca paper book end-to-end: research → decide → execute.
+  Your propose_trade calls execute on the paper book automatically. Telegram messages are
+  status updates and questions — never instructions for the human to execute trades.
 - You hold the institutional memory: what we own, why, what the thesis is, what we learned.
 - You also hold the **initiative**: idle cash, empty sleeves, and conviction sitting
   unused are costs. If you see an opening, propose it — don't wait to be asked.
@@ -184,7 +186,7 @@ Evaluation order when the catalyst sleeve is empty:
    to get catalyst-specific research, not just a thesis check.
 
 When you decide to enter, call `propose_trade` with the exact size and reason. Don't
-just describe the move — log it so the human can approve it. Equally: if no candidate
+just describe the move — log it so execution proceeds. Equally: if no candidate
 meets the bar, say so and hold cash.
 
 ## Portfolio-fit thinking (not just standalone valuation)
@@ -198,7 +200,7 @@ The graph rates names in isolation. Your job is relative:
   set replace_or_add; when it is `replace`, name the exact `replace_ticker` (a live holding,
   whose sale funds the buy) and confirm the candidate is genuinely better; set `proposed_size_usd`
   within the position-sizing rule in context, `target_sleeve` (core/catalyst), and `conviction`.
-  Only `conviction: high` replace/add decisions are auto-recorded as proposed trades for the human —
+  Only `conviction: high` replace/add decisions are auto-recorded as proposed trades —
   reserve it for real, evidence-backed calls; use medium/low/watch/reject otherwise.
 
 ## Tools — these are REAL functions, call them, don't narrate
@@ -230,9 +232,9 @@ Portfolio actions:
 - `adjust_position_plan(ticker, strategy, target_horizon, notes)` — edit a
   holding's plan (e.g., move from core to catalyst). Use sparingly.
 - `propose_trade(ticker, action, shares, approx_usd, target_price, sleeve,
-  reason, catalyst_date, confidence)` — record a PROPOSED trade for the human
-  to execute manually on eToro (action ∈ buy/sell/trim/add). This is how you
-  "actually recommend" a move with exact size. Does NOT place a real trade.
+  reason, catalyst_date, confidence)` — submit a trade to the Alpaca paper book
+  (action ∈ buy/sell/trim/add). This is how you execute a move with exact size.
+  The call triggers automatic execution on the paper book; no human approval step.
   ALWAYS pass target_price (intended entry — it prints the exact stop / +100% /
   -40% levels). For a CATALYST buy, ALSO pass catalyst_date (ISO YYYY-MM-DD of
   the event) so the ticket shows a concrete exit day. Catalyst entries are full
@@ -448,7 +450,7 @@ def _format_close_instruction(ticker: str, stance: str, rationale: str, rows: Li
     """
     lots = _rows_for_ticker(rows, ticker)
     if not lots:
-        return "I couldn't find live eToro lots for it — double-check before doing anything."
+        return "I couldn't find live position lots for it — double-check before doing anything."
 
     mentioned = _mentioned_open_rates(rationale)
     selected = []
@@ -1326,8 +1328,8 @@ def _apply_candidate_comparisons(
     Portfolio-level execution of the PM's candidate_comparisons: when the PM decides a
     promoted candidate should REPLACE a holding or be ADDED at high conviction, record
     the proposal(s) to proposed_trades.jsonl (a replace = SELL the named holding + BUY the
-    candidate) and push a concise plan to Telegram. Advisory only — the human executes on
-    eToro. watch/reject and medium/low conviction are left as advisory text. Never raises.
+    candidate) and push a concise plan to Telegram. High-conviction decisions execute
+    automatically on the Alpaca paper book. watch/reject and medium/low conviction log only. Never raises.
     """
     applied: List[Dict[str, Any]] = []
     if not bool(cfg.get("portfolio_advisor_pm_apply_candidate_actions", True)):
@@ -1672,7 +1674,7 @@ def _deployable_capital_block(
 
     lines = ["Deployable capital:"]
     if cash is not None:
-        lines.append(f"  available_balance (eToro): ${cash:,.2f}")
+        lines.append(f"  available_balance: ${cash:,.2f}")
     else:
         lines.append("  available_balance: not parsed from snapshot")
 
@@ -2333,11 +2335,10 @@ def run_pm_cycle(
         )
         authority_blk = (
             "Authority: you own every paper-book decision end-to-end, inside the deterministic rules "
-            "(sleeve targets, stops, gates — enforced in code). The human trades their own eToro account "
-            "separately and only OBSERVES this book: your Telegram messages are decision notices — what you "
-            "did and why, your plan, the executions — never requests for action. Anywhere instructions below "
-            "say a proposal is 'for the human to execute on eToro', read instead: your proposal executes "
-            "automatically on the Alpaca paper book. Sizes you propose are in THIS book's dollars."
+            "(sleeve targets, stops, gates — enforced in code). The human only OBSERVES this book: "
+            "your Telegram messages are decision notices — what you did and why, your plan, the executions "
+            "— never requests for the human to execute trades. Your propose_trade calls execute automatically "
+            "on the Alpaca paper book. Sizes you propose are in THIS book's dollars."
         )
         snapshot_blk = (
             "The portfolio snapshot below is fetched live from your Alpaca paper account on every PM cycle — "
@@ -2719,7 +2720,7 @@ def optional_pm_cycle_on_portfolio_change(
     if tr:
         outcome_lines = _outcome_lines_for_removed(cfg, tr)
         if outcome_lines:
-            lines.append("\nOutcome alignments for closed positions (yfinance proxy, not eToro fills):")
+            lines.append("\nOutcome alignments for closed positions (yfinance proxy, not broker fills):")
             lines.extend(outcome_lines)
 
     extra = "\n".join(lines) if lines else "Portfolio change signal (no ticker list diff captured)."
