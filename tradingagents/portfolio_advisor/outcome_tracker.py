@@ -19,13 +19,26 @@ over the same holding window. A pick that gains +6% while QQQ gains +8% is
 "bad" (-2% alpha), not "good". Absolute return is stored alongside but the
 headline metric and was_correct are driven by alpha. This is the only metric
 that matters for "does the system beat the alternative of buying QQQ?"
+
+T4 — Multi-horizon outcome scoring:
+  Core sleeve: 30/90/365-day checkpoints. Each checkpoint is written once when
+  the row is old enough (idempotent — only missing horizons get computed).
+  Fields: ret_<N>d, alpha_<N>d for N in (30, 90, 365).
+
+  Catalyst sleeve: R-multiple scored once at catalyst_date + 5 days (or
+  entry_ts + 5 days if no catalyst_date). If the position closed before that
+  horizon, the actual fill close is used instead.
+  Fields: r_multiple, scored_horizon="event+5d".
+
+  Sleeve is read from the recommendation/proposal row if present; rows with
+  no sleeve field default to core.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -35,6 +48,13 @@ logger = logging.getLogger(__name__)
 # e.g. GOOD_THRESHOLD = 0.02 means the pick must beat QQQ by ≥2% to be "good"
 GOOD_THRESHOLD = 0.02   # +2% alpha → good
 BAD_THRESHOLD = -0.02   # -2% alpha → bad
+
+# Multi-horizon checkpoints for core-sleeve recommendations (days).
+# Module constant — not a cfg key; horizons are architectural not per-user.
+CORE_HORIZONS: Tuple[int, ...] = (30, 90, 365)
+
+# Catalyst scoring: days after the event / entry date before computing R-multiple.
+CATALYST_SCORE_DAYS: int = 5
 
 
 def _outcomes_path(cfg: Dict[str, Any]) -> Path:
@@ -110,6 +130,10 @@ def compute_recommendation_outcomes(
     - Append an outcome record to outcomes.jsonl
     - Update the recommendation log entry with was_correct + pnl_impact_est
 
+    The 30-day horizon is the primary classification horizon (kept for backward
+    compatibility). compute_core_multihorizon_outcomes() adds the 90d/365d
+    checkpoints for core-sleeve rows once they age into them.
+
     Returns a summary dict with counts.
     """
     from tradingagents.portfolio_advisor import recommendation_log
@@ -162,7 +186,6 @@ def compute_recommendation_outcomes(
             # do not break the fetch. yfinance returns the closest trading
             # day inside the window.
             start_date = start_dt.date().isoformat()
-            from datetime import timedelta
             end_date = (start_dt + timedelta(days=horizon + 2)).date().isoformat()
 
             prices = price_fetcher(ticker, start_date, end_date)
@@ -259,6 +282,449 @@ def compute_recommendation_outcomes(
 
     logger.info("outcome tracker: %s", json.dumps(summary))
     return summary
+
+
+# ---------------------------------------------------------------------------
+# T4 — Multi-horizon scoring
+# ---------------------------------------------------------------------------
+
+def _multihorizon_outcomes_path(cfg: Dict[str, Any]) -> Path:
+    """Path to multihorizon_outcomes.jsonl under the advisor directory."""
+    from tradingagents.portfolio_advisor import state as pa_state
+    return pa_state.advisor_dir(cfg) / "multihorizon_outcomes.jsonl"
+
+
+def _catalyst_outcomes_path(cfg: Dict[str, Any]) -> Path:
+    """Path to catalyst_r_outcomes.jsonl under the advisor directory."""
+    from tradingagents.portfolio_advisor import state as pa_state
+    return pa_state.advisor_dir(cfg) / "catalyst_r_outcomes.jsonl"
+
+
+def _load_scored_keys(path: Path) -> set:
+    """Return a set of (rec_id, horizon_days) already scored in a JSONL file."""
+    scored: set = set()
+    if not path.is_file():
+        return scored
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            r = json.loads(line)
+            key = (r.get("recommendation_id", ""), int(r.get("horizon_days", 0)))
+            scored.add(key)
+        except (json.JSONDecodeError, ValueError, TypeError):
+            continue
+    return scored
+
+
+def compute_core_multihorizon_outcomes(
+    cfg: Dict[str, Any],
+    *,
+    price_fetcher: Optional[Callable[[str, str, str], Optional[Tuple[float, float]]]] = None,
+) -> Dict[str, Any]:
+    """Score core-sleeve recommendation-log rows at each CORE_HORIZONS checkpoint.
+
+    For each row in recommendation_log.jsonl whose sleeve is "core" (or absent —
+    rows without a sleeve field default to core):
+      - For each horizon in CORE_HORIZONS (30, 90, 365 days):
+        - If the row is old enough AND no score for that horizon exists yet,
+          fetch prices, compute ret_<N>d and alpha_<N>d, append to
+          multihorizon_outcomes.jsonl.
+
+    Idempotent: (recommendation_id, horizon_days) pairs already present in
+    multihorizon_outcomes.jsonl are skipped without re-fetching prices.
+
+    Returns a summary dict.
+    """
+    from tradingagents.portfolio_advisor import recommendation_log
+
+    if price_fetcher is None:
+        price_fetcher = _default_price_fetcher
+
+    scores_path = _multihorizon_outcomes_path(cfg)
+    already_scored = _load_scored_keys(scores_path)
+
+    all_recs = recommendation_log.load_all(cfg)
+    now = datetime.now(timezone.utc)
+
+    summary: Dict[str, Any] = {
+        "total_rows": len(all_recs),
+        "horizons_scored": 0,
+        "horizons_skipped_too_young": 0,
+        "horizons_skipped_existing": 0,
+        "skipped_no_price": 0,
+    }
+
+    scores_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(scores_path, "a", encoding="utf-8") as out_f:
+        for rec in all_recs:
+            ticker = rec.get("ticker")
+            if not ticker:
+                continue
+
+            # Sleeve: from row if present; rows with no sleeve default to core.
+            sleeve = str(rec.get("sleeve") or "core").lower()
+            if sleeve == "catalyst":
+                continue  # catalyst rows go through compute_catalyst_r_outcomes
+
+            ts_str = rec.get("ts", "")
+            try:
+                rec_dt = datetime.fromisoformat(ts_str)
+            except (TypeError, ValueError):
+                continue
+
+            age_days = (now - rec_dt).days
+            start_date = rec_dt.date().isoformat()
+            rec_id = rec.get("id", "")
+
+            for h in CORE_HORIZONS:
+                key = (rec_id, h)
+                if key in already_scored:
+                    summary["horizons_skipped_existing"] += 1
+                    continue
+                if age_days < h:
+                    summary["horizons_skipped_too_young"] += 1
+                    continue
+
+                end_date = (rec_dt + timedelta(days=h + 2)).date().isoformat()
+                prices = price_fetcher(ticker, start_date, end_date)
+                if prices is None:
+                    summary["skipped_no_price"] += 1
+                    continue
+
+                start_price, end_price = prices
+                if start_price <= 0:
+                    summary["skipped_no_price"] += 1
+                    continue
+
+                ret = (end_price - start_price) / start_price
+                qqq_return = _fetch_qqq_return(start_date, end_date)
+                alpha = (ret - qqq_return) if qqq_return is not None else None
+
+                score_row: Dict[str, Any] = {
+                    "recommendation_id": rec_id,
+                    "ticker": ticker,
+                    "sleeve": sleeve,
+                    "recommendation_date": start_date,
+                    "horizon_days": h,
+                    "end_date": end_date,
+                    "start_price": round(start_price, 4),
+                    "end_price": round(end_price, 4),
+                    f"ret_{h}d": round(ret, 4),
+                    "qqq_return": round(qqq_return, 4) if qqq_return is not None else None,
+                    f"alpha_{h}d": round(alpha, 4) if alpha is not None else None,
+                    "scored_at": now.isoformat(),
+                    "rule_ref": rec.get("rule_ref"),
+                }
+                out_f.write(json.dumps(score_row, ensure_ascii=False) + "\n")
+                already_scored.add(key)
+                summary["horizons_scored"] += 1
+
+    logger.info("compute_core_multihorizon_outcomes: %s", json.dumps(summary))
+    return summary
+
+
+def _find_ledger_close(
+    cfg: Dict[str, Any],
+    ticker: str,
+    after_ts: datetime,
+) -> Optional[Tuple[datetime, float]]:
+    """Search alpaca_trades.jsonl for an actual close fill for ticker after after_ts.
+
+    Returns (fill_datetime, fill_price) if found, else None.
+    Only considers rows with action in (sell, exit, close) and status==submitted
+    or action==fill_check.
+    """
+    from tradingagents.portfolio_advisor import state as pa_state
+    ledger_path = pa_state.advisor_dir(cfg) / "alpaca_trades.jsonl"
+    if not ledger_path.is_file():
+        return None
+
+    ticker_upper = ticker.upper()
+    best: Optional[Tuple[datetime, float]] = None
+
+    for line in ledger_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+
+        if str(row.get("ticker") or "").upper() != ticker_upper:
+            continue
+
+        action = str(row.get("action") or "").lower()
+        is_close = any(k in action for k in ("sell", "exit", "close", "fill_check"))
+        if not is_close:
+            continue
+
+        ts_str = str(row.get("ts") or "")
+        try:
+            row_dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            continue
+
+        if row_dt <= after_ts:
+            continue
+
+        # Use filled_avg_price if available (fill_check rows), else intended_price
+        price_raw = row.get("filled_avg_price") or row.get("intended_price")
+        try:
+            price = float(price_raw)
+        except (TypeError, ValueError):
+            continue
+
+        if best is None or row_dt < best[0]:
+            best = (row_dt, price)
+
+    return best
+
+
+def compute_catalyst_r_outcomes(
+    cfg: Dict[str, Any],
+    *,
+    price_fetcher: Optional[Callable[[str, str, str], Optional[Tuple[float, float]]]] = None,
+) -> Dict[str, Any]:
+    """Score catalyst-sleeve recommendation-log rows with R-multiple at event+5d.
+
+    For each row whose sleeve=="catalyst":
+      - Score horizon = catalyst_date + CATALYST_SCORE_DAYS (or ts + CATALYST_SCORE_DAYS
+        if no catalyst_date).
+      - If the position closed before the score horizon (find in alpaca_trades.jsonl),
+        use the actual close fill date and price.
+      - R = (exit_price - entry_price) / (entry_price × hard_stop_pct)
+        where hard_stop_pct defaults to cfg portfolio_advisor_catalyst_hard_stop_pct (0.08).
+      - Writes to catalyst_r_outcomes.jsonl (one row per rec_id, idempotent).
+
+    Returns a summary dict.
+    """
+    from tradingagents.portfolio_advisor import recommendation_log
+
+    if price_fetcher is None:
+        price_fetcher = _default_price_fetcher
+
+    outcomes_path = _catalyst_outcomes_path(cfg)
+    hard_stop_pct = float(cfg.get("portfolio_advisor_catalyst_hard_stop_pct", 0.08) or 0.08)
+
+    # Build set of already-scored rec_ids (one score per catalyst row).
+    already_scored: set = set()
+    if outcomes_path.is_file():
+        for line in outcomes_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                r = json.loads(line)
+                rid = r.get("recommendation_id", "")
+                if rid:
+                    already_scored.add(rid)
+            except (json.JSONDecodeError, ValueError):
+                continue
+
+    all_recs = recommendation_log.load_all(cfg)
+    now = datetime.now(timezone.utc)
+
+    summary: Dict[str, Any] = {
+        "total_catalyst_rows": 0,
+        "scored": 0,
+        "skipped_existing": 0,
+        "skipped_too_young": 0,
+        "skipped_no_price": 0,
+    }
+
+    outcomes_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(outcomes_path, "a", encoding="utf-8") as out_f:
+        for rec in all_recs:
+            ticker = rec.get("ticker")
+            if not ticker:
+                continue
+
+            sleeve = str(rec.get("sleeve") or "core").lower()
+            if sleeve != "catalyst":
+                continue
+
+            summary["total_catalyst_rows"] += 1
+            rec_id = rec.get("id", "")
+
+            if rec_id in already_scored:
+                summary["skipped_existing"] += 1
+                continue
+
+            ts_str = rec.get("ts", "")
+            try:
+                rec_dt = datetime.fromisoformat(ts_str)
+            except (TypeError, ValueError):
+                continue
+
+            # Score horizon: catalyst_date + 5d, or rec_ts + 5d if no catalyst_date.
+            catalyst_date_str = str(rec.get("catalyst_date") or "").strip()
+            if catalyst_date_str:
+                try:
+                    cat_dt = datetime.fromisoformat(catalyst_date_str).replace(
+                        tzinfo=timezone.utc
+                    )
+                    score_dt = cat_dt + timedelta(days=CATALYST_SCORE_DAYS)
+                except (TypeError, ValueError):
+                    score_dt = rec_dt + timedelta(days=CATALYST_SCORE_DAYS)
+            else:
+                score_dt = rec_dt + timedelta(days=CATALYST_SCORE_DAYS)
+
+            if now < score_dt:
+                summary["skipped_too_young"] += 1
+                continue
+
+            # Entry price: from rec row if present, else fetch from price data.
+            entry_price_raw = rec.get("entry_price")
+            try:
+                entry_price: Optional[float] = float(entry_price_raw) if entry_price_raw is not None else None
+            except (TypeError, ValueError):
+                entry_price = None
+
+            if entry_price is None:
+                # Fall back to fetching the start price from yfinance.
+                start_date = rec_dt.date().isoformat()
+                end_date = (rec_dt + timedelta(days=2)).date().isoformat()
+                ep_prices = price_fetcher(ticker, start_date, end_date)
+                if ep_prices is None or ep_prices[0] <= 0:
+                    summary["skipped_no_price"] += 1
+                    continue
+                entry_price = ep_prices[0]
+
+            if entry_price <= 0:
+                summary["skipped_no_price"] += 1
+                continue
+
+            # Check for an actual ledger close before the score horizon.
+            ledger_close = _find_ledger_close(cfg, ticker, rec_dt)
+            if ledger_close is not None:
+                close_dt, exit_price = ledger_close
+                scored_horizon_label = "ledger_close"
+            else:
+                # Fetch market price at score horizon.
+                score_start = (score_dt - timedelta(days=2)).date().isoformat()
+                score_end = (score_dt + timedelta(days=2)).date().isoformat()
+                score_prices = price_fetcher(ticker, score_start, score_end)
+                if score_prices is None:
+                    summary["skipped_no_price"] += 1
+                    continue
+                exit_price = score_prices[1]  # end_close at score horizon
+                scored_horizon_label = "event+5d"
+
+            if exit_price <= 0:
+                summary["skipped_no_price"] += 1
+                continue
+
+            # R = (exit - entry) / (entry × hard_stop_pct)
+            r_multiple = (exit_price - entry_price) / (entry_price * hard_stop_pct)
+
+            score_row: Dict[str, Any] = {
+                "recommendation_id": rec_id,
+                "ticker": ticker,
+                "sleeve": "catalyst",
+                "recommendation_date": rec_dt.date().isoformat(),
+                "entry_price": round(entry_price, 4),
+                "exit_price": round(exit_price, 4),
+                "hard_stop_pct": hard_stop_pct,
+                "r_multiple": round(r_multiple, 3),
+                "scored_horizon": scored_horizon_label,
+                "catalyst_date": catalyst_date_str or None,
+                "scored_at": now.isoformat(),
+                "rule_ref": rec.get("rule_ref"),
+            }
+            out_f.write(json.dumps(score_row, ensure_ascii=False) + "\n")
+            already_scored.add(rec_id)
+            summary["scored"] += 1
+
+    logger.info("compute_catalyst_r_outcomes: %s", json.dumps(summary))
+    return summary
+
+
+def multihorizon_aggregates(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Aggregate multi-horizon outcomes for surfacing in CLI / veto_scorecard.
+
+    Returns::
+
+        {
+          "core": {
+            "30d":  {"count": int, "avg_ret": float|None, "avg_alpha": float|None},
+            "90d":  {...},
+            "365d": {...},
+          },
+          "catalyst": {
+            "count": int, "avg_r_multiple": float|None,
+          },
+        }
+    """
+    scores_path = _multihorizon_outcomes_path(cfg)
+    cat_path = _catalyst_outcomes_path(cfg)
+
+    core: Dict[str, Dict[str, Any]] = {}
+    for h in CORE_HORIZONS:
+        core[f"{h}d"] = {"count": 0, "sum_ret": 0.0, "sum_alpha": 0.0}
+
+    if scores_path.is_file():
+        for line in scores_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                r = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            h = int(r.get("horizon_days", 0))
+            key = f"{h}d"
+            if key not in core:
+                continue
+            bucket = core[key]
+            bucket["count"] += 1
+            try:
+                bucket["sum_ret"] += float(r.get(f"ret_{h}d") or 0.0)
+            except (TypeError, ValueError):
+                pass
+            try:
+                alpha_val = r.get(f"alpha_{h}d")
+                if alpha_val is not None:
+                    bucket["sum_alpha"] += float(alpha_val)
+            except (TypeError, ValueError):
+                pass
+
+    core_out: Dict[str, Any] = {}
+    for h in CORE_HORIZONS:
+        key = f"{h}d"
+        b = core[key]
+        n = b["count"]
+        core_out[key] = {
+            "count": n,
+            "avg_ret": round(b["sum_ret"] / n, 4) if n else None,
+            "avg_alpha": round(b["sum_alpha"] / n, 4) if n else None,
+        }
+
+    # Catalyst
+    cat_r: List[float] = []
+    if cat_path.is_file():
+        for line in cat_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                r = json.loads(line)
+                rm = r.get("r_multiple")
+                if rm is not None:
+                    cat_r.append(float(rm))
+            except (json.JSONDecodeError, ValueError, TypeError):
+                continue
+
+    cat_out: Dict[str, Any] = {
+        "count": len(cat_r),
+        "avg_r_multiple": round(sum(cat_r) / len(cat_r), 3) if cat_r else None,
+    }
+
+    return {"core": core_out, "catalyst": cat_out}
 
 
 def _nav_history_path(cfg: Dict[str, Any]) -> "Path":
@@ -544,6 +1010,9 @@ def veto_scorecard(cfg: Dict[str, Any]) -> Dict[str, Any]:
         else:
             note_parts.append("PM vetoes have zero net impact so far")
 
+    # T4: include per-horizon aggregates from multi-horizon scoring.
+    mh = multihorizon_aggregates(cfg)
+
     return {
         "vetoed": {
             "count": len(vetoed_returns),
@@ -557,6 +1026,9 @@ def veto_scorecard(cfg: Dict[str, Any]) -> Dict[str, Any]:
         },
         "pm_veto_lift": veto_lift,
         "note": "; ".join(note_parts) if note_parts else "scorecard computed",
+        # Per-horizon aggregates for core and catalyst (empty dicts until rows age in).
+        "core_horizons": mh["core"],
+        "catalyst_r": mh["catalyst"],
     }
 
 

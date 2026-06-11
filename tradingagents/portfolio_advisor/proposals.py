@@ -353,6 +353,8 @@ def add(
                         action=entry.get("action", ""),
                         ticker=entry.get("ticker"),
                         rationale=(entry.get("reason") or "")[:600],
+                        sleeve=entry.get("sleeve"),
+                        catalyst_date=entry.get("catalyst_date"),
                     )
                 except Exception:
                     pass  # log failure must never break the proposal path

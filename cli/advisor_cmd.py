@@ -539,13 +539,15 @@ def portfolio_advisor_measure_outcomes(
     try:
         from tradingagents.portfolio_advisor.outcome_tracker import (
             compute_recommendation_outcomes,
+            compute_core_multihorizon_outcomes,
+            compute_catalyst_r_outcomes,
             veto_scorecard,
             score_counterfactuals,
         )
         from tradingagents.portfolio_advisor.recommendation_log import human_override_analysis
         from tradingagents.portfolio_advisor.candidates import shadow_outcomes
 
-        # 1. Score recommendation-log rows
+        # 1. Score recommendation-log rows (30d primary horizon, backward compat)
         summary = compute_recommendation_outcomes(cfg)
         console.print(
             f"[cyan]measure-outcomes:[/cyan] due={summary['due']}, "
@@ -555,7 +557,25 @@ def portfolio_advisor_measure_outcomes(
             f"good={summary['good']}, bad={summary['bad']}, neutral={summary['neutral']}"
         )
 
-        # 2. Score shadow-book rows
+        # 2. T4 — Core multi-horizon scoring (30/90/365d checkpoints)
+        mh_summary = compute_core_multihorizon_outcomes(cfg)
+        console.print(
+            f"[cyan]core-horizons:[/cyan] scored={mh_summary['horizons_scored']}, "
+            f"too_young={mh_summary['horizons_skipped_too_young']}, "
+            f"existing={mh_summary['horizons_skipped_existing']}, "
+            f"no_price={mh_summary['skipped_no_price']}"
+        )
+
+        # 3. T4 — Catalyst R-multiple scoring
+        cat_summary = compute_catalyst_r_outcomes(cfg)
+        console.print(
+            f"[cyan]catalyst-R:[/cyan] total_catalyst={cat_summary['total_catalyst_rows']}, "
+            f"scored={cat_summary['scored']}, "
+            f"too_young={cat_summary['skipped_too_young']}, "
+            f"no_price={cat_summary['skipped_no_price']}"
+        )
+
+        # 4. Score shadow-book rows
         shadow_summary = shadow_outcomes(cfg)
         console.print(
             f"[cyan]shadow-outcomes:[/cyan] total_open={shadow_summary['total_open']}, "
@@ -564,7 +584,7 @@ def portfolio_advisor_measure_outcomes(
             f"skipped_no_price={shadow_summary['skipped_no_price']}"
         )
 
-        # 3. Human-override analysis
+        # 5. Human-override analysis
         analysis = human_override_analysis(cfg)
         if analysis["followed_count"] or analysis["overrode_count"]:
             f_avg = f"${analysis['followed_avg_pnl']:.0f}" if analysis["followed_avg_pnl"] is not None else "N/A"
@@ -572,7 +592,7 @@ def portfolio_advisor_measure_outcomes(
             console.print(f"  Followed PM advice: n={analysis['followed_count']} avg P&L={f_avg}")
             console.print(f"  Overrode PM advice: n={analysis['overrode_count']} avg P&L={o_avg}")
 
-        # 4. T2 — PM veto scorecard
+        # 6. T2 — PM veto scorecard (now includes per-horizon aggregates)
         veto = veto_scorecard(cfg)
         console.print(
             f"[cyan]veto-scorecard:[/cyan] "
@@ -580,8 +600,21 @@ def portfolio_advisor_measure_outcomes(
             f"executed={veto['executed']['count']} avg={veto['executed']['avg_30d_return']}, "
             f"pm_veto_lift={veto['pm_veto_lift']} — {veto['note']}"
         )
+        # Per-horizon core alpha summary (compact)
+        core_h = veto.get("core_horizons") or {}
+        for hkey in ("30d", "90d", "365d"):
+            hd = core_h.get(hkey, {})
+            if hd.get("count"):
+                console.print(
+                    f"  core {hkey}: n={hd['count']} avg_alpha={hd['avg_alpha']}"
+                )
+        cat_r = veto.get("catalyst_r") or {}
+        if cat_r.get("count"):
+            console.print(
+                f"  catalyst R: n={cat_r['count']} avg_R={cat_r['avg_r_multiple']}"
+            )
 
-        # 5. T3 — Counterfactual ledger scoring
+        # 7. T3 — Counterfactual ledger scoring
         cf_summary = score_counterfactuals(cfg)
         console.print(
             f"[cyan]counterfactuals:[/cyan] "

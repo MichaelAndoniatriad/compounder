@@ -64,6 +64,8 @@ def log_recommendation(
     consensus_age_days: Optional[int] = None,
     consensus_score: Optional[Dict[str, float]] = None,
     deepseek_aligned_with_consensus: Optional[bool] = None,
+    sleeve: Optional[str] = None,
+    catalyst_date: Optional[str] = None,
 ) -> Optional[str]:
     """Write a recommendation to the append-only log. Returns the entry ID.
 
@@ -124,6 +126,10 @@ def log_recommendation(
         "consensus_age_days": int(consensus_age_days) if consensus_age_days is not None else None,
         "consensus_score": consensus_score if consensus_score else None,
         "deepseek_aligned_with_consensus": bool(deepseek_aligned_with_consensus) if deepseek_aligned_with_consensus is not None else None,
+        # T4: sleeve and catalyst_date for multi-horizon routing.
+        # "core" is the default when absent (multi-horizon scorer treats missing sleeve as core).
+        "sleeve": (str(sleeve).strip().lower() or None) if sleeve else None,
+        "catalyst_date": (str(catalyst_date).strip() or None) if catalyst_date else None,
     }
 
     try:

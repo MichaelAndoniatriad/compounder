@@ -446,6 +446,19 @@ class TestMeasureOutcomesCLI:
                 "skipped_no_price": 0, "good": 0, "bad": 0, "neutral": 0,
             },
         ), patch(
+            "tradingagents.portfolio_advisor.outcome_tracker.compute_core_multihorizon_outcomes",
+            return_value={
+                "total_rows": 0, "horizons_scored": 0,
+                "horizons_skipped_too_young": 0, "horizons_skipped_existing": 0,
+                "skipped_no_price": 0,
+            },
+        ), patch(
+            "tradingagents.portfolio_advisor.outcome_tracker.compute_catalyst_r_outcomes",
+            return_value={
+                "total_catalyst_rows": 0, "scored": 0,
+                "skipped_existing": 0, "skipped_too_young": 0, "skipped_no_price": 0,
+            },
+        ), patch(
             "tradingagents.portfolio_advisor.candidates.shadow_outcomes",
             return_value={
                 "total_open": 0, "scored": 0,
@@ -464,3 +477,362 @@ class TestMeasureOutcomesCLI:
 
         assert result.exit_code == 0, f"CLI exited with {result.exit_code}: {result.output}"
         assert "measure-outcomes" in result.output
+
+
+# ---------------------------------------------------------------------------
+# 6. T4 — Multi-horizon outcome scoring tests
+# ---------------------------------------------------------------------------
+
+class TestMultiHorizonCoreScoring:
+    """Tests for compute_core_multihorizon_outcomes."""
+
+    def _write_rec_log(
+        self,
+        log_path: Path,
+        *,
+        age_days: int,
+        ticker: str = "AAPL",
+        sleeve: str = "core",
+        rec_id: str = "rec001",
+    ) -> None:
+        """Write a recommendation_log row aged age_days in the past."""
+        ts = (datetime.now(timezone.utc) - timedelta(days=age_days)).isoformat()
+        row = {
+            "id": rec_id,
+            "ts": ts,
+            "trigger": "autonomous_execution",
+            "type": "sizing",
+            "ticker": ticker,
+            "action": "buy",
+            "rationale": "test",
+            "rule_ref": None,
+            "entry_price": 100.0,
+            "stop_price": None,
+            "shares": 10.0,
+            "status": "pending",
+            "human_response": None,
+            "outcome_measured_at": None,
+            "was_correct": None,
+            "pnl_impact_est": None,
+            "outcome_note": None,
+            "confidence": None,
+            "thesis_break_metrics": None,
+            "exit_horizon_days": None,
+            "peer_holdings": None,
+            "consensus_rank": None,
+            "consensus_age_days": None,
+            "consensus_score": None,
+            "deepseek_aligned_with_consensus": None,
+            "sleeve": sleeve,
+            "catalyst_date": None,
+        }
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, "a") as f:
+            f.write(json.dumps(row) + "\n")
+
+    def _make_price_fetcher(self, start_close: float = 100.0, end_close: float = 110.0):
+        """Return a mock price fetcher returning (start_close, end_close)."""
+        def _fetcher(ticker, start_date, end_date):
+            return (start_close, end_close)
+        return _fetcher
+
+    def test_95d_row_gets_30d_and_90d_but_not_365d(self, tmp_path):
+        """A 95-day-old core row should receive 30d and 90d scores but not 365d."""
+        cfg = _cfg(tmp_path)
+        log_path = tmp_path / "recommendation_log.jsonl"
+        self._write_rec_log(log_path, age_days=95, ticker="AAPL", sleeve="core")
+
+        with patch("yfinance.Ticker") as mock_yf:
+            # QQQ fetch for benchmark
+            import pandas as pd
+            idx = pd.date_range("2026-01-01", periods=2, freq="D")
+            qqq_hist = pd.DataFrame({"Close": [400.0, 402.0]}, index=idx)
+            mock_yf.return_value.history.return_value = qqq_hist
+
+            from tradingagents.portfolio_advisor.outcome_tracker import compute_core_multihorizon_outcomes
+
+            summary = compute_core_multihorizon_outcomes(
+                cfg,
+                price_fetcher=self._make_price_fetcher(),
+            )
+
+        assert summary["horizons_scored"] == 2, f"Expected 2 scored (30d+90d), got {summary}"
+        assert summary["horizons_skipped_too_young"] == 1  # 365d not yet
+
+        scores_path = tmp_path / "multihorizon_outcomes.jsonl"
+        assert scores_path.is_file()
+        rows = [json.loads(l) for l in scores_path.read_text().splitlines() if l.strip()]
+        assert len(rows) == 2
+        horizons = {r["horizon_days"] for r in rows}
+        assert horizons == {30, 90}
+
+        # Check fields present on each row
+        for row in rows:
+            h = row["horizon_days"]
+            assert f"ret_{h}d" in row
+            assert f"alpha_{h}d" in row
+            assert row["ticker"] == "AAPL"
+            assert row["sleeve"] == "core"
+
+    def test_rerun_does_not_recompute_existing_horizons(self, tmp_path):
+        """Re-running compute_core_multihorizon_outcomes does not double-score."""
+        cfg = _cfg(tmp_path)
+        log_path = tmp_path / "recommendation_log.jsonl"
+        self._write_rec_log(log_path, age_days=95, ticker="MSFT", sleeve="core")
+
+        with patch("yfinance.Ticker") as mock_yf:
+            import pandas as pd
+            idx = pd.date_range("2026-01-01", periods=2, freq="D")
+            qqq_hist = pd.DataFrame({"Close": [400.0, 402.0]}, index=idx)
+            mock_yf.return_value.history.return_value = qqq_hist
+
+            from tradingagents.portfolio_advisor.outcome_tracker import compute_core_multihorizon_outcomes
+
+            s1 = compute_core_multihorizon_outcomes(
+                cfg, price_fetcher=self._make_price_fetcher()
+            )
+            s2 = compute_core_multihorizon_outcomes(
+                cfg, price_fetcher=self._make_price_fetcher()
+            )
+
+        assert s1["horizons_scored"] == 2
+        assert s2["horizons_scored"] == 0, "Second run must not re-score existing horizons"
+        assert s2["horizons_skipped_existing"] == 2
+
+        scores_path = tmp_path / "multihorizon_outcomes.jsonl"
+        rows = [json.loads(l) for l in scores_path.read_text().splitlines() if l.strip()]
+        assert len(rows) == 2, "Only 2 rows total; no duplicates"
+
+    def test_catalyst_rows_are_skipped(self, tmp_path):
+        """Catalyst-sleeve rows are not scored by the core multi-horizon function."""
+        cfg = _cfg(tmp_path)
+        log_path = tmp_path / "recommendation_log.jsonl"
+        self._write_rec_log(log_path, age_days=100, ticker="TSLA", sleeve="catalyst")
+
+        with patch("yfinance.Ticker"):
+            from tradingagents.portfolio_advisor.outcome_tracker import compute_core_multihorizon_outcomes
+            summary = compute_core_multihorizon_outcomes(
+                cfg, price_fetcher=self._make_price_fetcher()
+            )
+
+        assert summary["horizons_scored"] == 0
+
+    def test_missing_sleeve_defaults_to_core(self, tmp_path):
+        """A recommendation row with no sleeve field is treated as core."""
+        cfg = _cfg(tmp_path)
+        log_path = tmp_path / "recommendation_log.jsonl"
+        # Write a row without sleeve field
+        ts = (datetime.now(timezone.utc) - timedelta(days=40)).isoformat()
+        row = {
+            "id": "nosleeve01",
+            "ts": ts,
+            "trigger": "autonomous_execution",
+            "type": "sizing",
+            "ticker": "GOOG",
+            "action": "buy",
+            "rationale": "",
+            "rule_ref": None,
+            "status": "pending",
+            "outcome_measured_at": None,
+            "was_correct": None,
+            # sleeve key intentionally omitted — should default to core
+        }
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, "a") as f:
+            f.write(json.dumps(row) + "\n")
+
+        with patch("yfinance.Ticker") as mock_yf:
+            import pandas as pd
+            idx = pd.date_range("2026-01-01", periods=2, freq="D")
+            qqq_hist = pd.DataFrame({"Close": [400.0, 402.0]}, index=idx)
+            mock_yf.return_value.history.return_value = qqq_hist
+
+            from tradingagents.portfolio_advisor.outcome_tracker import compute_core_multihorizon_outcomes
+            summary = compute_core_multihorizon_outcomes(
+                cfg, price_fetcher=self._make_price_fetcher()
+            )
+
+        # Row is 40d old → only 30d horizon should score
+        assert summary["horizons_scored"] == 1
+        scores_path = tmp_path / "multihorizon_outcomes.jsonl"
+        rows = [json.loads(l) for l in scores_path.read_text().splitlines() if l.strip()]
+        assert len(rows) == 1
+        assert rows[0]["sleeve"] == "core"
+
+
+class TestCatalystRMultipleScoring:
+    """Tests for compute_catalyst_r_outcomes."""
+
+    def _write_catalyst_rec(
+        self,
+        log_path: Path,
+        *,
+        age_days: int,
+        ticker: str = "NVDA",
+        catalyst_date_offset: int = 0,
+        entry_price: float = 100.0,
+        rec_id: str = "cat001",
+    ) -> None:
+        """Write a catalyst recommendation row."""
+        ts = (datetime.now(timezone.utc) - timedelta(days=age_days)).isoformat()
+        cat_date = (
+            datetime.now(timezone.utc) - timedelta(days=abs(catalyst_date_offset))
+        ).date().isoformat()
+        row = {
+            "id": rec_id,
+            "ts": ts,
+            "trigger": "autonomous_execution",
+            "type": "ep_entry",
+            "ticker": ticker,
+            "action": "buy",
+            "rationale": "catalyst trade",
+            "rule_ref": None,
+            "entry_price": entry_price,
+            "stop_price": None,
+            "shares": 10.0,
+            "status": "pending",
+            "human_response": None,
+            "outcome_measured_at": None,
+            "was_correct": None,
+            "pnl_impact_est": None,
+            "outcome_note": None,
+            "confidence": None,
+            "thesis_break_metrics": None,
+            "exit_horizon_days": None,
+            "peer_holdings": None,
+            "consensus_rank": None,
+            "consensus_age_days": None,
+            "consensus_score": None,
+            "deepseek_aligned_with_consensus": None,
+            "sleeve": "catalyst",
+            "catalyst_date": cat_date,
+        }
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, "a") as f:
+            f.write(json.dumps(row) + "\n")
+
+    def test_catalyst_row_6d_old_gets_r_multiple(self, tmp_path):
+        """A catalyst row with catalyst_date 6 days ago gets an R-multiple score."""
+        cfg = _cfg(tmp_path)
+        log_path = tmp_path / "recommendation_log.jsonl"
+        # age_days=8 so rec is older than 5d; catalyst_date 6d ago (> 5d) → score horizon elapsed
+        self._write_catalyst_rec(
+            log_path,
+            age_days=8,
+            ticker="NVDA",
+            catalyst_date_offset=6,
+            entry_price=100.0,
+        )
+
+        def mock_price_fetcher(ticker, start_date, end_date):
+            return (100.0, 112.0)  # +12% from entry
+
+        with patch("yfinance.Ticker"):
+            from tradingagents.portfolio_advisor.outcome_tracker import compute_catalyst_r_outcomes
+
+            summary = compute_catalyst_r_outcomes(
+                cfg,
+                price_fetcher=mock_price_fetcher,
+            )
+
+        assert summary["scored"] == 1, f"Expected 1 scored, got {summary}"
+        out_path = tmp_path / "catalyst_r_outcomes.jsonl"
+        assert out_path.is_file()
+        rows = [json.loads(l) for l in out_path.read_text().splitlines() if l.strip()]
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["ticker"] == "NVDA"
+        assert row["sleeve"] == "catalyst"
+        assert "r_multiple" in row
+        assert row["scored_horizon"] == "event+5d"
+        # R = (112 - 100) / (100 * 0.08) = 12 / 8 = 1.5
+        assert abs(row["r_multiple"] - 1.5) < 0.01
+
+    def test_catalyst_too_young_skipped(self, tmp_path):
+        """A catalyst row whose score horizon has not elapsed is skipped."""
+        cfg = _cfg(tmp_path)
+        log_path = tmp_path / "recommendation_log.jsonl"
+        # catalyst_date only 2 days ago → score horizon (2+5=7d from now) not elapsed
+        self._write_catalyst_rec(
+            log_path,
+            age_days=3,
+            ticker="AMD",
+            catalyst_date_offset=2,
+        )
+
+        from tradingagents.portfolio_advisor.outcome_tracker import compute_catalyst_r_outcomes
+        summary = compute_catalyst_r_outcomes(cfg)
+        assert summary["skipped_too_young"] == 1
+        assert summary["scored"] == 0
+
+    def test_catalyst_rerun_idempotent(self, tmp_path):
+        """Re-running does not re-score an already-scored catalyst row."""
+        cfg = _cfg(tmp_path)
+        log_path = tmp_path / "recommendation_log.jsonl"
+        self._write_catalyst_rec(
+            log_path,
+            age_days=10,
+            ticker="AMZN",
+            catalyst_date_offset=8,
+            entry_price=200.0,
+        )
+
+        def mock_price_fetcher(ticker, start_date, end_date):
+            return (200.0, 216.0)
+
+        with patch("yfinance.Ticker"):
+            from tradingagents.portfolio_advisor.outcome_tracker import compute_catalyst_r_outcomes
+
+            s1 = compute_catalyst_r_outcomes(cfg, price_fetcher=mock_price_fetcher)
+            s2 = compute_catalyst_r_outcomes(cfg, price_fetcher=mock_price_fetcher)
+
+        assert s1["scored"] == 1
+        assert s2["scored"] == 0
+        assert s2["skipped_existing"] == 1
+
+    def test_catalyst_closed_before_horizon_uses_ledger_close(self, tmp_path):
+        """When position closed before event+5d, ledger close price is used for R."""
+        cfg = _cfg(tmp_path)
+        log_path = tmp_path / "recommendation_log.jsonl"
+        self._write_catalyst_rec(
+            log_path,
+            age_days=10,
+            ticker="TSLA",
+            catalyst_date_offset=8,
+            entry_price=100.0,
+            rec_id="cat_ledger",
+        )
+
+        # Write a ledger close in alpaca_trades.jsonl
+        ledger_path = tmp_path / "alpaca_trades.jsonl"
+        close_ts = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+        ledger_row = {
+            "ts": close_ts,
+            "ticker": "TSLA",
+            "action": "sell",
+            "status": "submitted",
+            "filled_avg_price": 115.0,  # +15% from entry
+            "intended_price": 115.0,
+            "sleeve": "catalyst",
+        }
+        with open(ledger_path, "w") as f:
+            f.write(json.dumps(ledger_row) + "\n")
+
+        def mock_price_fetcher(ticker, start_date, end_date):
+            # Should NOT be called for the exit price (ledger close takes priority)
+            return (100.0, 108.0)
+
+        with patch("yfinance.Ticker"):
+            from tradingagents.portfolio_advisor.outcome_tracker import compute_catalyst_r_outcomes
+
+            summary = compute_catalyst_r_outcomes(cfg, price_fetcher=mock_price_fetcher)
+
+        assert summary["scored"] == 1
+        out_path = tmp_path / "catalyst_r_outcomes.jsonl"
+        rows = [json.loads(l) for l in out_path.read_text().splitlines() if l.strip()]
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["scored_horizon"] == "ledger_close"
+        # R = (115 - 100) / (100 * 0.08) = 15 / 8 = 1.875
+        assert abs(row["r_multiple"] - 1.875) < 0.01
+        assert row["exit_price"] == 115.0
