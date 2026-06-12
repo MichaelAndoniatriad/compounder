@@ -175,5 +175,7 @@ Suite: **860 tests + 93 subtests, all green**.
 ## Explicitly rejected (do not build)
 Thematic anticipation trades as catalyst entries (wrong-signed; DKNG class → shadow book only — covered by validate gates in pm_tools); macro pattern library as a trading signal; more LLM context/authority; LLM self-grading loops; naive small-cap tilt without the event trigger.
 
+**Options/leverage (decided 2026-06-11):** no options contracts or any "gamble" sleeve until the equity catalyst sleeve has 50+ scored trades proving the event edge is real. Buying options into catalysts is documented negative-edge (IV crush); options are illiquid exactly where our edge lives (small caps). The ONLY future-permissible form is defined-risk debit spreads as catalyst expression (caps gap-through-stop risk) — revisit only after the 50-trade bar is met, never as leverage on an unproven edge.
+
 ## Done criteria
 Suite green after every item; one commit per item; this doc updated with a ✅ + commit hash per item as it lands.
