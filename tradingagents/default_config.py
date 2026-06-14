@@ -465,13 +465,14 @@ DEFAULT_CONFIG = _apply_env_overrides({
     # minimum viable graph (analysts → R&E → PM) once scoreboard data shows
     # debates don't improve alpha.
     "risk_debate_enabled": True,
-    # Which account the advisor manages. "etoro": advisory-only — human executes
-    # on eToro, paper book mirrors advice. "alpaca": AUTONOMOUS — the PM manages
+    # Which account the advisor manages. "alpaca": AUTONOMOUS — the PM manages
     # the Alpaca PAPER book as the first-class portfolio (snapshot, watchdog,
     # sleeves all read Alpaca; proposals auto-execute there; Telegram messages
-    # are decision notices, not action requests). Real-money execution does not
-    # exist in either mode. Override with TRADINGAGENTS_ACCOUNT_MODE.
-    "account_mode": "etoro",
+    # are decision notices, not action requests). "etoro": advisory-only (legacy,
+    # disabled — eToro reads are gated behind portfolio_advisor_etoro_enabled).
+    # Real-money execution does not exist in either mode. Override with
+    # TRADINGAGENTS_ACCOUNT_MODE.
+    "account_mode": "alpaca",
     # Hard-disable all eToro network reads. When False (the default) and NOT under
     # pytest, any eToro HTTP fetch is short-circuited — no API calls are made, the
     # function returns an "unavailable" result, and a one-time warning is logged.

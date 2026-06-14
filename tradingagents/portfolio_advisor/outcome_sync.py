@@ -19,6 +19,15 @@ from tradingagents.portfolio_advisor.plan_validation import (
 logger = logging.getLogger(__name__)
 
 
+def _account_mode_safe() -> str:
+    """Return the active account mode, falling back to 'alpaca' on any error."""
+    try:
+        from tradingagents.portfolio_advisor.etoro_scan import account_mode
+        return account_mode()
+    except Exception:
+        return "alpaca"
+
+
 def _parse_event_ts(row: Dict[str, Any]) -> Optional[datetime]:
     ts = row.get("timestamp")
     if not isinstance(ts, str):
@@ -175,6 +184,7 @@ def _sync_partial_unit_changes(
             },
         )
     st["last_book_units_by_ticker"] = {k: float(v) for k, v in current.items()}
+    st["last_book_source"] = _account_mode_safe()
     return st
 
 

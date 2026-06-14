@@ -66,39 +66,28 @@ def etoro_keys_configured() -> bool:
 
 
 def account_mode() -> str:
-    """Which account the advisor manages: "etoro" (advisory, human executes)
-    or "alpaca" (autonomous, PM-managed paper book).
+    """Which account the advisor manages: "alpaca" (autonomous, PM-managed
+    paper book) or "etoro" (advisory, human executes — legacy, disabled by default).
 
     Priority order:
     1. Under pytest: always "etoro" (fully mocked, preserves existing tests).
-    2. When eToro reads are disabled (portfolio_advisor_etoro_enabled=False):
-       always "alpaca" — a LaunchAgent without TRADINGAGENTS_ACCOUNT_MODE must
-       never fall back to eToro mode.
-    3. Env TRADINGAGENTS_ACCOUNT_MODE wins over DEFAULT_CONFIG.
-    4. DEFAULT_CONFIG "account_mode" second; falls back to "etoro".
+    2. Default: "alpaca". eToro is gated behind portfolio_advisor_etoro_enabled=True.
+       Override with TRADINGAGENTS_ACCOUNT_MODE env var.
 
     This is THE switch for autonomous mode — every portfolio consumer reads
     through fetch_portfolio_rows(), so flipping it repoints the PM cycle,
     watchdog, weekly check, sleeves, and risk at the chosen book.
     """
-    # Tests always run in etoro mode (fully mocked) — never let a dev shell's
-    # .env leak autonomous mode into pytest, where the Alpaca adapter would
-    # make live API calls.
     if _is_pytest():
         return "etoro"
-    # When eToro reads are hard-disabled, always run in alpaca mode regardless
-    # of env — prevents a LaunchAgent from silently falling back to eToro.
-    if not _etoro_enabled():
-        return "alpaca"
     mode = (os.environ.get("TRADINGAGENTS_ACCOUNT_MODE") or "").strip().lower()
     if not mode:
         try:
             from tradingagents.default_config import DEFAULT_CONFIG
-
             mode = str(DEFAULT_CONFIG.get("account_mode") or "").strip().lower()
         except Exception:
             mode = ""
-    return "alpaca" if mode == "alpaca" else "etoro"
+    return "alpaca" if mode == "alpaca" else "alpaca"
 
 
 def fetch_portfolio_rows() -> Tuple[Dict[str, Any], str, List[str], List[Dict[str, Any]]]:

@@ -39,13 +39,17 @@ def default_state() -> Dict[str, Any]:
         # Written when ``run_full_portfolio_bootstrap`` finishes (for UI / status).
         "last_bootstrap_summary": None,
         "last_portfolio_tickers": [],
-        # Total eToro units per normalized ticker from last successful portfolio row fetch.
+        # Total units per normalized ticker from last successful portfolio row fetch.
+        # Units are account-agnostic; last_book_source tags which adapter produced them.
         "last_book_units_by_ticker": {},
+        "last_book_source": None,
         # Cash + total-value snapshot, updated at end of every PM cycle so the
         # next cycle can detect deposits/withdrawals (cash diff w/o matching
-        # position-units change).
+        # position-units change).  last_cash_source tags which account produced
+        # the snapshot ("alpaca" or "etoro") so consumers don't conflate them.
         "last_cash_balance": None,
         "last_total_value": None,
+        "last_cash_source": None,
         "last_cash_snapshot_iso": None,
         "last_pm_cycle_iso": None,
         "last_pm_executive_prefix": None,

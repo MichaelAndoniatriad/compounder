@@ -905,8 +905,11 @@ def load_cash_change_block(
 def update_cash_snapshot(
     cfg: Dict[str, Any], *, current_cash: Optional[float], current_total: Optional[float]
 ) -> None:
-    """Persist current cash + total. Called at the end of each PM cycle."""
+    """Persist current cash + total. Called at the end of each PM cycle.
+    Tags the snapshot with the active account_mode so consumers can
+    distinguish Alpaca paper data from eToro live data."""
     from tradingagents.portfolio_advisor import state as _state
+    from tradingagents.portfolio_advisor.etoro_scan import account_mode as _am
     if current_cash is None and current_total is None:
         return
     st = _state.load_state(cfg)
@@ -914,5 +917,6 @@ def update_cash_snapshot(
         st["last_cash_balance"] = round(float(current_cash), 2)
     if current_total is not None:
         st["last_total_value"] = round(float(current_total), 2)
+    st["last_cash_source"] = _am()
     st["last_cash_snapshot_iso"] = _now_iso()
     _state.save_state(cfg, st)

@@ -533,7 +533,7 @@ def _paper_buy(
             "status": "submitted",
             "order_id": str(order.id),
             "notional_usd": notional,
-            "etoro_usd": usd,
+            "proposal_usd": usd,
             "scale": round(scale, 4),
             "confidence": conf,
             "conf_mult": round(conf_mult, 3),
