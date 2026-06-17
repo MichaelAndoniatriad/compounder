@@ -10,13 +10,114 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from langchain_core.tools import tool
 
 from tradingagents.portfolio_advisor import action_log as al
 from tradingagents.portfolio_advisor import state as pa_state
 from tradingagents.portfolio_advisor import pm_workspace as pmws
+
+
+# The PM tool loop truncates each tool result to ~1000 chars before the model
+# sees it, so the news digest is headlines-only (title + source, no summaries)
+# and hard-capped well under that. The model synthesizes the headlines itself.
+_NEWS_DIGEST_CHAR_CAP = 950
+
+
+def _news_headline_digest(raw: str, limit: int) -> str:
+    """Reduce a vendor news payload (yfinance pre-formatted text OR Alpha Vantage
+    NEWS_SENTIMENT JSON) to a compact "- title (source)" list. Vendor-agnostic so it
+    survives the data_vendors / fallback chain in route_to_vendor."""
+    import json as _json
+
+    raw = (raw or "").strip()
+    if not raw:
+        return ""
+    lines: List[str] = []
+
+    # Alpha Vantage path: raw JSON with a "feed" array.
+    if raw[:1] in ("{", "["):
+        try:
+            obj = _json.loads(raw)
+            feed = obj.get("feed") if isinstance(obj, dict) else obj
+            for art in (feed or []):
+                if not isinstance(art, dict):
+                    continue
+                title = " ".join(str(art.get("title") or "").split())
+                src = str(art.get("source") or "").strip()
+                if title:
+                    lines.append(f"- {title}" + (f" ({src})" if src else ""))
+                if len(lines) >= limit:
+                    break
+            if lines:
+                return "\n".join(lines)
+        except (ValueError, TypeError):
+            pass
+
+    # yfinance path (and any markdown-ish text): pull the "### Title (source: X)" heads.
+    # Skip the vendor's date-range banner (e.g. "AVGO News, from 2026-06-10 to 2026-06-17:")
+    # so it doesn't eat a headline slot.
+    import re as _re
+
+    _banner = _re.compile(r"from \d{4}-\d{2}-\d{2} to \d{4}-\d{2}-\d{2}")
+    for ln in raw.splitlines():
+        s = ln.strip()
+        if s.startswith("#"):
+            s = s.lstrip("#").strip()
+            if s and not _banner.search(s):
+                lines.append(f"- {s}")
+            if len(lines) >= limit:
+                break
+    if lines:
+        return "\n".join(lines)
+
+    # Unknown shape: hand back the raw text; the caller caps the length.
+    return raw
+
+
+def _news_digest_tool(cfg: Dict[str, Any], *, ticker: Optional[str], days: int, limit: int) -> str:
+    """Fetch live news on demand and return a compact, phone-sized headline digest.
+
+    Backs the get_market_news / get_ticker_news PM tools. ``ticker=None`` pulls macro/
+    market headlines (get_global_news); a ticker pulls that name's news (get_news).
+    """
+    from datetime import date as _date, timedelta as _td
+
+    from tradingagents.dataflows.config import set_config
+    from tradingagents.dataflows.interface import route_to_vendor
+
+    try:
+        days = max(1, min(int(days or 3), 30))
+    except (TypeError, ValueError):
+        days = 3
+    try:
+        limit = max(1, min(int(limit or 8), 20))
+    except (TypeError, ValueError):
+        limit = 8
+
+    set_config(cfg)  # route_to_vendor reads the active global config / vendor selection
+    today = _date.today()
+    try:
+        if ticker:
+            start = (today - _td(days=days)).isoformat()
+            raw = route_to_vendor("get_news", ticker, start, today.isoformat())
+        else:
+            raw = route_to_vendor("get_global_news", today.isoformat(), days, limit)
+    except Exception as e:  # network / vendor / rate-limit — report, don't crash the cycle
+        scope = ticker or "market"
+        return f"news fetch failed for {scope}: {e}"
+
+    digest = _news_headline_digest(str(raw or ""), limit)
+    if not digest.strip():
+        scope = f"{ticker} " if ticker else "market "
+        return f"no {scope}news in the last {days}d"
+    header = (
+        f"{ticker} news (last {days}d):\n" if ticker
+        else f"Market/macro headlines (last {days}d):\n"
+    )
+    out = header + digest
+    return out[:_NEWS_DIGEST_CHAR_CAP]
 
 
 def build_pm_tools(cfg: Dict[str, Any], live_tickers: set) -> List[Any]:
@@ -1043,6 +1144,36 @@ def build_pm_tools(cfg: Dict[str, Any], live_tickers: set) -> List[Any]:
         except Exception as e:
             return f"error recording re-underwrite verdict for {tk}: {e}"
 
+    @tool
+    def get_market_news(days: int = 3, limit: int = 10) -> str:
+        """Pull LIVE market/macro headlines from the last N days (default 3) so you can
+        explain what is actually moving the market RIGHT NOW — instead of guessing from
+        training memory or saying you have no news feed.
+
+        Call this whenever the human asks "what's happening?", "why is the market up/down?",
+        "any news?", or any time you need fresh, dated macro context before a stance.
+        Covers financial markets, the economy, and monetary policy broadly — NOT a single
+        ticker (use get_ticker_news for one name). Returns a compact headline digest
+        (title + source). Headlines only — synthesize them into your own read.
+        """
+        return _news_digest_tool(cfg, ticker=None, days=days, limit=limit)
+
+    @tool
+    def get_ticker_news(ticker: str, days: int = 7, limit: int = 8) -> str:
+        """Pull LIVE recent news for ONE ticker from the last N days (default 7) so you
+        can explain a single name's move or check for a fresh catalyst ON DEMAND —
+        without queuing a research job and waiting for a future cycle.
+
+        Call this when the human asks "what's the news on AVGO?" or you need fresh
+        headlines on a holding/candidate before taking a stance. Returns a compact
+        headline digest (title + source). For a full multi-agent deep dive with a
+        verdict, use queue_research instead; this is the fast inline lookup.
+        """
+        tk = (ticker or "").strip().upper()
+        if not tk:
+            return "error: empty ticker"
+        return _news_digest_tool(cfg, ticker=tk, days=days, limit=limit)
+
     return [
         queue_research,
         mark_action_done,
@@ -1066,4 +1197,6 @@ def build_pm_tools(cfg: Dict[str, Any], live_tickers: set) -> List[Any]:
         run_macro_review,
         veto_candidate,
         record_reunderwrite_verdict,
+        get_market_news,
+        get_ticker_news,
     ]
