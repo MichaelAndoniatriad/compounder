@@ -18,8 +18,10 @@ def test_process_update_answers_allowed_chat(tmp_path):
         "update_id": 10,
         "message": {"chat": {"id": 42}, "text": "what should I do?"},
     }
+    # answer_text retries run_pm_cycle while the reply is empty/short (< 30 chars),
+    # so the canned answer must be a realistic substantive reply to break after one call.
     result = AdvisorPMCycleResult(
-        executive_summary="Do nothing broad.",
+        executive_summary="Do nothing broad right now — the book looks balanced after the latest check.",
         stances=[AdvisorPMTickerStance(ticker="NVDA", stance="hold", rationale="Latest evidence supports hold.")],
     )
 

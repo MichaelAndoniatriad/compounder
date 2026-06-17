@@ -5,6 +5,8 @@ catalyst sleeve just to fill it, which slapped a -8% hard stop on a name whose
 own thesis said to ADD on a dip to ~$205 — the stop would fire at the buy price.
 A catalyst buy with no catalyst_date must be rejected and pushed to core.
 """
+from datetime import date, timedelta
+
 from tradingagents.portfolio_advisor import pm_tools, proposals, position_plans
 
 
@@ -38,8 +40,11 @@ def test_catalyst_buy_without_date_is_rejected(monkeypatch):
 def test_catalyst_buy_with_date_proceeds(monkeypatch):
     captured: list = []
     tool = _propose_tool({}, captured, monkeypatch)
+    # Relative to today so the date stays inside the validation window as the
+    # real clock advances (a hardcoded date silently ages into the past).
+    future = (date.today() + timedelta(days=14)).isoformat()
     out = tool.invoke({"ticker": "DKNG", "action": "buy", "sleeve": "catalyst",
-                       "catalyst_date": "2026-06-11", "approx_usd": 275, "reason": "World Cup draw"})
+                       "catalyst_date": future, "approx_usd": 275, "reason": "World Cup draw"})
     assert "error" not in out.lower()
     assert captured and captured[0]["ticker"] == "DKNG"
 

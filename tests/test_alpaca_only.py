@@ -6,7 +6,8 @@ Coverage:
 3. fetch_portfolio_rows() — eToro network path is never called when flag=False.
 4. fetch_current_portfolio_headlines() — same gate.
 5. fetch_clerk_watchlist_from_etoro() — same gate.
-6. When flag=True, the fetch path proceeds (mocked HTTP, no real network).
+6. Even with flag=True and env=etoro, account_mode() stays "alpaca" and the fetch
+   routes to Alpaca (eToro is hard-severed; the eToro network path is unreachable).
 7. format_action_ticket() in alpaca mode — footer must not contain "you execute on eToro".
 """
 
@@ -29,29 +30,6 @@ import tradingagents.portfolio_advisor.etoro_scan as etoro_scan_mod
 def _make_fake_alpaca_rows():
     """Minimal fake return value from fetch_portfolio_rows_alpaca."""
     return ({}, "Alpaca snapshot", ["DKNG"], [{"symbolFull": "DKNG", "unitsBaseValueDollars": 500}])
-
-
-def _make_etoro_pnl_payload():
-    """Minimal eToro PnL payload so mocked EtoroClient can return something."""
-    return {
-        "clientPortfolio": {
-            "credit": 1000.0,
-            "unrealizedPnL": 50.0,
-            "positions": [
-                {
-                    "positionId": 1,
-                    "instrumentId": 101,
-                    "isBuy": True,
-                    "units": 10,
-                    "openRate": 25.0,
-                    "amount": 250.0,
-                    "unitsBaseValueDollars": 260.0,
-                    "initialAmountInDollars": 250.0,
-                }
-            ],
-            "mirrors": [],
-        }
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -170,37 +148,47 @@ class TestFetchPortfolioRowsGate:
         assert alpaca_called, "Alpaca adapter was not called"
         assert not etoro_http_calls, "eToro HTTP was called despite flag=False"
 
-    def test_flag_true_etoro_fetch_proceeds(self, simulate_production, monkeypatch):
-        """When flag=True and mode=etoro, fetch_portfolio_rows() calls eToro HTTP (mocked)."""
+    def test_etoro_severed_routes_to_alpaca_even_with_flag_and_env(self, simulate_production, monkeypatch):
+        """eToro is hard-severed: even with flag=True AND TRADINGAGENTS_ACCOUNT_MODE=etoro,
+        account_mode() stays 'alpaca' and fetch_portfolio_rows() never touches eToro HTTP.
+
+        account_mode() is hardwired to 'alpaca' (see etoro_scan.account_mode), so the
+        eToro network path is unreachable in production. This is the intended behaviour
+        after the eToro-sever change — the prior "flag=True reaches eToro" expectation
+        no longer holds.
+        """
         import tradingagents.default_config as dc_mod
         monkeypatch.setattr(dc_mod, "DEFAULT_CONFIG", {
             "portfolio_advisor_etoro_enabled": True,
             "account_mode": "etoro",
         })
         monkeypatch.setenv("TRADINGAGENTS_ACCOUNT_MODE", "etoro")
-
-        # Set eToro env keys so key-check passes
         monkeypatch.setenv("ETORO_API_KEY", "test-key")
         monkeypatch.setenv("ETORO_USER_KEY", "test-user")
 
+        # Alpaca adapter is where the call must land.
+        alpaca_called = []
+        def fake_fetch_alpaca():
+            alpaca_called.append(True)
+            return _make_fake_alpaca_rows()
+        monkeypatch.setattr(
+            "tradingagents.integrations.alpaca.account_adapter.fetch_portfolio_rows_alpaca",
+            fake_fetch_alpaca,
+        )
+
+        # eToro HTTP must never be hit, flag or no flag.
         import tradingagents.integrations.etoro.client as etoro_client_mod
         etoro_http_calls = []
+        def fail_on_etoro_http(*args, **kwargs):
+            etoro_http_calls.append(args)
+            raise AssertionError("eToro HTTP must not be called — eToro is severed")
+        monkeypatch.setattr(etoro_client_mod.requests, "get", fail_on_etoro_http)
 
-        class FakeResp:
-            status_code = 200
-            def json(self):
-                return _make_etoro_pnl_payload()
-            def raise_for_status(self):
-                pass
-
-        def fake_get(url, headers=None, timeout=None):
-            etoro_http_calls.append(url)
-            return FakeResp()
-
-        monkeypatch.setattr(etoro_client_mod.requests, "get", fake_get)
-
-        payload, text, tickers, rows = etoro_scan_mod.fetch_portfolio_rows()
-        assert etoro_http_calls, "Expected at least one eToro HTTP call when flag=True"
+        assert etoro_scan_mod.account_mode() == "alpaca"
+        result = etoro_scan_mod.fetch_portfolio_rows()
+        assert result[2] == ["DKNG"]
+        assert alpaca_called, "Alpaca adapter was not called"
+        assert not etoro_http_calls, "eToro HTTP was called despite the sever"
 
 
 # ---------------------------------------------------------------------------

@@ -245,6 +245,14 @@ def _run_scan_unguarded(cfg, eps_responses, yf_pv_fn):
             "tradingagents.portfolio_advisor.pead_scanner._yf_price_volume",
             side_effect=yf_pv_fn,
         ),
+        # Pin the session-elapsed fraction to 1.0 so the RVOL and dollar-volume
+        # gates use unscaled full-day thresholds. Without this they scale by the
+        # real wall-clock session fraction, making these gate assertions
+        # time-of-day flaky (e.g. a low dollar-vol passes a shrunken floor).
+        patch(
+            "tradingagents.portfolio_advisor.pead_scanner._session_elapsed_fraction",
+            return_value=1.0,
+        ),
         patch("tradingagents.portfolio_advisor.candidates.evaluate_candidate",
               return_value=MagicMock(status="watch", ticker=list(eps_responses.keys())[0])),
         patch("tradingagents.portfolio_advisor.candidates.append_candidate_records"),

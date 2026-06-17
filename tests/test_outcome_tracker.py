@@ -32,6 +32,19 @@ def tmp_advisor_dir(monkeypatch, tmp_path: Path) -> Path:
     return tmp_path
 
 
+@pytest.fixture(autouse=True)
+def _pin_qqq_benchmark(monkeypatch):
+    """Pin the QQQ benchmark to a flat 0% return so alpha == raw return and the
+    classification tests are deterministic.
+
+    Without this, ``_fetch_qqq_return`` makes a live yfinance call, so the
+    alpha-relative classification drifts with the real market — a +1% pick flips
+    between neutral and bad as QQQ moves, making these tests time-of-run flaky.
+    The injected ``price_fetcher`` only covers the picks, never the benchmark.
+    """
+    monkeypatch.setattr(outcome_tracker, "_fetch_qqq_return", lambda start, end: 0.0)
+
+
 def _seed_recommendations(advisor_dir: Path, entries: List[Dict[str, Any]]) -> None:
     p = advisor_dir / "recommendation_log.jsonl"
     p.write_text("\n".join(json.dumps(e) for e in entries) + "\n")

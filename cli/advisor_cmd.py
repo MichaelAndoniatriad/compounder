@@ -866,7 +866,7 @@ def portfolio_advisor_heartbeat():
             f"Position plans: {n_plans}\n"
             f"Pending jobs: {pending}\n"
             f"Last delivered alert: {last_alert_str}\n"
-            f"eToro fetch: OK"
+            f"{etoro_scan.account_mode()} fetch: OK"
         )
         ok = messaging.send_advisor_message(cfg, "Advisor: system alive", body, urgent=True)
         if ok:

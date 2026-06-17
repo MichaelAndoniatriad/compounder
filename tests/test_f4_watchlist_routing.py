@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Dict, List
 from unittest.mock import MagicMock
@@ -150,6 +151,9 @@ def test_emit_ep_candidate_alpaca_with_date_files_proposal(monkeypatch):
     tools = pm_tools_mod.build_pm_tools({}, live_tickers=set())
     tool = next(t for t in tools if getattr(t, "name", "") == "emit_ep_candidate")
 
+    # Relative to today so the catalyst date stays inside the validation window
+    # as the real clock advances (a hardcoded date silently ages into the past).
+    future = (date.today() + timedelta(days=14)).isoformat()
     result = tool.invoke({
         "ticker": "NVDA",
         "tier": "Tier 1",
@@ -157,7 +161,7 @@ def test_emit_ep_candidate_alpaca_with_date_files_proposal(monkeypatch):
         "entry_price": 950.0,
         "stop_price": 874.0,
         "risk_pct": 1.0,
-        "catalyst_date": "2026-06-11",
+        "catalyst_date": future,
         "confidence": 0.8,
     })
 
@@ -167,7 +171,7 @@ def test_emit_ep_candidate_alpaca_with_date_files_proposal(monkeypatch):
     assert p["ticker"] == "NVDA"
     assert p["action"] == "buy"
     assert p["sleeve"] == "catalyst"
-    assert p["catalyst_date"] == "2026-06-11"
+    assert p["catalyst_date"] == future
     assert p["confidence"] == 0.8
 
     # Telegram must also have been sent

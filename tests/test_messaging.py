@@ -39,6 +39,9 @@ def test_send_advisor_message_sends_telegram(tmp_path, monkeypatch):
         "message_log_path": str(tmp_path / "messages.jsonl"),
         "analysis_telegram_bot_token": "123:test-token",
         "analysis_telegram_chat_id": "456",
+        # Non-urgent sends are gated to quiet-hours windows; disable so this test
+        # exercises delivery deterministically regardless of wall-clock time.
+        "portfolio_advisor_quiet_hours_enabled": False,
     }
     calls = []
 

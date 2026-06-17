@@ -108,6 +108,11 @@ class TestRvolGate:
                 "spy_pct": 0.5, "vix": 18.0, "blocked": False, "reason": ""
             }),
             patch.object(ep_scanner, "_alpaca_live_price", return_value=None),
+            # Pin the session-elapsed fraction to 1.0 so RVOL is unscaled
+            # (vol_today / avg_vol_20d) and deterministic. Without this the gate
+            # scales by the real wall-clock session fraction, so these RVOL math
+            # assertions become time-of-day flaky.
+            patch.object(ep_scanner, "_ep_session_elapsed_fraction", return_value=1.0),
             # Mock holdings so NVDA is NOT treated as already held.
             patch.object(etoro_scan, "fetch_portfolio_rows",
                          return_value=({}, "", [], [])),

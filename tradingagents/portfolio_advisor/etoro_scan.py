@@ -67,16 +67,18 @@ def etoro_keys_configured() -> bool:
 
 def account_mode() -> str:
     """Which account the advisor manages: "alpaca" (autonomous, PM-managed
-    paper book) or "etoro" (advisory, human executes — legacy, disabled by default).
+    paper book) or "etoro" (advisory, human executes — legacy).
 
-    Priority order:
-    1. Under pytest: always "etoro" (fully mocked, preserves existing tests).
-    2. Default: "alpaca". eToro is gated behind portfolio_advisor_etoro_enabled=True.
-       Override with TRADINGAGENTS_ACCOUNT_MODE env var.
+    eToro is currently HARD-SEVERED: in production this always returns "alpaca",
+    regardless of TRADINGAGENTS_ACCOUNT_MODE or portfolio_advisor_etoro_enabled.
+    The env lookup below is read but intentionally has no effect — it (and the
+    eToro fetch path in fetch_portfolio_rows) is kept only so the sever can be
+    reverted in one line if eToro is ever revived. Under pytest this returns
+    "etoro" so the existing eToro-mock tests keep exercising that code path.
 
     This is THE switch for autonomous mode — every portfolio consumer reads
-    through fetch_portfolio_rows(), so flipping it repoints the PM cycle,
-    watchdog, weekly check, sleeves, and risk at the chosen book.
+    through fetch_portfolio_rows(), so it repoints the PM cycle, watchdog,
+    weekly check, sleeves, and risk at the chosen book.
     """
     if _is_pytest():
         return "etoro"
@@ -87,6 +89,7 @@ def account_mode() -> str:
             mode = str(DEFAULT_CONFIG.get("account_mode") or "").strip().lower()
         except Exception:
             mode = ""
+    # eToro severed: always alpaca. To revive eToro, change this to honour `mode`.
     return "alpaca" if mode == "alpaca" else "alpaca"
 
 

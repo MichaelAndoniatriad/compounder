@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 from tradingagents.agents.utils.memory import TradingMemoryLog
@@ -34,8 +35,6 @@ def test_run_pm_cycle_writes_logs(tmp_path):
         forward_tasks=["Replan next week"],
         memory_note="Watch semis",
     )
-    m_struct = MagicMock()
-    m_struct.invoke.return_value = fake
     m_llm = MagicMock()
     m_client = MagicMock()
     m_client.get_llm.return_value = m_llm
@@ -43,7 +42,7 @@ def test_run_pm_cycle_writes_logs(tmp_path):
     with patch("tradingagents.portfolio_advisor.advisor_pm.etoro_scan.fetch_portfolio_rows") as fetch:
         fetch.return_value = ({}, "portfolio text here", ["NVDA"], [])
         with patch("tradingagents.portfolio_advisor.advisor_pm.create_llm_client", return_value=m_client):
-            with patch("tradingagents.portfolio_advisor.advisor_pm.bind_structured", return_value=m_struct):
+            with patch("tradingagents.portfolio_advisor.advisor_pm._coerce_pm_result_from_text", return_value=fake):
                 with patch("tradingagents.portfolio_advisor.advisor_pm.append_event"):
                     out = run_pm_cycle(cfg, trigger="test_trigger")
     assert out.executive_summary == "Test memo"
@@ -58,7 +57,7 @@ def test_pm_default_model_is_gpt_55():
     assert _pm_model({}) == "openai/gpt-5.5"
 
 
-def test_format_close_instruction_lists_exact_sell_lots():
+def test_format_close_instruction_summarizes_sell_in_plain_english():
     rows = [
         {
             "symbolFull": "TEAM",
@@ -80,12 +79,12 @@ def test_format_close_instruction_lists_exact_sell_lots():
 
     out = _format_close_instruction("TEAM", "sell", "Exit the TEAM position.", rows)
 
-    assert "Close 2 TEAM position(s)" in out
-    assert "3.5 units" in out
-    assert "about $244 current value ($307 capital/base)" in out
-    assert "id 101" in out
-    assert "opened at $167" in out
-    assert "id 102" in out
+    # Conversational format (commit 09e03ad): no position IDs / capital-base / per-lot
+    # P&L jargon — just plain English. A bare sell with no specific lots named closes
+    # the whole position, and the units aggregate across both lots (1.5 + 2.0 = 3.5).
+    assert "close the whole position" in out
+    assert "3.5 shares" in out
+    assert "$244" in out
 
 
 def test_notify_action_stances_suppresses_unchanged_repeats(tmp_path):
@@ -113,7 +112,9 @@ def test_notify_action_stances_suppresses_unchanged_repeats(tmp_path):
     assert second is False
     assert send.call_count == 1
     body = send.call_args[0][2]
-    assert "Close 1 TEAM position(s)" in body
+    # Conversational close instruction (caller prepends "TEAM: ").
+    assert "TEAM" in body
+    assert "close the whole position" in body
 
 
 def test_run_pm_cycle_combines_action_alert_and_push_note(tmp_path):
@@ -139,8 +140,6 @@ def test_run_pm_cycle_combines_action_alert_and_push_note(tmp_path):
         ],
         push_note="Do not send this as a separate PM message.",
     )
-    m_struct = MagicMock()
-    m_struct.invoke.return_value = fake
     m_llm = MagicMock()
     m_client = MagicMock()
     m_client.get_llm.return_value = m_llm
@@ -149,7 +148,7 @@ def test_run_pm_cycle_combines_action_alert_and_push_note(tmp_path):
     with patch("tradingagents.portfolio_advisor.advisor_pm.etoro_scan.fetch_portfolio_rows") as fetch:
         fetch.return_value = ({}, "portfolio text here", ["TEAM"], rows)
         with patch("tradingagents.portfolio_advisor.advisor_pm.create_llm_client", return_value=m_client):
-            with patch("tradingagents.portfolio_advisor.advisor_pm.bind_structured", return_value=m_struct):
+            with patch("tradingagents.portfolio_advisor.advisor_pm._coerce_pm_result_from_text", return_value=fake):
                 with patch("tradingagents.portfolio_advisor.messaging.send_advisor_message") as send:
                     run_pm_cycle(cfg, trigger="test_trigger")
 
@@ -175,8 +174,6 @@ def test_run_pm_cycle_prompt_includes_latest_research(tmp_path):
         encoding="utf-8",
     )
     fake = AdvisorPMCycleResult(executive_summary="Test memo")
-    m_struct = MagicMock()
-    m_struct.invoke.return_value = fake
     m_llm = MagicMock()
     m_client = MagicMock()
     m_client.get_llm.return_value = m_llm
@@ -184,18 +181,25 @@ def test_run_pm_cycle_prompt_includes_latest_research(tmp_path):
     with patch("tradingagents.portfolio_advisor.advisor_pm.etoro_scan.fetch_portfolio_rows") as fetch:
         fetch.return_value = ({}, "portfolio text here", ["NVDA"], [])
         with patch("tradingagents.portfolio_advisor.advisor_pm.create_llm_client", return_value=m_client):
-            with patch("tradingagents.portfolio_advisor.advisor_pm.bind_structured", return_value=m_struct):
+            with patch("tradingagents.portfolio_advisor.advisor_pm._coerce_pm_result_from_text", return_value=fake):
                 with patch("tradingagents.portfolio_advisor.advisor_pm.append_event"):
                     run_pm_cycle(cfg, trigger="test_trigger")
 
-    prompt = m_struct.invoke.call_args[0][0][0].content
+    prompt = m_llm.bind_tools.return_value.invoke.call_args[0][0][0].content
     assert "Latest completed research decisions/results:" in prompt
     assert "Hold; margin thesis intact" in prompt
     assert "Do not create facts" in prompt
     assert "Retrieved evidence refs and known dates" in prompt
 
 
-def test_ntfy_question_prompt_excludes_prior_pm_prose(tmp_path):
+def test_ntfy_question_prompt_includes_full_context_and_anti_echo_guard(tmp_path):
+    """Chat-mode (ntfy_question) gets the SAME full context as scheduled cycles.
+
+    Commit 6ae7e93 deliberately stopped stripping PM memory / prior context for
+    ntfy_question — the lightweight prompt made the model defer with empty replies.
+    The prompt now carries the prior PM memory AND the standing instruction telling
+    the model not to parrot it; we assert both, plus the latest evidence + question.
+    """
     event_log = tmp_path / "events.jsonl"
     cfg = {
         "portfolio_advisor_dir": str(tmp_path / "pa"),
@@ -210,19 +214,17 @@ def test_ntfy_question_prompt_excludes_prior_pm_prose(tmp_path):
         ),
         encoding="utf-8",
     )
-    old = AdvisorPMCycleResult(
-        executive_summary="OLD URGENT PM PROSE THAT SHOULD NOT BE ECHOED",
-        memory_note="OLD MEMORY NOTE THAT SHOULD NOT BE ECHOED",
+    prior = AdvisorPMCycleResult(
+        executive_summary="PRIOR PM EXECUTIVE SUMMARY",
+        memory_note="PRIOR PM MEMORY NOTE",
     )
-    _append_pm_memory_md(cfg, trigger="old_cycle", result=old)
+    _append_pm_memory_md(cfg, trigger="old_cycle", result=prior)
     _write_pm_memory_update = __import__(
         "tradingagents.portfolio_advisor.advisor_pm",
         fromlist=["_write_pm_memory_update"],
     )._write_pm_memory_update
-    _write_pm_memory_update(cfg, "OLD STRUCTURED MEMORY THAT SHOULD NOT BE ECHOED", "old_cycle")
+    _write_pm_memory_update(cfg, "PRIOR STRUCTURED MEMORY", "old_cycle")
     fake = AdvisorPMCycleResult(executive_summary="answer")
-    m_struct = MagicMock()
-    m_struct.invoke.return_value = fake
     m_llm = MagicMock()
     m_client = MagicMock()
     m_client.get_llm.return_value = m_llm
@@ -230,15 +232,16 @@ def test_ntfy_question_prompt_excludes_prior_pm_prose(tmp_path):
     with patch("tradingagents.portfolio_advisor.advisor_pm.etoro_scan.fetch_portfolio_rows") as fetch:
         fetch.return_value = ({}, "portfolio text here", ["TEAM"], [])
         with patch("tradingagents.portfolio_advisor.advisor_pm.create_llm_client", return_value=m_client):
-            with patch("tradingagents.portfolio_advisor.advisor_pm.bind_structured", return_value=m_struct):
+            with patch("tradingagents.portfolio_advisor.advisor_pm._coerce_pm_result_from_text", return_value=fake):
                 run_pm_cycle(cfg, trigger="ntfy_question", extra_context="what should I do?")
 
-    prompt = m_struct.invoke.call_args[0][0][0].content
+    prompt = m_llm.bind_tools.return_value.invoke.call_args[0][0][0].content
     assert "Latest TEAM evidence." in prompt
     assert "what should I do?" in prompt
-    assert "OLD URGENT PM PROSE" not in prompt
-    assert "OLD MEMORY NOTE" not in prompt
-    assert "OLD STRUCTURED MEMORY" not in prompt
+    # Full PM context is fed to chat mode (commit 6ae7e93) ...
+    assert "PRIOR PM EXECUTIVE SUMMARY" in prompt
+    assert "PRIOR STRUCTURED MEMORY" in prompt
+    # ... but the standing instruction tells the model not to parrot it.
     assert "Do not echo prior PM prose" in prompt
 
 
@@ -248,8 +251,6 @@ def test_run_pm_cycle_downgrades_unsupported_action_stance(tmp_path):
         executive_summary="Sell NVDA because the thesis is broken.",
         stances=[AdvisorPMTickerStance(ticker="NVDA", stance="sell", rationale="Thesis broken.")],
     )
-    m_struct = MagicMock()
-    m_struct.invoke.return_value = fake
     m_llm = MagicMock()
     m_client = MagicMock()
     m_client.get_llm.return_value = m_llm
@@ -257,7 +258,7 @@ def test_run_pm_cycle_downgrades_unsupported_action_stance(tmp_path):
     with patch("tradingagents.portfolio_advisor.advisor_pm.etoro_scan.fetch_portfolio_rows") as fetch:
         fetch.return_value = ({}, "portfolio text here", ["NVDA"], [])
         with patch("tradingagents.portfolio_advisor.advisor_pm.create_llm_client", return_value=m_client):
-            with patch("tradingagents.portfolio_advisor.advisor_pm.bind_structured", return_value=m_struct):
+            with patch("tradingagents.portfolio_advisor.advisor_pm._coerce_pm_result_from_text", return_value=fake):
                 with patch("tradingagents.portfolio_advisor.messaging.send_advisor_message"):
                     out = run_pm_cycle(cfg, trigger="test_trigger")
 
@@ -268,6 +269,9 @@ def test_run_pm_cycle_downgrades_unsupported_action_stance(tmp_path):
 
 
 def test_run_pm_cycle_keeps_action_stance_with_research_evidence(tmp_path):
+    # Recent date so the evidence stays fresh (a hardcoded date eventually trips
+    # the staleness gate and the stance gets downgraded for the wrong reason).
+    rdate = (datetime.now(timezone.utc) - timedelta(days=3)).strftime("%Y-%m-%d")
     event_log = tmp_path / "events.jsonl"
     cfg = {
         "portfolio_advisor_dir": str(tmp_path / "pa"),
@@ -275,7 +279,7 @@ def test_run_pm_cycle_keeps_action_stance_with_research_evidence(tmp_path):
     }
     event_log.write_text(
         (
-            '{"timestamp":"2026-05-15T09:00:00+00:00","ticker":"NVDA",'
+            '{"timestamp":"' + rdate + 'T09:00:00+00:00","ticker":"NVDA",'
             '"event_type":"single_model_analysis","key_data":{"job_type":"thesis_check",'
             '"excerpt":"Trim; thesis weakened after latest check."},"outcome":null}\n'
         ),
@@ -288,12 +292,10 @@ def test_run_pm_cycle_keeps_action_stance_with_research_evidence(tmp_path):
                 ticker="NVDA",
                 stance="trim",
                 rationale="Latest thesis check weakened.",
-                evidence_refs=["event:single_model_analysis:NVDA:2026-05-15"],
+                evidence_refs=[f"event:single_model_analysis:NVDA:{rdate}"],
             )
         ],
     )
-    m_struct = MagicMock()
-    m_struct.invoke.return_value = fake
     m_llm = MagicMock()
     m_client = MagicMock()
     m_client.get_llm.return_value = m_llm
@@ -301,15 +303,17 @@ def test_run_pm_cycle_keeps_action_stance_with_research_evidence(tmp_path):
     with patch("tradingagents.portfolio_advisor.advisor_pm.etoro_scan.fetch_portfolio_rows") as fetch:
         fetch.return_value = ({}, "portfolio text here", ["NVDA"], [])
         with patch("tradingagents.portfolio_advisor.advisor_pm.create_llm_client", return_value=m_client):
-            with patch("tradingagents.portfolio_advisor.advisor_pm.bind_structured", return_value=m_struct):
+            with patch("tradingagents.portfolio_advisor.advisor_pm._coerce_pm_result_from_text", return_value=fake):
                 with patch("tradingagents.portfolio_advisor.messaging.send_advisor_message"):
                     out = run_pm_cycle(cfg, trigger="test_trigger")
 
     assert out.stances[0].stance == "trim"
-    assert out.stances[0].evidence_refs == ["event:single_model_analysis:NVDA:2026-05-15"]
+    assert out.stances[0].evidence_refs == [f"event:single_model_analysis:NVDA:{rdate}"]
 
 
 def test_run_pm_cycle_downgrades_conflict_with_latest_full_graph(tmp_path):
+    # Recent date so the conflict path (not the staleness path) is the one tested.
+    rdate = (datetime.now(timezone.utc) - timedelta(days=3)).strftime("%Y-%m-%d")
     event_log = tmp_path / "events.jsonl"
     cfg = {
         "portfolio_advisor_dir": str(tmp_path / "pa"),
@@ -317,9 +321,9 @@ def test_run_pm_cycle_downgrades_conflict_with_latest_full_graph(tmp_path):
     }
     event_log.write_text(
         (
-            '{"timestamp":"2026-05-15T09:00:00+00:00","ticker":"NVDA",'
+            '{"timestamp":"' + rdate + 'T09:00:00+00:00","ticker":"NVDA",'
             '"event_type":"full_graph_decision","key_data":{'
-            '"decision_id":"dec1","trade_date":"2026-05-15","rating":"Hold",'
+            '"decision_id":"dec1","trade_date":"' + rdate + '","rating":"Hold",'
             '"confidence":"Medium","summary":"Hold; evidence balanced.",'
             '"thesis":"Balanced thesis."},"outcome":null}\n'
         ),
@@ -332,12 +336,10 @@ def test_run_pm_cycle_downgrades_conflict_with_latest_full_graph(tmp_path):
                 ticker="NVDA",
                 stance="sell",
                 rationale="Looks broken.",
-                evidence_refs=["event:full_graph_decision:NVDA:2026-05-15"],
+                evidence_refs=[f"event:full_graph_decision:NVDA:{rdate}"],
             )
         ],
     )
-    m_struct = MagicMock()
-    m_struct.invoke.return_value = fake
     m_llm = MagicMock()
     m_client = MagicMock()
     m_client.get_llm.return_value = m_llm
@@ -345,7 +347,7 @@ def test_run_pm_cycle_downgrades_conflict_with_latest_full_graph(tmp_path):
     with patch("tradingagents.portfolio_advisor.advisor_pm.etoro_scan.fetch_portfolio_rows") as fetch:
         fetch.return_value = ({}, "portfolio text here", ["NVDA"], [])
         with patch("tradingagents.portfolio_advisor.advisor_pm.create_llm_client", return_value=m_client):
-            with patch("tradingagents.portfolio_advisor.advisor_pm.bind_structured", return_value=m_struct):
+            with patch("tradingagents.portfolio_advisor.advisor_pm._coerce_pm_result_from_text", return_value=fake):
                 with patch("tradingagents.portfolio_advisor.messaging.send_advisor_message"):
                     out = run_pm_cycle(cfg, trigger="test_trigger")
 
@@ -356,6 +358,9 @@ def test_run_pm_cycle_downgrades_conflict_with_latest_full_graph(tmp_path):
 
 
 def test_run_pm_cycle_allows_full_graph_disagreement_with_newer_evidence(tmp_path):
+    # Recent date so both events stay fresh; this test is about newer single_model
+    # evidence overriding an older full_graph, not about staleness.
+    rdate = (datetime.now(timezone.utc) - timedelta(days=3)).strftime("%Y-%m-%d")
     event_log = tmp_path / "events.jsonl"
     cfg = {
         "portfolio_advisor_dir": str(tmp_path / "pa"),
@@ -363,12 +368,12 @@ def test_run_pm_cycle_allows_full_graph_disagreement_with_newer_evidence(tmp_pat
     }
     event_log.write_text(
         (
-            '{"timestamp":"2026-05-15T09:00:00+00:00","ticker":"NVDA",'
+            '{"timestamp":"' + rdate + 'T09:00:00+00:00","ticker":"NVDA",'
             '"event_type":"full_graph_decision","key_data":{'
-            '"decision_id":"dec1","trade_date":"2026-05-15","rating":"Hold",'
+            '"decision_id":"dec1","trade_date":"' + rdate + '","rating":"Hold",'
             '"confidence":"Medium","summary":"Hold; evidence balanced.",'
             '"thesis":"Balanced thesis."},"outcome":null}\n'
-            '{"timestamp":"2026-05-15T12:00:00+00:00","ticker":"NVDA",'
+            '{"timestamp":"' + rdate + 'T12:00:00+00:00","ticker":"NVDA",'
             '"event_type":"single_model_analysis","key_data":{"job_type":"thesis_check",'
             '"excerpt":"Trim; new margin warning changed the thesis."},"outcome":null}\n'
         ),
@@ -381,12 +386,10 @@ def test_run_pm_cycle_allows_full_graph_disagreement_with_newer_evidence(tmp_pat
                 ticker="NVDA",
                 stance="trim",
                 rationale="New margin warning.",
-                evidence_refs=["event:single_model_analysis:NVDA:2026-05-15"],
+                evidence_refs=[f"event:single_model_analysis:NVDA:{rdate}"],
             )
         ],
     )
-    m_struct = MagicMock()
-    m_struct.invoke.return_value = fake
     m_llm = MagicMock()
     m_client = MagicMock()
     m_client.get_llm.return_value = m_llm
@@ -394,7 +397,7 @@ def test_run_pm_cycle_allows_full_graph_disagreement_with_newer_evidence(tmp_pat
     with patch("tradingagents.portfolio_advisor.advisor_pm.etoro_scan.fetch_portfolio_rows") as fetch:
         fetch.return_value = ({}, "portfolio text here", ["NVDA"], [])
         with patch("tradingagents.portfolio_advisor.advisor_pm.create_llm_client", return_value=m_client):
-            with patch("tradingagents.portfolio_advisor.advisor_pm.bind_structured", return_value=m_struct):
+            with patch("tradingagents.portfolio_advisor.advisor_pm._coerce_pm_result_from_text", return_value=fake):
                 with patch("tradingagents.portfolio_advisor.messaging.send_advisor_message"):
                     out = run_pm_cycle(cfg, trigger="test_trigger")
 
@@ -418,8 +421,6 @@ def test_run_pm_cycle_uses_candidate_comparisons_for_non_held_candidate(tmp_path
             )
         ],
     )
-    m_struct = MagicMock()
-    m_struct.invoke.return_value = fake
     m_llm = MagicMock()
     m_client = MagicMock()
     m_client.get_llm.return_value = m_llm
@@ -427,7 +428,7 @@ def test_run_pm_cycle_uses_candidate_comparisons_for_non_held_candidate(tmp_path
     with patch("tradingagents.portfolio_advisor.advisor_pm.etoro_scan.fetch_portfolio_rows") as fetch:
         fetch.return_value = ({}, "portfolio text here", ["NVDA"], [])
         with patch("tradingagents.portfolio_advisor.advisor_pm.create_llm_client", return_value=m_client):
-            with patch("tradingagents.portfolio_advisor.advisor_pm.bind_structured", return_value=m_struct):
+            with patch("tradingagents.portfolio_advisor.advisor_pm._coerce_pm_result_from_text", return_value=fake):
                 out = run_pm_cycle(
                     cfg,
                     trigger="candidate_comparison",

@@ -6,10 +6,7 @@ import unittest
 
 from tradingagents.llm_clients.fallback_chat_model import is_rate_limit_error
 from tradingagents.llm_clients.corporate_llm_factory import _effective_routing_table
-from tradingagents.llm_clients.model_catalog import (
-    DEFAULT_CORPORATE_AGENT_ROUTING,
-    OR_CLAUDE_SONNET_4_6,
-)
+from tradingagents.llm_clients.model_catalog import DEFAULT_CORPORATE_AGENT_ROUTING
 
 
 class TestRateLimitDetection(unittest.TestCase):
@@ -55,7 +52,12 @@ class TestRoutingMerge(unittest.TestCase):
         table = _effective_routing_table(cfg)
         self.assertEqual(table["news_analyst"]["model"], "google/gemini-2.5-flash")
         self.assertEqual(table["news_analyst"]["provider"], "openrouter")
-        self.assertEqual(table["research_manager"]["model"], OR_CLAUDE_SONNET_4_6)
+        # A non-overridden key keeps its built-in default model. Assert against the
+        # default table itself so this survives model-routing migrations.
+        self.assertEqual(
+            table["research_manager"]["model"],
+            DEFAULT_CORPORATE_AGENT_ROUTING["research_manager"]["model"],
+        )
 
 
 if __name__ == "__main__":
