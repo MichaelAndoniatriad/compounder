@@ -473,8 +473,11 @@ class TestF6CatalystTrailingStop:
         from tradingagents.integrations.alpaca import executor as ex
 
         # entry=100, peak=103 (< 105 = entry*(1+0.05) → NOT armed), price=96
+        # Relative so the 3-day post-catalyst time stop doesn't fire and preempt
+        # the "trailing not armed" check as the real clock advances.
         _write_plan(cfg, "AMD", entry_price=100.0, strategy="catalyst",
-                    catalyst_date="2026-06-15", peak_price=103.0)
+                    catalyst_date=(datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d"),
+                    peak_price=103.0)
 
         # price = 96 → would be below peak*0.92=94.8 if armed, but NOT armed (peak 103 < 105)
         pos = _make_position("AMD", plpc=-0.04, market_value=4800.0, qty=50.0)  # price=96
@@ -672,7 +675,9 @@ class TestF6PeakHelpers:
             ticker="AMD",
             entry_price=100.0,
             strategy="catalyst",
-            catalyst_date="2026-06-15",
+            # Relative so the 3-day post-catalyst time stop doesn't fire and preempt
+            # the "trailing not armed" assertion as the real clock advances.
+            catalyst_date=(datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d"),
             peak_price=103.0,  # < entry*(1+0.05)=105 → NOT armed with default trail_arm_pct=0.05
         )
         rules = CatalystRules(trailing_activate_pct=0.05, trailing_stop_pct=0.08)
