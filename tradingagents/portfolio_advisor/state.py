@@ -4,9 +4,16 @@ from __future__ import annotations
 
 import json
 import os
+import time
+from contextlib import contextmanager
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, List
+
+try:  # POSIX (darwin + the Linux VPS). Absent on Windows → degrade to no lock.
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX fallback
+    fcntl = None  # type: ignore[assignment]
 
 
 def advisor_dir(cfg: Dict[str, Any]) -> Path:
@@ -83,13 +90,127 @@ def load_state(cfg: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-def save_state(cfg: Dict[str, Any], state: Dict[str, Any]) -> None:
+def _lock_path(cfg: Dict[str, Any]) -> Path:
+    return state_path(cfg).with_suffix(".lock")
+
+
+@contextmanager
+def state_file_lock(cfg: Dict[str, Any], timeout: float = 15.0):
+    """Cross-process exclusive lock for the state.json read-modify-write section.
+
+    Without this, the universal ``load_state -> mutate -> save_state`` pattern run
+    by many concurrent processes (telegram poller, watchdog, scheduled PM cycles,
+    the job executor, scanners, core-discovery) races: process A appends a research
+    job and saves, process B (which loaded an older snapshot) then saves and clobbers
+    A's job — the "research jobs vanish from the queue" bug.
+
+    Best-effort: if fcntl is unavailable or the lock can't be taken within
+    ``timeout``, we proceed anyway (never hang the trading loop on a stuck lock).
+    """
+    if fcntl is None:
+        yield
+        return
+    lp = _lock_path(cfg)
+    lp.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(lp, "w")
+    try:
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    break  # give up waiting; proceed un-locked rather than hang
+                time.sleep(0.05)
+        yield
+    finally:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        fh.close()
+
+
+# Jobs only ever move FORWARD through these states (pending -> in_progress ->
+# terminal); they are never removed from the list. The merge keeps the most
+# advanced status when the same job id appears in two racing snapshots.
+_JOB_STATUS_RANK = {
+    "pending": 0,
+    "in_progress": 1,
+    "deferred": 1,
+    "done": 2,
+    "completed": 2,
+    "cancelled": 2,
+    "failed": 2,
+    "error": 2,
+    "skipped": 2,
+}
+
+
+def _job_key(job: Dict[str, Any]):
+    jid = job.get("id")
+    if jid:
+        return ("id", str(jid))
+    # Fallback signature for the rare id-less job, so it still dedups.
+    return ("sig", job.get("ticker"), job.get("kind"), job.get("job_type"),
+            job.get("scheduled_at"), job.get("created_at"))
+
+
+def _merge_jobs(disk_jobs: List[Dict[str, Any]], mem_jobs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Union jobs from the on-disk snapshot and the caller's in-memory snapshot.
+
+    Safe because jobs are only appended or status-flipped, never removed: the
+    union can't drop a legitimate deletion (there are none). For a job present in
+    both, keep the more-advanced status; on a tie the caller's (mem) version wins
+    since it carries the freshest details. Preserves first-seen order.
+    """
+    merged: Dict[Any, Dict[str, Any]] = {}
+    order: List[Any] = []
+    for j in list(disk_jobs) + list(mem_jobs):  # mem after disk -> mem wins ties
+        if not isinstance(j, dict):
+            continue
+        k = _job_key(j)
+        prev = merged.get(k)
+        if prev is None:
+            merged[k] = j
+            order.append(k)
+        elif _JOB_STATUS_RANK.get(str(j.get("status")), 0) >= _JOB_STATUS_RANK.get(str(prev.get("status")), 0):
+            merged[k] = j
+    return [merged[k] for k in order]
+
+
+def save_state(cfg: Dict[str, Any], state: Dict[str, Any], *, merge_jobs: bool = True) -> None:
+    """Persist state atomically.
+
+    By default the ``jobs`` list is merged with the on-disk copy under a
+    cross-process lock so a stale snapshot can't clobber jobs another process
+    appended/advanced concurrently (the lost-update race). Pass
+    ``merge_jobs=False`` for a deliberate full reset (e.g. ``run_init --force``)
+    that must wipe jobs rather than preserve them.
+    """
     path = state_path(cfg)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    payload = json.dumps(state, indent=2, ensure_ascii=False)
-    tmp.write_text(payload, encoding="utf-8")
-    tmp.replace(path)
+    # Hold the cross-process lock across read-merge-write so two concurrent
+    # saves can't both merge against a pre-write disk snapshot (which would
+    # re-introduce the lost-update race inside the merge itself).
+    with state_file_lock(cfg):
+        to_write = state
+        # Merge our jobs view with whatever is on disk RIGHT NOW so a concurrent
+        # writer's freshly-appended jobs / status advances aren't clobbered by our
+        # (possibly stale) snapshot.
+        if merge_jobs:
+            try:
+                if path.is_file():
+                    disk = json.loads(path.read_text(encoding="utf-8"))
+                    if isinstance(disk, dict) and isinstance(disk.get("jobs"), list):
+                        to_write = dict(state)
+                        to_write["jobs"] = _merge_jobs(disk.get("jobs") or [], state.get("jobs") or [])
+            except (OSError, json.JSONDecodeError):
+                pass  # unreadable/corrupt on-disk state -> just write our snapshot
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(to_write, indent=2, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(path)
 
 
 def list_pending_jobs(state: Dict[str, Any]) -> List[Dict[str, Any]]:

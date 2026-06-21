@@ -248,7 +248,8 @@ def run_planning_session(cfg: Dict[str, Any], *, mode: str) -> Tuple[AdvisorPlan
 
 def run_init(cfg: Dict[str, Any], *, force: bool = False) -> None:
     if force:
-        state.save_state(cfg, state.default_state())
+        # Deliberate full reset — wipe jobs rather than merge them back in.
+        state.save_state(cfg, state.default_state(), merge_jobs=False)
     else:
         st = state.load_state(cfg)
         if st.get("first_scan_complete"):
